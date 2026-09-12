@@ -18,6 +18,7 @@ from pydantic import (
     field_validator,
 )
 
+from tinkerfin_contracts import ThreadIdentity
 from tinkerfin_studio.api.errors import (
     BusinessException,
     ConversationErrorCode,
@@ -252,7 +253,7 @@ class ConversationHistoryService:
             user_runs = {
                 item.id: item.run_id
                 for item in trace.messages
-                if item.role == "user" and not item.namespace
+                if item.role == "user" and not item.graph_namespace
             }
             last_status = trace.status
             last_completeness = trace.completeness
@@ -262,7 +263,7 @@ class ConversationHistoryService:
                     for message_id in update.messages.removes:
                         user_runs.pop(message_id, None)
                     for item in update.messages.upserts:
-                        if item.role == "user" and not item.namespace:
+                        if item.role == "user" and not item.graph_namespace:
                             user_runs[item.id] = item.run_id
                     task_trace_update = None
                     if projector is not None:
@@ -388,7 +389,9 @@ class ConversationHistoryService:
         await self._repository.commit()
         try:
             return await self._tracer.query(
-                thread.thread_id,
+                ThreadIdentity(
+                    namespace=f"ns_{self._user_id}", thread_id=thread.thread_id
+                ),
                 where=where,
                 head_run_id=head_run_id,
                 cursor=cursor,
@@ -416,7 +419,9 @@ class ConversationHistoryService:
         await self._repository.commit()
         try:
             trace = await self._tracer.get(
-                thread.thread_id,
+                ThreadIdentity(
+                    namespace=f"ns_{self._user_id}", thread_id=thread.thread_id
+                ),
                 head_run_id=None if history_cursor is not None else head_run_id,
                 history_cursor=history_cursor,
                 projections=(FAILURE_PROJECTION,),
@@ -479,7 +484,7 @@ class ConversationHistoryService:
                 {
                     item.run_id
                     for item in trace.messages
-                    if item.role == "user" and not item.namespace
+                    if item.role == "user" and not item.graph_namespace
                 },
             ),
             reasoning=trace.reasoning,

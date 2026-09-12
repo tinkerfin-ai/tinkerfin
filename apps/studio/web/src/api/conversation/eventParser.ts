@@ -74,13 +74,13 @@ const hasOptionalBoolean = (value: Record<string, unknown>, key: string) => (
 
 const isEventSourceInfo = (value: unknown): value is EventSourceInfo => {
   if (!isRecord(value)) return false
-  const namespace = value.namespace
-  if (!isStringArray(namespace)) return false
+  const graphNamespace = value.graphNamespace
+  if (!isStringArray(graphNamespace)) return false
   const commonFieldsValid = hasOptionalString(value, 'graphTaskId', true)
     && hasOptionalString(value, 'nodeName', true)
-    && (value.parentNamespace === undefined
-      || value.parentNamespace === null
-      || isStringArray(value.parentNamespace))
+    && (value.parentGraphNamespace === undefined
+      || value.parentGraphNamespace === null
+      || isStringArray(value.parentGraphNamespace))
     && hasOptionalString(value, 'parentToolCallId', true)
     && hasOptionalString(value, 'subagentInput', true)
     && hasOptionalString(value, 'subagentInvocationId', true)
@@ -88,16 +88,16 @@ const isEventSourceInfo = (value: unknown): value is EventSourceInfo => {
 
   switch (value.kind) {
     case 'root':
-      return namespace.length === 0
+      return graphNamespace.length === 0
         && value.agentType === 'main'
         && typeof value.agentName === 'string'
         && value.agentName.length > 0
     case 'compiled_subgraph':
-      return namespace.length > 0
+      return graphNamespace.length > 0
         && value.agentType === undefined
         && value.agentName === undefined
     case 'deep_agent_subagent':
-      return namespace.length > 0
+      return graphNamespace.length > 0
         && value.agentType === 'subagent'
         && typeof value.agentName === 'string'
         && value.agentName.length > 0

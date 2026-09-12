@@ -32,12 +32,8 @@ from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identity
 from .errors import PublicationRejected
-from .protocols import MessageCodec, MessageSource, ProfiledMessageSource, SseRenderer
-from .sources import (
-    MessageSourceBinding,
-    ProfiledDeferredMessageSource,
-    map_source,
-)
+from .protocols import MessageCodec, ProfiledMessageSource, SseRenderer
+from .sources import _MappedMessageSource
 
 _EVENT_ADAPTER: TypeAdapter[Event] = TypeAdapter(Event)
 _JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
@@ -294,139 +290,111 @@ def _validate_event_run_identity(event: BaseEvent, identity: RunIdentity) -> Non
             raise ValueError("AG-UI error RunIdentity does not match its source")
 
 
+class _AgUiRunSource(_MappedMessageSource[BaseEvent, BaseEvent]):
+    """Retain the AG-UI profile while validating live events and cancellation tails."""
+
+    def __init__(
+        self,
+        source: ProfiledMessageSource[BaseEvent, BaseEvent],
+        transform: Callable[[BaseEvent], Awaitable[BaseEvent]],
+    ) -> None:
+        super().__init__(source, transform)
+        self._identity = required_identity(source.messaging_identity)
+
+    @property
+    def messaging_identity(self) -> RunIdentity:
+        return self._identity
+
+    @property
+    def messaging_codec_profile(self) -> str:
+        return "agui.event"
+
+    @property
+    def messaging_source_type(self) -> type[BaseEvent]:
+        return BaseEvent
+
+    @property
+    def messaging_replay_type(self) -> type[BaseEvent]:
+        return BaseEvent
+
+
 def create_agui_run_source(
-    identity: RunIdentity,
+    source: ProfiledMessageSource[BaseEvent, BaseEvent],
     *,
-    open_events: Callable[
-        [RunIdentity],
-        Awaitable[MessageSource[BaseEvent]],
-    ],
     transform_event: (
         Callable[[BaseEvent], BaseEvent | Awaitable[BaseEvent]] | None
     ) = None,
 ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
-    """Create a durable-ready AG-UI source from one lazy managed run opener.
+    """Prepare an AG-UI event source for durable delivery and optional transformation.
 
-    The helper keeps model, Sandbox, and Graph setup behind Messaging's owner decision.
-    Attachments therefore never call ``open_events``. A newly selected owner receives
-    the exact ``RunIdentity`` object supplied here; the returned stream must publish the
-    same identity and declare that cancellation waits for its first lifecycle event.
+    Creating the adapter does not prepare or consume the source. Messaging prepares
+    only the selected producer before announcing readiness; replay closes an unused
+    candidate without preparing it. Cancellation waits for the first transformed
+    event or failed pull, then transforms the source's finite cancellation tail.
 
     Args:
-        identity: Single authoritative thread and run identity used for preparation and
-            managed Runtime opening.
-        open_events: Async owner-only function receiving that exact identity and
-            returning one single-use AG-UI event source.
-        transform_event: Optional synchronous or asynchronous product metadata
-            or content transform, applied with source backpressure before durable
-            encoding. It must preserve the event type, lifecycle role, and every
-            protocol correlation identity. A Run start's complete caller input is
-            authoritative and cannot be transformed.
+        source: Unconsumed, closeable AG-UI source with a complete ``agui.event``
+            profile, immutable run identity, and first-event cancellation support.
+            The returned adapter owns its cleanup only after construction succeeds.
+        transform_event: Optional synchronous or asynchronous content or metadata
+            transform. It must preserve the event type, protocol identities,
+            complete Run input, and existing interrupt metadata.
 
     Returns:
-        A profiled lazy source ready for an AG-UI-inferred Messaging channel.
+        A single-use source for an inferred AG-UI Messaging channel. Closing it
+        settles active work and closes the input source. If cleanup fails, a later
+        explicit ``aclose()`` can finish it; successful close is idempotent.
 
     Raises:
-        TypeError: A callback, opened source, identity, cancellation capability, or
-            transformed event violates the AG-UI source contract.
-        ValueError: The opened stream or an event publishes a different run identity
-            or changes an established protocol contract.
-        BaseException: Owner setup or source cleanup fails.
+        TypeError: The source profile, cancellation capability, or transform is
+            invalid. A synchronous construction failure leaves source cleanup to
+            the caller.
+        ValueError: An identity is invalid or a transformed event changes an
+            established protocol contract.
+        RuntimeError: A transform tries to close its own active adapter. Close it
+            after the pull returns or from the consuming context's cleanup.
+        BaseException: Source preparation, transformation, cancellation, or cleanup
+            fails during use; cancellation and process control remain unchanged.
     """
 
-    resolved_identity = required_identity(identity)
-    if not callable(open_events):
-        raise TypeError("open_events must be an async callable")
+    if not isinstance(source, ProfiledMessageSource):
+        raise TypeError("source must be a profiled AG-UI MessageSource")
+    if (
+        source.messaging_codec_profile != "agui.event"
+        or source.messaging_source_type is not BaseEvent
+        or source.messaging_replay_type is not BaseEvent
+    ):
+        raise TypeError("source must publish the agui.event BaseEvent profile")
+    identity = required_identity(source.messaging_identity)
+    if getattr(source, "messaging_cancel_waits_for_first_item", None) is not True:
+        raise TypeError("AG-UI source must wait for its first item before cancellation")
+    if not callable(getattr(source, "messaging_cancel_callback", None)):
+        raise TypeError("AG-UI source must publish cancellation")
     if transform_event is not None and not callable(transform_event):
         raise TypeError("transform_event must be a callable or None")
 
-    async def opener() -> MessageSourceBinding[BaseEvent]:
-        pending = open_events(resolved_identity)
-        if not inspect.isawaitable(pending):
-            raise TypeError("open_events must return an awaitable")
-        opened = await pending
-        if not isinstance(opened, MessageSource):
-            raise TypeError("open_events must resolve to a MessageSource")
-        source = opened
-        opened_object = cast(object, opened)
-        try:
-            stream_identity = getattr(opened_object, "messaging_identity", None)
-            if stream_identity is not resolved_identity:
-                if not isinstance(stream_identity, RunIdentity):
-                    raise TypeError("opened AG-UI source has no RunIdentity")
-                raise ValueError(
-                    "opened AG-UI source must retain the supplied identity object"
-                )
-            waits_for_first = getattr(
-                opened_object,
-                "messaging_cancel_waits_for_first_item",
-                None,
-            )
-            if waits_for_first is not True:
-                raise TypeError(
-                    "opened AG-UI source must wait for its first item before cancellation"
-                )
-            cancel = getattr(opened_object, "messaging_cancel_callback", None)
-            if not callable(cancel):
-                raise TypeError("opened AG-UI source must publish cancellation")
-            event_transform = transform_event
+    async def transform(event: BaseEvent) -> BaseEvent:
+        expected_type = _protocol_model_type(event)
+        expected_identity = _event_protocol_identity(event)
+        expected_metadata = _interrupt_metadata(event)
+        value = event if transform_event is None else transform_event(event)
+        if inspect.isawaitable(value):
+            value = await value
+        validated = _EVENT_ADAPTER.validate_python(value)
+        if _protocol_model_type(validated) is not expected_type:
+            raise TypeError("transform_event must preserve the AG-UI event type")
+        # Canonical aliases protect correlation fields even when a product adds
+        # typed extension fields to an AG-UI event. See the run-source contracts.
+        transformed = _canonical_event(
+            validated,
+            expected_type=expected_type,
+            expected_identity=expected_identity,
+            expected_interrupt_metadata=expected_metadata,
+        )
+        _validate_event_run_identity(transformed, identity)
+        return transformed
 
-            async def transform(event: BaseEvent) -> BaseEvent:
-                expected_type = _protocol_model_type(event)
-                expected_identity = _event_protocol_identity(event)
-                expected_metadata = _interrupt_metadata(event)
-                if event_transform is None:
-                    value = event
-                else:
-                    value = event_transform(event)
-                    if inspect.isawaitable(value):
-                        value = await value
-                validated = _EVENT_ADAPTER.validate_python(value)
-                if _protocol_model_type(validated) is not expected_type:
-                    raise TypeError(
-                        "transform_event must preserve the AG-UI event type"
-                    )
-                # AG-UI models allow extra product fields. The shared codec boundary
-                # prevents a duplicate alias from hiding behind an unchanged Python
-                # field until persistence.
-                transformed = _canonical_event(
-                    validated,
-                    expected_type=expected_type,
-                    expected_identity=expected_identity,
-                    expected_interrupt_metadata=expected_metadata,
-                )
-                _validate_event_run_identity(transformed, resolved_identity)
-                return transformed
-
-            return MessageSourceBinding(source=map_source(source, transform))
-        except BaseException as error:
-            try:
-                await source.aclose()
-            except BaseException as close_error:
-                if isinstance(error, Exception) and not isinstance(
-                    close_error,
-                    Exception,
-                ):
-                    close_error.add_note(
-                        "Rejected AG-UI source validation also failed: "
-                        f"{type(error).__name__}: {error}"
-                    )
-                    raise close_error from error
-                error.add_note(
-                    "Rejected AG-UI source cleanup also failed: "
-                    f"{type(close_error).__name__}: {close_error}"
-                )
-            raise
-
-    return ProfiledDeferredMessageSource(
-        opener,
-        identity=resolved_identity,
-        codec_profile="agui.event",
-        source_type=BaseEvent,
-        replay_type=BaseEvent,
-        cancellable=True,
-        cancel_after_first_item=True,
-    )
+    return _AgUiRunSource(source, transform)
 
 
 class AgUiCodec(

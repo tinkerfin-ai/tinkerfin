@@ -14,7 +14,9 @@ from tinkerfin_tracing.errors import TraceStoreProtocolError
 def _fact() -> RunFact:
     return RunFact(
         source_observation_id="codec-observation",
-        identity=RunIdentity(threadId="codec-thread", runId="codec-run"),
+        identity=RunIdentity(
+            namespace="test", thread_id="codec-thread", run_id="codec-run"
+        ),
         occurred_at=datetime.now(UTC),
         monotonic_ns=1,
         phase="started",

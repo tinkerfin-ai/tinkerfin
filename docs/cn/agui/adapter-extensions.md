@@ -15,6 +15,7 @@ pip install tinkerfin-agui-adapter
 ## 最简单的转换方式
 
 ```python
+from contextlib import aclosing
 from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
@@ -31,11 +32,12 @@ events = astream_events(
     identity=RunIdentity(threadId="thread-1", runId="run-1"),
 )
 
-async for event in events:
-    await send_event(event)
+async with aclosing(events):
+    async for event in events:
+        await send_event(event)
 ```
 
-`astream_events()` 会生成 `RUN_STARTED`、转换中间事件，并保证一个主终止事件。它会独占并关闭传入的异步迭代器，因此同一份 `parts` 不能再交给另一个消费者。
+完整消费 `astream_events()` 时，中间事件前后会各有一个 `RUN_STARTED` 和主终止事件。异步上下文保证提前退出也会关闭来源，同一份 `parts` 不能交给多个消费者。
 
 ### 参数
 
@@ -49,17 +51,17 @@ async for event in events:
 | `private_state_keys` | `frozenset()` | 在已知公开投影边界排除的顶层 state channel |
 
 独立转换器无法推断宿主的私有字段，因此 `private_state_keys` 需要显式提供，并且只过滤顶层
-channel，不会递归删除嵌套同名业务字段。TinkerFin Plan Definition 会自动提供自己的内部 key。
+channel，不会递归删除嵌套同名业务字段。TinkerFin Plan Runtime 会自动提供自己的内部 key。
 
 ## 持久图片与文档
 
 `tinkerfin_contracts.media` 的 `Attachment` 包含 `id`、`name`、`mime_type`
 和 `size_bytes`。调用 `content_block()` 会得到 LangChain 的 `image` 或 `file`
 内容块，带有 `file_id`、`mime_type` 和 `extras.attachment`。消息保存该引用；宿主
-负责访问授权，并通过 `TinkerFin().attachments(AttachmentSupport(read_image=...))`
+负责访问授权，并通过 `TinkerFin().with_attachments(AttachmentSupport(read_image=...))`
 在模型请求时提供图片字节。每个目标模型独立判断图片能力；自定义编译 Agent 单独配置附件访问。
 
-普通运行直接向 `TinkerFin.open_agui_run(messages=...)` 提交标准用户消息，由框架校验并转换。宿主自行分配消息 ID 时，可用 `AgUiUserInput` 提前读取文字和附件引用、替换已授权的附件描述。
+普通运行直接向 `runtime.open_agui_run(messages=...)` 提交标准用户消息，由 Runtime 校验并转换。宿主自行分配消息 ID 时，可用 `AgUiUserInput` 提前读取文字和附件引用，并替换已授权的附件描述。
 
 自定义适配集成可使用底层 `tinkerfin_agui_adapter.media` 的 `user_message_to_langchain()` 转换 AG-UI
 用户输入。持久图片使用 `type: "image"`，文档使用 `type: "document"`，
@@ -75,6 +77,15 @@ TEXT_MESSAGE_START 与 TEXT_MESSAGE_END 之间。增量按附件 ID 合并，快
 `tinkerfin_agui_adapter.media` 的 `MessageAttachments` 校验该 CUSTOM 载荷。
 包内提供 `contracts/message-attachments.schema.json`，以及经过真实 LangChain
 工具调用的 Fixture。附件描述不包含文件字节、密钥或临时下载地址。
+
+`AttachmentToolCallResultEvent`、`AttachmentAssistantMessage` 和
+`AttachmentToolMessage` 正式声明 `attachments` 字段；
+`AttachmentMessagesSnapshotEvent` 校验并序列化包含附件的历史消息。
+从通用 AG-UI 回放取得事件后，可调用 `parse_attachment_output_event(event)`，
+将工具结果或消息快照校验为公开的附件类型。包内 `contracts/` 同时提供
+`tool-call-result.schema.json`、`assistant-message.schema.json`、
+`tool-message.schema.json` 和 `messages-snapshot.schema.json`，共享 Fixture
+覆盖实时输出及其对应历史快照。
 
 ## 编码成 SSE
 
@@ -104,8 +115,8 @@ lifecycle = AgUiLifecycleEventFactory()
 identity = RunIdentity(threadId="thread-1", runId="run-1")
 adapter = DeepAgentAgUiAdapter(identity=identity)
 
-await send_event(lifecycle.started(identity=identity))
 try:
+    await send_event(lifecycle.started(identity=identity))
     async for part in parts:
         for event in adapter.process(part):
             await send_event(event)
@@ -127,6 +138,8 @@ except Exception:
             code="runtime_error",
         )
     )
+finally:
+    await parts.aclose()
 ```
 
 `abort()` 只关闭文字、推理和 Tool 子生命周期；自定义编排器仍按上例唯一发送主 `RUN_ERROR`。
@@ -148,7 +161,7 @@ async for event in batched:
 
 ## 如果需要保存自己的 ID
 
-`ScopedIdCodec` 把 namespace、对象类型和原始 ID 编成完整 ID：
+`ScopedIdCodec` 把 graph_namespace、对象类型和原始 ID 编成完整 ID：
 
 ```python
 from tinkerfin_agui_adapter import ScopedIdCodec
@@ -156,10 +169,10 @@ from tinkerfin_agui_adapter import ScopedIdCodec
 
 codec = ScopedIdCodec()
 public_id = codec.encode("tool", ("researcher",), "call-7")
-kind, namespace, raw_id = codec.decode(public_id)
+kind, graph_namespace, raw_id = codec.decode(public_id)
 ```
 
-不要截断 scoped ID，也不要只保存原始 Tool ID；不同 namespace 中可能出现相同原始 ID。
+不要截断 scoped ID，也不要只保存原始 Tool ID；不同 graph_namespace 中可能出现相同原始 ID。
 
 ## 解析框架扩展
 
@@ -183,12 +196,3 @@ Deep Agents `task` 调用发布 `tinkerfin.subagent-provenance` 形状的
 AG-UI `parentRunId` 继续只表达分支和时间旅行谱系。
 
 下一篇：[AG-UI 使用参考](api-reference.md)。
-
-`AttachmentToolCallResultEvent`、`AttachmentAssistantMessage` 和
-`AttachmentToolMessage` 正式声明 `attachments` 字段；
-`AttachmentMessagesSnapshotEvent` 校验并序列化包含附件的历史消息。
-从通用 AG-UI 回放取得事件后，可调用 `parse_attachment_output_event(event)`，
-将工具结果或消息快照校验为公开的附件类型。包内 `contracts/` 同时提供
-`tool-call-result.schema.json`、`assistant-message.schema.json`、
-`tool-message.schema.json` 和 `messages-snapshot.schema.json`，共享 Fixture
-覆盖实时输出及其对应历史快照。

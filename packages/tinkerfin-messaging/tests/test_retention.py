@@ -17,7 +17,7 @@ from tinkerfin_messaging._messaging_ledger import _MessagingLedger
 
 
 def _identity(run_id: str = "run-retention") -> RunIdentity:
-    return RunIdentity(threadId="thread-retention", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-retention", run_id=run_id)
 
 
 async def _start(

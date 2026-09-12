@@ -14,7 +14,7 @@ async def cancel_agent(context):
     return cancellation_tail
 
 
-body = await channel.sse(
+body = await channel.open_sse(
     source,
     identity=identity,
     cancel=cancel_agent,
@@ -31,10 +31,9 @@ The callback may take no arguments or one `CancelContext`. It may return a finit
 
 TinkerFin AG-UI streams already declare cancellation. Do not also pass `cancel=` when the source owns that callback.
 
-`cancel()` is a Messaging preflight operation: it cannot outlive the facade and continue
-against a closed borrowed backend. During shutdown, Messaging first signals current
-producers, then joins cancel preflights and producer settlement so the two paths cannot
-form a wait cycle.
+Messaging rejects new cancellation requests after closing starts. Closing first
+signals current producers, then waits for accepted cancellation, settlement and
+resource cleanup to finish.
 
 | Result or error | Meaning |
 | --- | --- |
@@ -46,35 +45,21 @@ form a wait cycle.
 
 ## Create the agent only for the owner
 
-For managed TinkerFin AG-UI runs, use the task-oriented helper:
+Pass the lazy Runtime stream directly to Messaging:
 
 ```python
-from tinkerfin_messaging import create_agui_run_source
-
-
-source = create_agui_run_source(
-    identity,
-    open_events=lambda run_identity: tinkerfin.open_agui_run(
-        run_identity,
-        agent=create_agent,
-        input=graph_input,
-        config=graph_config,
-    ),
-    transform_event=add_product_metadata,
+source = runtime.open_agui_run(
+    thread_id="thread-42", run_id="run-7", input=graph_input,
 )
 ```
 
-The helper opens the Agent only after Messaging selects this caller as owner. It hides
-Binding, profile constants, source types, mapping, and the first-event cancellation
-fence. The exact `RunIdentity` supplied once to the helper is passed to `open_events`.
-`transform_event` may enrich product metadata or content, but it must preserve the
-concrete event type, every protocol correlation identity, and the complete optional
-`RUN_STARTED.input` supplied by the caller.
+Messaging opens the Agent only after selecting this source as producer. Attachments
+reuse existing state without repeating Agent or Sandbox preparation.
 
 Use channel callbacks for host delivery state:
 
 ```python
-body = await channel.sse(
+body = await channel.open_sse(
     source,
     on_source_ready=activate_business_run,
     on_delivery_not_started=cleanup_business_run,
@@ -97,9 +82,8 @@ from tinkerfin_messaging import (
 
 
 async def open_events():
-    runtime = await create_runtime()
-    events = runtime.astream(graph_input, graph_config)
-    return MessageSourceBinding(source=events)
+    events = await connect_event_source()
+    return MessageSourceBinding(source=events, cancel=events.cancel)
 
 
 source = DeferredMessageSource(
@@ -108,6 +92,9 @@ source = DeferredMessageSource(
     cancel_after_first_item=True,
 )
 ```
+
+`connect_event_source()` is application code returning an async event source with
+idempotent `aclose()` and a cancellation callback. The callback is passed explicitly.
 
 | Parameter | Purpose |
 | --- | --- |
@@ -156,7 +143,7 @@ source = ProfiledDeferredMessageSource(
 | `replay_type` | required | Value type decoded by the codec |
 | `cancellable` | required | Whether the source supports remote cancellation |
 | `cancel_after_first_item` | `False` | Prevent cancellation from overtaking the first protocol event |
-| `on_owner_preflight` | `None` | Owner-only async activation before producer execution |
+| `on_owner_preflight` | `None` | Source preparation after owner selection and before opener execution |
 
 ## Fixed and transformed sources
 

@@ -1,4 +1,4 @@
-"""Reversible namespace-scoped IDs shared by events and snapshots."""
+"""Reversible graph-scoped IDs shared by events and snapshots."""
 
 from __future__ import annotations
 
@@ -24,14 +24,14 @@ class ScopedIdCodec:
     def encode(
         self,
         kind: ScopedIdKind,
-        namespace: tuple[str, ...],
+        graph_namespace: tuple[str, ...],
         raw_id: str,
     ) -> str:
         """Return an event ID safe from delimiters and cross-scope reuse."""
 
-        self._validate(kind, namespace, raw_id)
+        self._validate(kind, graph_namespace, raw_id)
         payload = json.dumps(
-            [list(namespace), raw_id],
+            [list(graph_namespace), raw_id],
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -70,23 +70,25 @@ class ScopedIdCodec:
             or not isinstance(payload_items[1], str)
         ):
             raise ValueError("invalid scoped ID")
-        namespace = cast(tuple[str, ...], tuple(cast(list[object], payload_items[0])))
+        graph_namespace = cast(
+            tuple[str, ...], tuple(cast(list[object], payload_items[0]))
+        )
         kind = cast(ScopedIdKind, raw_kind)
         raw_id = payload_items[1]
-        self._validate(kind, namespace, raw_id)
-        return kind, namespace, raw_id
+        self._validate(kind, graph_namespace, raw_id)
+        return kind, graph_namespace, raw_id
 
     @staticmethod
     def _validate(
         kind: ScopedIdKind,
-        namespace: tuple[str, ...],
+        graph_namespace: tuple[str, ...],
         raw_id: str,
     ) -> None:
         if kind not in _KINDS:
             raise ValueError("unsupported scoped ID kind")
-        if not isinstance(namespace, tuple) or any(
-            not isinstance(segment, str) or not segment for segment in namespace
+        if not isinstance(graph_namespace, tuple) or any(
+            not isinstance(segment, str) or not segment for segment in graph_namespace
         ):
-            raise ValueError("namespace must contain only non-empty strings")
+            raise ValueError("graph_namespace must contain only non-empty strings")
         if not isinstance(raw_id, str) or not raw_id:
             raise ValueError("raw ID must be a non-empty string")

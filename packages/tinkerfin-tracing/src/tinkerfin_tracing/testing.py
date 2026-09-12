@@ -61,19 +61,21 @@ async def verify_trace_ledger_backend(
     resolved_options = options or TraceStoreOptions()
     primary = DurableTraceStore(
         primary_backend,
-        namespace=resolved_namespace,
         options=resolved_options,
     )
     peer = DurableTraceStore(
         peer_backend,
-        namespace=resolved_namespace,
         options=resolved_options,
     )
     await asyncio.gather(primary.setup(), peer.setup())
 
     thread_id = f"thread-{uuid4().hex}"
-    first_identity = RunIdentity(threadId=thread_id, runId="contract-first")
-    second_identity = RunIdentity(threadId=thread_id, runId="contract-second")
+    first_identity = RunIdentity(
+        namespace=resolved_namespace, thread_id=thread_id, run_id="contract-first"
+    )
+    second_identity = RunIdentity(
+        namespace=resolved_namespace, thread_id=thread_id, run_id="contract-second"
+    )
     writers: list[TraceWriter] = []
     generation_key: TraceThreadKey | None = None
     follower: AsyncGenerator[TraceStoreUpdate, None] | None = None
@@ -91,7 +93,7 @@ async def verify_trace_ledger_backend(
             second.append((_run_fact(second_identity, "started"),)),
         )
         assert {first_events[0].trace_seq, second_events[0].trace_seq} == {1, 2}
-        snapshot = await peer.snapshot(thread_id)
+        snapshot = await peer.snapshot(first_identity.thread)
         assert snapshot.as_of_seq == 2
         assert snapshot.active_run_ids == ("contract-first", "contract-second")
 
@@ -110,7 +112,7 @@ async def verify_trace_ledger_backend(
             mandatory=True,
         )
         await asyncio.gather(first.aclose(), second.aclose())
-        snapshot = await primary.snapshot(thread_id)
+        snapshot = await primary.snapshot(first_identity.thread)
         assert snapshot.as_of_seq == 6
         assert snapshot.active_writers == ()
         assert [
@@ -156,7 +158,9 @@ async def verify_trace_ledger_backend(
         )
 
         follower = peer.follow(snapshot.key, after_seq=snapshot.as_of_seq)
-        third_identity = RunIdentity(threadId=thread_id, runId="contract-third")
+        third_identity = RunIdentity(
+            namespace=resolved_namespace, thread_id=thread_id, run_id="contract-third"
+        )
         third = await primary.open_writer(third_identity)
         writers.append(third)
         current = await anext(follower)

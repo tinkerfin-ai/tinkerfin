@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from uuid import NAMESPACE_URL, uuid5
 
@@ -222,18 +223,59 @@ class ConversationRunPreparer:
         registered: RegisteredRun,
         thread_created: bool,
     ) -> None:
-        """幂等释放未结算认领并删除尚未启动的 Run 注册"""
+        """删除本次未启动的运行登记，并等待清理提交完成
 
-        if not registered.created:
-            await self._repository.rollback()
-            return
-        await self._repository.delete_unstarted_run(
-            thread_pk=thread_pk,
-            run_pk=registered.run_id,
-            run_id=identity_run_id,
-            delete_empty_thread=thread_created,
-        )
-        await self._repository.commit()
+        请求取消不会中断已接受的清理，调用方等到数据库操作结束后才收到取消。
+        清理期间独占借用的请求会话；已有登记只结束当前事务，不删除记录。
+
+        Args:
+            thread_pk: 已校验归属的会话主键
+            identity_run_id: 当前请求的运行 ID
+            registered: 本次登记结果，决定是否拥有删除权限
+            thread_created: 是否允许一并删除本次新建的空会话
+
+        Raises:
+            BaseException: 数据库清理失败或请求取消，保留同时发生的异常原因
+        """
+
+        async def cleanup() -> BaseException | None:
+            try:
+                if not registered.created:
+                    await self._repository.rollback()
+                else:
+                    await self._repository.delete_unstarted_run(
+                        thread_pk=thread_pk,
+                        run_pk=registered.run_id,
+                        run_id=identity_run_id,
+                        delete_empty_thread=thread_created,
+                    )
+                    await self._repository.commit()
+            except BaseException as error:  # noqa: BLE001 - 交回请求处理方，避免后台任务丢失控制异常
+                return error
+            return None
+
+        task = asyncio.create_task(cleanup(), name="conversation-registration-cleanup")
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                cancellation = cancellation or error
+        failure = task.result()
+        if cancellation is not None:
+            if failure is not None:
+                primary: BaseException = cancellation
+                secondary: BaseException = failure
+                if not isinstance(failure, (Exception, asyncio.CancelledError)):
+                    primary, secondary = failure, cancellation
+                # 让 Python 保留两条原始异常链；不覆盖供应商已有的 cause
+                try:
+                    raise secondary
+                except BaseException:  # noqa: BLE001 - 按控制异常、取消、普通失败的顺序交付
+                    raise primary
+            raise cancellation
+        if failure is not None:
+            raise failure
 
     async def activate_started(
         self,

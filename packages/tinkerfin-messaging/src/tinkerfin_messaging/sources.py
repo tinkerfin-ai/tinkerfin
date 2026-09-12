@@ -12,6 +12,7 @@ from tinkerfin_contracts import RunIdentity
 
 from ._identity import required_identifier, required_identity
 from ._messaging_boundary import _join_owned_task
+from ._tasks import TaskOutcome, capture, join_owned_task, select_failure
 from .messaging import (
     CancelCallback,
     CancelContext,
@@ -116,7 +117,7 @@ class DeferredMessageSource(Generic[SourceT]):
         self._open_task: asyncio.Task[_DeferredOpenOutcome[SourceT]] | None = None
         self._binding: _OpenedMessageSource[SourceT] | None = None
         self._active_task: asyncio.Task[object] | None = None
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[TaskOutcome[None]] | None = None
         self._owner_preflight = on_owner_preflight
         self._owner_preflight_task: asyncio.Task[BaseException | None] | None = None
 
@@ -342,15 +343,14 @@ class DeferredMessageSource(Generic[SourceT]):
 
     async def _finish(self) -> None:
         task = self._close_task
-        if task is None:
+        if task is None or (task.done() and isinstance(task.result(), BaseException)):
             self._closed = True
             task = asyncio.create_task(
-                self._close_once(),
+                capture(self._close_once()),
                 name="tinkerfin-messaging-deferred-source-close",
             )
-            task.add_done_callback(self._close_finished)
             self._close_task = task
-        await asyncio.shield(task)
+        await join_owned_task(task)
 
     async def _close_once(self) -> None:
         open_task = self._open_task
@@ -358,16 +358,14 @@ class DeferredMessageSource(Generic[SourceT]):
             open_task.cancel()
             await asyncio.gather(open_task, return_exceptions=True)
         binding = self._binding
-        self._binding = None
         self._iterator = None
+        self._first_pull_settled.set()
         if binding is None:
             return
+        # Keep the binding when cleanup fails so a later explicit aclose can
+        # finish an upstream operation that outlived its first waiting limit.
         await binding.source.aclose()
-
-    @staticmethod
-    def _close_finished(task: asyncio.Task[None]) -> None:
-        if not task.cancelled():
-            task.exception()
+        self._binding = None
 
 
 class ProfiledDeferredMessageSource(
@@ -510,7 +508,13 @@ class FiniteMessageSource(Generic[SourceT]):
 
 
 class _MappedMessageSource(Generic[SourceT, MappedT]):
-    """Apply one synchronous or asynchronous transform with source backpressure."""
+    """Transform one item at a time while retaining source preparation and cleanup.
+
+    Pulls stay in their consumer task, preserving upstream cancellation and
+    context. Close attempts have explicit owners. A failed close can be awaited
+    again because MessageSource.aclose is idempotent; only a successful attempt
+    finishes ownership. No pull or transform is prefetched.
+    """
 
     def __init__(
         self,
@@ -524,28 +528,81 @@ class _MappedMessageSource(Generic[SourceT, MappedT]):
         self._normalized_cancel = (
             None if source_cancel is None else _normalize_cancel_callback(source_cancel)
         )
+        owner_preflight = getattr(source, "messaging_owner_preflight", None)
+        if owner_preflight is not None and not callable(owner_preflight):
+            raise TypeError("messaging_owner_preflight must be an async callable")
+        self._owner_preflight = owner_preflight
+        self._cancel_after_first_item = (
+            getattr(source, "messaging_cancel_waits_for_first_item", False) is True
+        )
+        self._first_pull_settled = asyncio.Event()
         self._claimed = False
         self._closed = False
-        self._delivery: AsyncGenerator[MappedT, None] | None = None
-        self._close_task: asyncio.Task[None] | None = None
+        self._exhausted = False
+        self._iterator: AsyncIterator[SourceT] | None = None
+        self._active_consumer: asyncio.Task[object] | None = None
+        self._pull_settled = asyncio.Event()
+        self._pull_settled.set()
+        self._pull_error: BaseException | None = None
+        self._close_task: asyncio.Task[TaskOutcome[None]] | None = None
 
-    def __aiter__(self) -> AsyncIterator[MappedT]:
+    def __aiter__(self) -> _MappedMessageSource[SourceT, MappedT]:
         if self._claimed:
             raise RuntimeError("a mapped source can only be consumed once")
         if self._closed:
             raise RuntimeError("a closed mapped source cannot be consumed")
         self._claimed = True
-        delivery = self._iterate()
-        self._delivery = delivery
-        return delivery
+        return self
+
+    async def __anext__(self) -> MappedT:
+        if self._closed or self._exhausted:
+            raise StopAsyncIteration
+        if self._active_consumer is not None:
+            raise RuntimeError("a mapped source pull is already active")
+        self._active_consumer = asyncio.current_task()
+        self._pull_error = None
+        self._pull_settled.clear()
+        try:
+            # Iterators may retain their consuming Task to implement cancellation
+            # or use ContextVars across yields. Do not move pulls to child Tasks.
+            return await self._pull_once()
+        except BaseException as error:
+            self._pull_error = error
+            raise
+        finally:
+            self._active_consumer = None
+            self._pull_settled.set()
+
+    async def _pull_once(self) -> MappedT:
+        try:
+            iterator = self._iterator
+            if iterator is None:
+                iterator = aiter(self._source)
+                self._iterator = iterator
+            try:
+                item = await anext(iterator)
+            except StopAsyncIteration:
+                self._exhausted = True
+                raise
+            return await self._apply_transform(item)
+        finally:
+            # Cancellation cannot overtake the first transformed lifecycle event.
+            # Failed or exhausted first pulls must also release a waiting cancel.
+            self._first_pull_settled.set()
 
     @property
     def messaging_cancel_callback(self) -> CancelCallback[MappedT] | None:
-        """Publish a mapped callback only when the borrowed source owns one."""
+        """Publish a mapped callback only when the source owns one."""
 
         if self._normalized_cancel is None:
             return None
         return self.cancel
+
+    @property
+    def messaging_cancel_waits_for_first_item(self) -> bool:
+        """Retain the source's first-event cancellation constraint."""
+
+        return self._cancel_after_first_item
 
     def messaging_cancel_callback_matches(self, callback: object) -> bool:
         """Match this callback or the equivalent owner before mapping."""
@@ -555,19 +612,27 @@ class _MappedMessageSource(Generic[SourceT, MappedT]):
         matcher = getattr(self._source, "messaging_cancel_callback_matches", None)
         return bool(callable(matcher) and matcher(callback))
 
-    async def _iterate(self) -> AsyncGenerator[MappedT, None]:
-        try:
-            async for item in self._source:
-                yield await self._apply_transform(item)
-        finally:
-            self._delivery = None
+    async def messaging_owner_preflight(self) -> None:
+        """Prepare the source before Messaging announces owner readiness."""
+
+        if self._closed:
+            raise RuntimeError("a closed mapped source cannot be prepared")
+        if self._owner_preflight is not None:
+            pending = self._owner_preflight()
+            if not inspect.isawaitable(pending):
+                raise TypeError("messaging_owner_preflight must return an awaitable")
+            await pending
 
     async def cancel(self, context: CancelContext) -> tuple[MappedT, ...] | None:
-        """Cancel the borrowed source and atomically transform its finite tail."""
+        """Cancel the source and atomically transform its finite tail."""
 
         callback = self._normalized_cancel
         if callback is None:
             raise RuntimeError("this mapped source is not cancellable")
+        if self._cancel_after_first_item:
+            await self._first_pull_settled.wait()
+        if self._closed:
+            return None
         tail = await _invoke_cancel(callback, context)
         if tail is None:
             return None
@@ -583,48 +648,46 @@ class _MappedMessageSource(Generic[SourceT, MappedT]):
         return cast(MappedT, transformed)
 
     async def aclose(self) -> None:
-        """Close active delivery and the borrowed source exactly once."""
+        """Settle active work and close the source, rejoining after failed cleanup."""
 
+        if self._active_consumer is asyncio.current_task():
+            raise RuntimeError("a transform cannot close its own active source")
         task = self._close_task
-        if task is None:
+        if task is None or (task.done() and isinstance(task.result(), BaseException)):
             self._closed = True
             task = asyncio.create_task(
-                self._close_once(),
+                capture(self._close_once()),
                 name="tinkerfin-messaging-mapped-source-close",
             )
             self._close_task = task
-            task.add_done_callback(self._close_finished)
-        await _join_owned_task(task)
+        await join_owned_task(task)
 
     async def _close_once(self) -> None:
         primary: BaseException | None = None
-        delivery = self._delivery
-        if delivery is not None:
-            try:
-                await delivery.aclose()
-            except BaseException as error:  # noqa: BLE001 - settle cancellation safely
+        consumer = self._active_consumer
+        if consumer is not None:
+            requested = not consumer.done() and not consumer.cancelling()
+            if requested:
+                consumer.cancel()
+            # The consumer can next wait for this close. Join only its current
+            # pull, never the whole producer task, to avoid a cyclic wait.
+            await self._pull_settled.wait()
+            error = self._pull_error
+            if error is not None and not (
+                requested
+                and isinstance(error, asyncio.CancelledError)
+                and error.__cause__ is None
+                and error.__context__ is None
+            ):
                 primary = error
-            finally:
-                self._delivery = None
+        self._first_pull_settled.set()
         try:
             await self._source.aclose()
         except BaseException as error:  # noqa: BLE001 - preserve close outcome
-            if primary is None:
-                primary = error
-            else:
-                primary.add_note(
-                    "Mapped source upstream close also failed: "
-                    f"{type(error).__name__}: {error}"
-                )
+            primary = error if primary is None else select_failure(primary, error)
         if primary is not None:
-            raise primary.with_traceback(primary.__traceback__)
-
-    @staticmethod
-    def _close_finished(task: asyncio.Task[None]) -> None:
-        """Consume a retained close failure when no caller waits again."""
-
-        if not task.cancelled():
-            task.exception()
+            raise primary
+        self._iterator = None
 
 
 @overload
@@ -664,6 +727,8 @@ def map_source(
     Any awaitable returned by ``transform`` is awaited before the next source item is
     requested. The returned source is deliberately unprofiled because a transform can
     change the value type and therefore invalidate the original codec profile.
+    Transform callbacks must not close their own active adapter; close it after
+    the pull returns or from its consuming context's cleanup.
 
     Args:
         source: Single-use source closed when the returned adapter is closed.

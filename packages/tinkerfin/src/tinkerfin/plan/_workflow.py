@@ -26,17 +26,17 @@ from langgraph.typing import ContextT
 from pydantic import ConfigDict, JsonValue, TypeAdapter
 
 from tinkerfin.media import AttachmentSupport
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import PreparedWorkspace
 from tinkerfin_native_stream import RuntimeInterruptEnvelope
 
 from .._agui_lineage_state import (
     CHECKPOINT_ROLE_METADATA_KEY,
-    PARENT_RUN_ID_METADATA_KEY,
+    LINEAGE_CONFIG_KEY,
     PLANNING_CHECKPOINT_ROLE,
     RUN_ID_METADATA_KEY,
-    RUNTIME_PROFILE_METADATA_KEY,
-    lineage_state_update,
+    LineageMarker,
 )
+from .._hitl import _as_permissions
 from ._clarification import (
     build_response_schema,
     pending_contract_digest,
@@ -234,14 +234,14 @@ def _require_schema_fingerprints(
 ) -> None:
     if state.get(PLAN_SCHEMA_FINGERPRINT_KEY) != options.clarification.fingerprint:
         raise PlanModeConfigurationError(
-            "checkpoint clarification schema does not match this Definition"
+            "checkpoint clarification schema does not match this Runtime"
         )
     if (
         state.get(PLAN_CONTENT_SCHEMA_FINGERPRINT_KEY)
         != options.content.reference.fingerprint
     ):
         raise PlanModeConfigurationError(
-            "checkpoint Plan content schema does not match this Definition"
+            "checkpoint Plan content schema does not match this Runtime"
         )
 
 
@@ -313,45 +313,15 @@ def _planning_config(value: object) -> RunnableConfig:
         )
     configurable["run_id"] = PLAN_CHECKPOINT_RUN_ID
     configurable[CHECKPOINT_ROLE_METADATA_KEY] = PLANNING_CHECKPOINT_ROLE
+    lineage = configurable.get(LINEAGE_CONFIG_KEY)
+    if lineage is not None:
+        if not isinstance(lineage, LineageMarker):
+            raise PlanModeConfigurationError("Planning requires typed run ownership")
+        configurable[LINEAGE_CONFIG_KEY] = lineage.model_copy(
+            update={"role": "planning"}
+        )
     config["configurable"] = configurable
     return config
-
-
-def _planning_lineage_update(config: RunnableConfig) -> dict[str, object]:
-    """Build the planning-role marker from fully validated Runtime metadata.
-
-    Runtime Profile identity is mandatory so Plan checkpoints cannot later be resumed
-    or handed off through a different upstream integration.
-    """
-
-    configurable = config.get("configurable", {})
-    run_id = configurable.get(RUN_ID_METADATA_KEY)
-    if run_id is None:
-        return {}
-    thread_id = configurable.get("thread_id")
-    parent_run_id = configurable.get(PARENT_RUN_ID_METADATA_KEY)
-    runtime_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
-    if not isinstance(thread_id, str) or not isinstance(run_id, str):
-        raise PlanModeConfigurationError(
-            "Plan Mode requires canonical AG-UI lineage identifiers"
-        )
-    if parent_run_id is not None and not isinstance(parent_run_id, str):
-        raise PlanModeConfigurationError(
-            "Plan Mode requires a canonical AG-UI parent run ID"
-        )
-    if not isinstance(runtime_profile, str) or not runtime_profile:
-        raise PlanModeConfigurationError(
-            "Plan Mode requires a canonical Runtime Profile"
-        )
-    return cast(
-        dict[str, object],
-        lineage_state_update(
-            identity=RunIdentity(threadId=thread_id, runId=run_id),
-            parent_run_id=parent_run_id,
-            runtime_profile=runtime_profile,
-            role="planning",
-        ),
-    )
 
 
 def _create_handoff(
@@ -488,10 +458,7 @@ class PlanningWorkflowGraph(Generic[ContextT]):
         head_config["configurable"] = configurable
         await self._graph.aupdate_state(
             head_config,
-            {
-                **plan_state_update(updated),
-                **_planning_lineage_update(config),
-            },
+            plan_state_update(updated),
             as_node="review_plan",
         )
         return updated
@@ -520,11 +487,14 @@ class _PlanningGraphFactory(Generic[ContextT]):
         self._options = options
 
     def __call__(
-        self, *args: object, **kwargs: object
+        self,
+        *args: object,
+        _workspace: PreparedWorkspace[object, BackendProtocol] | None = None,
+        **kwargs: object,
     ) -> PlanningWorkflowGraph[ContextT]:
         bound = self._signature.bind(*args, **kwargs)
         bound.apply_defaults()
-        return self._build(bound.arguments)
+        return self._build(bound.arguments, workspace=_workspace)
 
     def _require_runtime_configuration(
         self,
@@ -541,6 +511,8 @@ class _PlanningGraphFactory(Generic[ContextT]):
     def _build(
         self,
         arguments: Mapping[str, object],
+        *,
+        workspace: PreparedWorkspace[object, BackendProtocol] | None = None,
     ) -> PlanningWorkflowGraph[ContextT]:
         model = self._require_runtime_configuration(arguments)
         context_schema = cast(type[ContextT] | None, arguments.get("context_schema"))
@@ -575,11 +547,16 @@ class _PlanningGraphFactory(Generic[ContextT]):
             else ()
         )
         resolved_model = resolve_planner_model(self._options.planner_model or model)
+        permissions = _as_permissions(arguments.get("permissions"))
         planner = create_planner_agent(
             resolved_model,
             backend=backend,
             attachments=self._attachments,
             read_only_tools=read_only_tools,
+            permissions=permissions,
+            filesystem_instructions=(
+                None if workspace is None else workspace.filesystem_instructions
+            ),
             clarification=self._options.clarification,
             content=self._options.content,
             response_type=self._options.contracts.planner_response_type,
@@ -590,6 +567,10 @@ class _PlanningGraphFactory(Generic[ContextT]):
             backend=backend,
             attachments=self._attachments,
             read_only_tools=read_only_tools,
+            permissions=permissions,
+            filesystem_instructions=(
+                None if workspace is None else workspace.filesystem_instructions
+            ),
             clarification=self._options.clarification,
             content=self._options.content,
             response_type=self._options.contracts.planner_edit_response_type,

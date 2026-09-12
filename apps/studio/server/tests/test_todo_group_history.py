@@ -11,7 +11,7 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.todo_groups import (
     TaskTraceQueryTimeout,
@@ -32,7 +32,9 @@ from tinkerfin_tracing import (
     TurnFact,
 )
 
-_IDENTITY = RunIdentity(threadId="thread:first-success", runId="run-1")
+_IDENTITY = RunIdentity(
+    namespace="test", thread_id="thread:first-success", run_id="run-1"
+)
 _OCCURRED_AT = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
 
@@ -174,7 +176,7 @@ async def _tracer_with_facts() -> tuple[Tracer, TraceWriter]:
 async def test_query_executor_projects_a_fixed_public_trace_prefix() -> None:
     tracer, writer = await _tracer_with_facts()
     trace = await tracer.get(
-        "thread:first-success",
+        ThreadIdentity(namespace="test", thread_id="thread:first-success"),
         head_run_id="run-1",
     )
     executor = TodoGroupQueryExecutor(capacity=1)

@@ -18,14 +18,16 @@ from tinkerfin_messaging import (
     MessagingBackendProtocolError,
     MessagingBackendTimeout,
     MessagingBackendUnavailable,
-    MessagingChangeCursor,
-    MessagingChangeWait,
     MessagingError,
     MessagingErrorCode,
-    MessagingStateQuery,
-    MessagingStateSnapshot,
     RedisBackend,
     UnexpectedMessagingBackendError,
+)
+from tinkerfin_messaging.backend_contract import (
+    MessagingChangeCursor,
+    MessagingChangeWait,
+    MessagingStateQuery,
+    MessagingStateSnapshot,
 )
 
 
@@ -108,7 +110,9 @@ async def test_redis_change_wait_preserves_cancellation_consumed_by_driver(
         backend.wait_for_messaging_change(
             MessagingChangeWait(
                 channel="events",
-                identity=RunIdentity(threadId="thread-1", runId="run-1"),
+                identity=RunIdentity(
+                    namespace="test", thread_id="thread-1", run_id="run-1"
+                ),
                 generation=1,
                 after=MessagingChangeCursor(message_sequence=0, control_sequence=0),
                 timeout_seconds=1,
@@ -140,7 +144,9 @@ async def test_redis_change_wait_preserves_a_timeout_consumed_by_driver() -> Non
                 await backend.wait_for_messaging_change(
                     MessagingChangeWait(
                         channel="events",
-                        identity=RunIdentity(threadId="thread-1", runId="run-1"),
+                        identity=RunIdentity(
+                            namespace="test", thread_id="thread-1", run_id="run-1"
+                        ),
                         generation=1,
                         after=MessagingChangeCursor(
                             message_sequence=0, control_sequence=0
@@ -164,7 +170,9 @@ async def test_redis_backend_preserves_driver_control_exceptions(
         backend.load_messaging_state(
             MessagingStateQuery(
                 channel="events",
-                identity=RunIdentity(threadId="thread-1", runId="run-1"),
+                identity=RunIdentity(
+                    namespace="test", thread_id="thread-1", run_id="run-1"
+                ),
             )
         )
     )
@@ -219,7 +227,7 @@ def test_error_separates_and_copies_safe_and_diagnostic_context() -> None:
 
 
 async def test_facade_wraps_an_undeclared_custom_backend_failure() -> None:
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     async with Messaging(backend=_FailingBackend()) as messaging:
         channel = messaging.channel(name="events")
         with pytest.raises(UnexpectedMessagingBackendError) as raised:
@@ -252,7 +260,7 @@ async def test_redis_backend_translates_driver_failures(
 ) -> None:
     client = cast(Redis, _FailingRedis(driver_error))
     backend = RedisBackend(client)
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
     with pytest.raises(expected_type) as raised:
         await backend.load_messaging_state(
@@ -272,7 +280,7 @@ async def test_redis_backend_translates_driver_failures(
 async def test_redis_protocol_details_are_trusted_diagnostics_only() -> None:
     client = cast(Redis, _ProtocolRedis())
     backend = RedisBackend(client)
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
     with pytest.raises(MessagingBackendProtocolError) as raised:
         await backend.load_messaging_state(

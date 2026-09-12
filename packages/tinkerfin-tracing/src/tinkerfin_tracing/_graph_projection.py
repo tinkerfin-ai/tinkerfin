@@ -80,7 +80,7 @@ def reduce_trace_graph_records(
                 status=node.status,
                 name=node.name,
                 run_id=node.run_id,
-                namespace=node.namespace,
+                graph_namespace=node.graph_namespace,
                 agent_name=node.agent_name,
                 provider=node.provider,
                 model=node.model,
@@ -155,7 +155,7 @@ def _assistant_tool_call_only(
         isinstance(event.fact, ModelCallFact)
         and bool(event.fact.tool_call_ids)
         and any(
-            scope_id("message", event.fact.namespace, source_id) == record.node_id
+            scope_id("message", event.fact.graph_namespace, source_id) == record.node_id
             for source_id in event.fact.output_message_ids
         )
         for event in (
@@ -206,22 +206,22 @@ def _context_content(
     return (values[0] if len(values) == 1 else values), False
 
 
-def _tool_node(namespace: tuple[str, ...], source_id: str) -> str:
-    return scope_id("tool", namespace, source_id)
+def _tool_node(graph_namespace: tuple[str, ...], source_id: str) -> str:
+    return scope_id("tool", graph_namespace, source_id)
 
 
 def _subagent_input_node(fact: SubagentFact) -> str:
-    return scope_id("subagent-input", fact.namespace, fact.subagent_id)
+    return scope_id("subagent-input", fact.graph_namespace, fact.subagent_id)
 
 
-def _subagent_owner(namespace: tuple[str, ...]) -> str | None:
-    if not namespace:
+def _subagent_owner(graph_namespace: tuple[str, ...]) -> str | None:
+    if not graph_namespace:
         return None
-    return scope_id("subagent", namespace, namespace[-1])
+    return scope_id("subagent", graph_namespace, graph_namespace[-1])
 
 
-def _outer_subagent_owner(namespace: tuple[str, ...]) -> str | None:
-    return _subagent_owner(namespace[:-1])
+def _outer_subagent_owner(graph_namespace: tuple[str, ...]) -> str | None:
+    return _subagent_owner(graph_namespace[:-1])
 
 
 def _message_fact_for(record: TraceGraphNodeRecord) -> MessageFact | None:
@@ -280,9 +280,12 @@ def _validate_locator_slots(record: TraceGraphNodeRecord) -> None:
             raise TraceStoreProtocolError(
                 f"Trace Graph {name} locator produces another node kind"
             )
-        if mutation.namespace is not None and mutation.namespace != record.namespace:
+        if (
+            mutation.graph_namespace is not None
+            and mutation.graph_namespace != record.graph_namespace
+        ):
             raise TraceStoreProtocolError(
-                f"Trace Graph {name} locator produces another namespace"
+                f"Trace Graph {name} locator produces another graph_namespace"
             )
         if (
             mutation.parent_subagent_id is not None
@@ -339,7 +342,7 @@ def _assistant_run_terminal_locator(
     if (
         record.kind is not TraceGraphNodeKind.ASSISTANT_MESSAGE
         or not isinstance(fact, RunFact)
-        or fact.namespace
+        or fact.graph_namespace
         or fact.identity.run_id != record.run_id
     ):
         return None
@@ -407,12 +410,12 @@ def _validate_locator_ownership(
             and _assistant_run_terminal_locator(record, event) is not None
         )
         if (
-            fact.namespace != record.namespace
+            fact.graph_namespace != record.graph_namespace
             and not isinstance(fact, TurnFact)
             and not run_terminal
         ):
             raise TraceStoreProtocolError(
-                "Trace Graph locator belongs to another namespace"
+                "Trace Graph locator belongs to another graph_namespace"
             )
 
     subagent_fact = next(
@@ -424,9 +427,11 @@ def _validate_locator_ownership(
         None,
     )
     if record.kind is TraceGraphNodeKind.SUBAGENT:
-        if not record.namespace:
-            raise TraceStoreProtocolError("Subagent Graph event requires a namespace")
-        expected_parent_subagent_id = _outer_subagent_owner(record.namespace)
+        if not record.graph_namespace:
+            raise TraceStoreProtocolError(
+                "Subagent Graph event requires a graph_namespace"
+            )
+        expected_parent_subagent_id = _outer_subagent_owner(record.graph_namespace)
     elif record.kind is TraceGraphNodeKind.HUMAN_MESSAGE and isinstance(
         subagent_fact, SubagentFact
     ):
@@ -442,11 +447,13 @@ def _validate_locator_ownership(
                 "Trace Graph facts disagree on Subagent scope ownership"
             )
         expected_parent_subagent_id = (
-            _subagent_owner(record.namespace) if scope_evidence == {True} else None
+            _subagent_owner(record.graph_namespace)
+            if scope_evidence == {True}
+            else None
         )
     if record.parent_subagent_id != expected_parent_subagent_id:
         raise TraceStoreProtocolError(
-            "Trace Graph Subagent owner conflicts with its namespace"
+            "Trace Graph Subagent owner conflicts with its graph_namespace"
         )
 
     model_call_ids: set[str] = set()
@@ -458,13 +465,13 @@ def _validate_locator_ownership(
             fact, ModelCallFact
         ):
             if any(
-                scope_id("message", fact.namespace, source_id) == record.node_id
+                scope_id("message", fact.graph_namespace, source_id) == record.node_id
                 for source_id in fact.output_message_ids
             ):
                 model_call_ids.add(fact.call_id)
         elif record.kind is TraceGraphNodeKind.TOOL:
             if isinstance(fact, ModelCallFact) and any(
-                _tool_node(fact.namespace, source_id) == record.node_id
+                _tool_node(fact.graph_namespace, source_id) == record.node_id
                 for source_id in fact.tool_call_ids
             ):
                 model_call_ids.add(fact.call_id)
@@ -502,7 +509,7 @@ def _validate_locator_ownership(
             not isinstance(event.fact, ModelCallFact)
             or event.fact.phase != "started"
             or record.node_id
-            != scope_id("context", event.fact.namespace, event.fact.call_id)
+            != scope_id("context", event.fact.graph_namespace, event.fact.call_id)
             for event in events
             if event is not None
         ):
@@ -516,14 +523,14 @@ def _validate_locator_ownership(
             fact = event.fact
             if (
                 isinstance(fact, ToolFact)
-                and _tool_node(fact.namespace, fact.source_tool_call_id)
+                and _tool_node(fact.graph_namespace, fact.source_tool_call_id)
                 != record.node_id
             ):
                 raise TraceStoreProtocolError("Tool locator belongs to another call")
             if (
                 isinstance(fact, ToolExecutionFact)
                 and fact.source_tool_call_id is not None
-                and _tool_node(fact.namespace, fact.source_tool_call_id)
+                and _tool_node(fact.graph_namespace, fact.source_tool_call_id)
                 != record.node_id
             ):
                 raise TraceStoreProtocolError("Tool execution belongs to another call")
@@ -587,7 +594,7 @@ def _validate_locator_ownership(
             not isinstance(event.fact, PlanRevisionFact)
             or scope_id(
                 "plan",
-                event.fact.namespace,
+                event.fact.graph_namespace,
                 event.fact.identity.run_id,
             )
             != record.node_id
@@ -742,7 +749,7 @@ def project_trace_graph_node(
                     (
                         candidate
                         for candidate in model_fact.output_message_ids
-                        if scope_id("message", model_fact.namespace, candidate)
+                        if scope_id("message", model_fact.graph_namespace, candidate)
                         == record.node_id
                     ),
                     None,
@@ -844,7 +851,7 @@ def project_trace_graph_node(
         status=record.status,
         name=record.name,
         run_id=record.run_id,
-        namespace=record.namespace,
+        graph_namespace=record.graph_namespace,
         agent_name=record.agent_name,
         provider=record.provider,
         model=record.model,

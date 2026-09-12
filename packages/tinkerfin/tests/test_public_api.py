@@ -13,36 +13,54 @@ from tinkerfin import (
 
 def test_top_level_exposes_the_stateless_runtime_contract() -> None:
     expected = {
-        "AgUiSettlementTimeoutError",
-        "AgUiEventStream",
         "AgUiResumeBinding",
         "AgUiResumeBindingError",
         "AgUiResumeCheckpoint",
         "AgUiResumeCheckpointObserver",
         "AgUiResumeNotSavedObserver",
         "AgUiResumeRequest",
+        "AgUiRunStream",
+        "AgUiSettlementTimeoutError",
         "AgUiUserInput",
+        "AgentMode",
+        "AgentRuntime",
         "AttachmentImage",
         "AttachmentSupport",
-        "AgentMode",
         "ContextKind",
-        "DeepAgentAgUiRuntime",
-        "DeepAgentAgUiResumeRuntime",
-        "DeepAgentDefinition",
-        "DeepAgentRuntime",
+        "EventObserver",
+        "RunIdentity",
+        "RunObservationError",
+        "NativeRunStream",
+        "NativeStreamPart",
+        "PartObserver",
+        "SseBody",
+        "SseEventIdResolver",
+        "SseMapper",
+        "SsePayload",
+        "SsePreflight",
+        "TinkerFin",
+        "TinkerFinError",
+        "TinkerFinErrorCode",
+        "TinkerFinLifecycleError",
+        "TinkerFinStreamProtocolError",
+        "TraceContribution",
+        "trace_contribution",
+    }
+
+    assert set(tinkerfin.__all__) == expected
+    assert all(getattr(tinkerfin, name) is not None for name in expected)
+    assert issubclass(AgUiSettlementTimeoutError, TimeoutError)
+
+
+def test_extension_contracts_are_not_exposed_from_the_root() -> None:
+    extension_names = {
         "DeepAgentsFactoryPreparation",
         "DeepAgentsRuntimeProfile",
         "DeepAgentsV2RuntimeProfile",
         "DeepAgentsV3RuntimeProfile",
-        "EventObserver",
-        "RunIdentity",
-        "RunObservationError",
         "InMemoryRunCoordinator",
-        "NativeGraphRunStream",
         "NativeStreamDriver",
         "NativeStreamFrame",
-        "NativeStreamPart",
-        "PartObserver",
         "ReasoningExtractor",
         "RedisLeaseError",
         "RedisLeaseLifecycleError",
@@ -54,25 +72,11 @@ def test_top_level_exposes_the_stateless_runtime_contract() -> None:
         "RunCoordinationOwnershipLostError",
         "RunCoordinationTimeoutError",
         "RunCoordinationUnavailableError",
-        "SseBody",
-        "SseEventIdResolver",
-        "SseMapper",
-        "SsePayload",
-        "SsePreflight",
-        "TinkerFin",
-        "TINKERFIN_HITL_CONTRACT",
-        "TinkerFinError",
-        "TinkerFinErrorCode",
-        "TinkerFinLifecycleError",
-        "TinkerFinStreamProtocolError",
-        "TraceContribution",
         "join_task",
-        "trace_contribution",
     }
 
-    assert set(tinkerfin.__all__) == expected
-    assert all(getattr(tinkerfin, name) is not None for name in expected)
-    assert issubclass(AgUiSettlementTimeoutError, TimeoutError)
+    assert extension_names.isdisjoint(tinkerfin.__all__)
+    assert all(not hasattr(tinkerfin, name) for name in extension_names)
 
 
 def test_factory_has_no_application_resource_lifecycle() -> None:

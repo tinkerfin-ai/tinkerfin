@@ -32,7 +32,7 @@ from tinkerfin_agui_adapter import (
 )
 from tinkerfin_contracts import RunIdentity, RunResumeSummary
 
-from ._agui_lineage_state import RESUME_MARKER_STATE_KEY
+from ._agui_lineage_state import LineageRole, ResumeAnchor, ResumeIntent
 from ._hitl import CANCEL_DECISION_TYPE
 from .errors import AgUiResumeBindingError
 
@@ -52,8 +52,8 @@ class AgUiResumeRequest(BaseModel):
     """Carry only untrusted client decisions into framework checkpoint resolution.
 
     The request contains no server interrupt payload, native command, checkpoint
-    identity, or Runtime Profile selection. A Definition resolves those facts from its
-    concrete checkpointer before producing :class:`AgUiResumeBinding`.
+    identity, or integration selection. The Runtime resolves those facts from its
+    checkpoint before applying the decisions.
     """
 
     model_config = ConfigDict(
@@ -112,53 +112,6 @@ def _observation_group_summary(
     return status, decision
 
 
-class _ResumeMarker(BaseModel):
-    """Validated private checkpoint evidence for one saver-readable resume intent."""
-
-    model_config = ConfigDict(
-        alias_generator=_to_camel,
-        populate_by_name=True,
-        extra="forbid",
-        frozen=True,
-        strict=True,
-    )
-
-    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    thread_id: str = Field(min_length=1)
-    run_id: str = Field(min_length=1)
-    parent_run_id: str | None = Field(default=None, min_length=1)
-    native_interrupt_ids: tuple[str, ...] = Field(min_length=1)
-
-    @field_validator("native_interrupt_ids", mode="before")
-    @classmethod
-    def interrupt_ids_are_json_arrays(cls, value: object) -> object:
-        """Normalize JSON arrays before strict tuple validation."""
-
-        if isinstance(value, list):
-            return tuple(cast(list[object], value))
-        return value
-
-    @field_validator("thread_id", "run_id", "parent_run_id")
-    @classmethod
-    def identifiers_are_canonical(cls, value: str | None) -> str | None:
-        """Reject marker identities that cannot produce stable checkpoint evidence."""
-
-        if value is not None and value != value.strip():
-            raise ValueError("resume marker identifiers must be canonical")
-        return value
-
-    @model_validator(mode="after")
-    def interrupt_ids_are_canonical(self) -> _ResumeMarker:
-        """Require a stable unique native interrupt set."""
-
-        values = self.native_interrupt_ids
-        if any(not value or value != value.strip() for value in values):
-            raise ValueError("native interrupt IDs must be canonical strings")
-        if len(set(values)) != len(values):
-            raise ValueError("native interrupt IDs must be unique")
-        return self
-
-
 @dataclass(frozen=True, slots=True)
 class AgUiResumeCheckpoint:
     """Stable evidence delivered after a resume marker is saver-readable.
@@ -183,12 +136,10 @@ AgUiResumeNotSavedObserver: TypeAlias = Callable[[], Awaitable[None]]
 class AgUiResumeBinding(BaseModel):
     """Persist validated resume and cancellation facts without run identity.
 
-    The common host path receives this model from
-    :meth:`DeepAgentDefinition.prepare_agui_resume`, which resolves authoritative facts
-    from the Graph checkpoint. :meth:`from_agui` remains an advanced boundary for hosts
-    that already own a complete trusted AG-UI terminal log. The model has a stable JSON
-    round trip, but owns no graph, checkpointer, identity, parent lineage, callback, or
-    I/O resource. Native ``Command`` creation remains private to the Runtime.
+    The Runtime resolves these facts from checkpoint evidence. Integration code can
+    validate complete trusted AG-UI terminal logs with from_agui(). Ordinary runs
+    accept AgUiResumeRequest and perform their own checkpoint validation. This value
+    owns no execution resources; native continuation commands remain internal.
     """
 
     model_config = ConfigDict(
@@ -304,6 +255,22 @@ class AgUiResumeBinding(BaseModel):
         resume_data = self._resume_snapshot()
         return _contains_cancel_decision(cast(dict[str, JsonValue], resume_data))
 
+    def _cancelled_native_groups(self) -> frozenset[str]:
+        """Select only native groups that will receive custom cancellation decisions."""
+
+        snapshot = self._resume_snapshot()
+        if self.mode == "abandon" or snapshot is None:
+            return frozenset()
+        single_group = len(self.native_interrupt_ids) == 1
+        return frozenset(
+            interrupt_id
+            for interrupt_id in self.native_interrupt_ids
+            if _observation_group_summary(
+                snapshot if single_group else snapshot.get(interrupt_id)
+            )[0]
+            == "cancelled"
+        )
+
     def _observation_summaries(self) -> tuple[RunResumeSummary, ...]:
         """Return protocol-neutral interaction outcomes for Runtime observers."""
 
@@ -334,14 +301,17 @@ class AgUiResumeBinding(BaseModel):
         *,
         request: AgUiResumeRequest,
         interrupts: Sequence[AgentRuntimeInterrupt],
-        messages_by_namespace: Mapping[tuple[str, ...], Sequence[BaseMessage]],
+        messages_by_graph_namespace: Mapping[tuple[str, ...], Sequence[BaseMessage]],
+        interrupt_graph_namespaces: Mapping[str, tuple[str, ...]] | None = None,
     ) -> AgUiResumeBinding:
         """Build a binding from one framework-resolved checkpoint snapshot.
 
         Args:
             request: Client decisions with no trusted interrupt payload.
             interrupts: Complete pending native interrupts from the canonical head.
-            messages_by_namespace: Complete checkpoint messages used to prove Tool IDs.
+            messages_by_graph_namespace: Complete checkpoint messages used to prove Tool IDs.
+            interrupt_graph_namespaces: Authoritative Graph location for each native
+                interrupt, required to distinguish identical reviews in different Graphs.
 
         Returns:
             Frozen binding for resume, mixed cancellation, or abandonment.
@@ -358,7 +328,8 @@ class AgUiResumeBinding(BaseModel):
             translation = ResumeMapper().map(
                 entries=request.entries,
                 interrupts=interrupts,
-                messages_by_namespace=messages_by_namespace,
+                messages_by_graph_namespace=messages_by_graph_namespace,
+                interrupt_graph_namespaces=interrupt_graph_namespaces,
             )
         except ResumeMappingError as error:
             raise AgUiResumeBindingError(
@@ -468,13 +439,13 @@ class AgUiResumeBinding(BaseModel):
         raw = object.__getattribute__(self, "__dict__").get("resume_data")
         return copy.deepcopy(cast(dict[str, JsonValue] | None, raw))
 
-    def _marker(
+    def _marker_id(
         self,
         *,
         identity: RunIdentity,
         parent_run_id: str | None,
-    ) -> _ResumeMarker:
-        """Build deterministic private evidence for one canonical run scope."""
+    ) -> str:
+        """Identify the exact decisions and complete logical run for idempotency."""
 
         self._validate_scope(identity=identity, parent_run_id=parent_run_id)
         if self.mode != "resume":
@@ -483,6 +454,7 @@ class AgUiResumeBinding(BaseModel):
         if resume_data is None:  # pragma: no cover - protected by model validation
             raise RuntimeError("resume binding lost its native data")
         digest_payload = {
+            "namespace": identity.namespace,
             "threadId": identity.thread_id,
             "runId": identity.run_id,
             "parentRunId": parent_run_id,
@@ -498,48 +470,75 @@ class AgUiResumeBinding(BaseModel):
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        return _ResumeMarker(
-            digest=hashlib.sha256(encoded).hexdigest(),
-            thread_id=identity.thread_id,
-            run_id=identity.run_id,
-            parent_run_id=parent_run_id,
-            native_interrupt_ids=self.native_interrupt_ids,
-        )
+        return hashlib.sha256(encoded).hexdigest()
 
-    def _state_update(
+    def _marker(
         self,
         *,
         identity: RunIdentity,
         parent_run_id: str | None,
-        state_update: Mapping[str, object],
-    ) -> dict[str, object]:
-        """Return the private state written before a native decision is submitted.
+        runtime_profile: str,
+        role: LineageRole,
+        source_checkpoint_id: str,
+        source_checkpoint_ns: str,
+        anchors: tuple[ResumeAnchor, ...],
+        storage_checkpoint_id: str,
+        storage_checkpoint_ns: str,
+    ) -> ResumeIntent:
+        """Bind prepared decisions to the exact source, profile, and Graph role."""
 
-        LangGraph 1.2.10 does not guarantee that ``Command(update=..., resume=...)`` is
-        saver-readable before its first streamed part on every supported Python version.
-        The selected Runtime Profile therefore persists these private writes on the
-        exact interrupted checkpoint before decision submission. The returned mapping
-        contains no decision payload and is never exposed through AG-UI or Observation.
-        """
-
-        marker = self._marker(identity=identity, parent_run_id=parent_run_id)
-        update = dict(state_update)
-        if RESUME_MARKER_STATE_KEY in update:
-            raise ValueError("state_update cannot replace the private resume marker")
-        update[RESUME_MARKER_STATE_KEY] = marker.model_dump(
-            mode="json",
-            by_alias=True,
-            exclude_none=False,
+        return ResumeIntent(
+            digest=self._marker_id(identity=identity, parent_run_id=parent_run_id),
+            namespace=identity.namespace,
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id=parent_run_id,
+            runtime_profile=runtime_profile,
+            role=role,
+            source_checkpoint_id=source_checkpoint_id,
+            source_checkpoint_ns=source_checkpoint_ns,
+            native_interrupt_ids=self.native_interrupt_ids,
+            anchors=anchors,
+            storage_checkpoint_id=storage_checkpoint_id,
+            storage_checkpoint_ns=storage_checkpoint_ns,
+            decisions_json=json.dumps(
+                self._native_decisions(),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ),
         )
-        return update
 
-    def _invocation_command(self) -> Command[object]:
-        """Return the native decision submitted from a verified staged checkpoint."""
+    def _native_decisions(self) -> dict[str, JsonValue]:
+        """Address every decision by native interrupt ID, including single groups."""
 
         resume_data = self._resume_snapshot()
         if resume_data is None:  # pragma: no cover - protected by model validation
             raise RuntimeError("resume binding lost its native data")
-        return Command(resume=resume_data)
+        if len(self.native_interrupt_ids) == 1:
+            return {self.native_interrupt_ids[0]: resume_data}
+        if set(resume_data) != set(self.native_interrupt_ids):
+            raise ValueError("native decisions must cover the complete interrupt batch")
+        return resume_data
+
+    def _invocation_command(
+        self, missing_interrupt_ids: frozenset[str]
+    ) -> Command[object] | None:
+        """Submit only original groups whose decisions have not been consumed.
+
+        LangGraph 1.2.10 appends an ID-mapped value to a task's saved resume list.
+        Resending consumed groups could answer a later interrupt in the same task.
+        """
+
+        if not missing_interrupt_ids:
+            return None
+        decisions = self._native_decisions()
+        if not missing_interrupt_ids <= decisions.keys():
+            raise ValueError("missing decisions are outside the original batch")
+        return Command(
+            resume={key: decisions[key] for key in sorted(missing_interrupt_ids)}
+        )
 
     def _checkpoint(
         self,
@@ -549,11 +548,11 @@ class AgUiResumeBinding(BaseModel):
     ) -> AgUiResumeCheckpoint:
         """Return stable host evidence for a durably prepared resume intent."""
 
-        marker = self._marker(identity=identity, parent_run_id=parent_run_id)
+        marker_id = self._marker_id(identity=identity, parent_run_id=parent_run_id)
         return AgUiResumeCheckpoint(
             identity=identity,
             parent_run_id=parent_run_id,
-            marker_id=marker.digest,
+            marker_id=marker_id,
             native_interrupt_ids=frozenset(self.native_interrupt_ids),
         )
 
@@ -577,11 +576,11 @@ class AgUiResumeBinding(BaseModel):
             raise ValueError("parent_run_id must differ from identity.run_id")
 
 
-def parse_resume_marker(value: object) -> _ResumeMarker | None:
+def parse_resume_marker(value: object) -> ResumeIntent | None:
     """Parse private checkpoint marker data without weakening corrupt-state checks."""
 
     try:
-        return _ResumeMarker.model_validate(value)
+        return ResumeIntent.model_validate(value)
     except (TypeError, ValidationError):
         return None
 
@@ -611,7 +610,6 @@ def _contains_cancel_decision(value: object) -> bool:
 
 
 __all__ = [
-    "RESUME_MARKER_STATE_KEY",
     "AgUiResumeBinding",
     "AgUiResumeCheckpoint",
     "AgUiResumeCheckpointObserver",

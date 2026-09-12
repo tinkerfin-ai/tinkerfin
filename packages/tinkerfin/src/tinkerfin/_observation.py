@@ -64,6 +64,8 @@ from tinkerfin_native_stream import (
     to_json_value,
 )
 
+from ._failure_evidence import retain_failure, select_failure
+from ._run_callbacks import callback_scope
 from ._tasks import join_task
 from .errors import RunObservationError
 
@@ -203,7 +205,7 @@ def native_observation(
     if isinstance(part, NativeMessageStreamPart):
         return NativeMessageObservation(
             identity=context.identity,
-            namespace=part.ns,
+            graph_namespace=part.ns,
             observed_at=observed_at,
             monotonic_ns=monotonic_ns,
             message=_message_record(part.data.message),
@@ -215,7 +217,7 @@ def native_observation(
             metadata = payload.metadata
             return NativeTaskObservation(
                 identity=context.identity,
-                namespace=part.ns,
+                graph_namespace=part.ns,
                 observed_at=observed_at,
                 monotonic_ns=monotonic_ns,
                 phase="start",
@@ -234,7 +236,7 @@ def native_observation(
         error = payload.error
         return NativeTaskObservation(
             identity=context.identity,
-            namespace=part.ns,
+            graph_namespace=part.ns,
             observed_at=observed_at,
             monotonic_ns=monotonic_ns,
             phase="result",
@@ -263,7 +265,7 @@ def native_observation(
         }
         return NativeStateObservation(
             identity=context.identity,
-            namespace=part.ns,
+            graph_namespace=part.ns,
             observed_at=observed_at,
             monotonic_ns=monotonic_ns,
             state=state,
@@ -284,7 +286,7 @@ def native_observation(
     ).encode()
     return NativeExtraObservation(
         identity=context.identity,
-        namespace=part.ns,
+        graph_namespace=part.ns,
         observed_at=observed_at,
         monotonic_ns=monotonic_ns,
         mode=part.type,
@@ -464,7 +466,10 @@ class RuntimeObservationHub:
         for index, observer in enumerate(self._observers):
             name = f"{type(observer).__module__}.{type(observer).__qualname__}"
             try:
-                session = await observer.open_run(self.context.model_copy(deep=True))
+                with callback_scope():
+                    session = await observer.open_run(
+                        self.context.model_copy(deep=True)
+                    )
                 if not isinstance(session, RunObservationSession):
                     raise TypeError(
                         "RuntimeObserver.open_run must return RunObservationSession"
@@ -601,10 +606,16 @@ class RuntimeObservationHub:
                     error = await join_task(operation, suppress_task_cancellation=True)
                     if error is not None:
                         if not isinstance(error, Exception | asyncio.CancelledError):
+                            retain_failure(
+                                error,
+                                cancellation,
+                                label="Observer delivery was also cancelled",
+                            )
                             raise error
-                        cancellation.add_note(
-                            "Observer operation cleanup also failed: "
-                            f"{type(error).__name__}: {error}"
+                        retain_failure(
+                            cancellation,
+                            error,
+                            label="Observer operation cleanup also failed",
                         )
                     raise cancellation
                 error = operation.result()
@@ -633,7 +644,8 @@ class RuntimeObservationHub:
         """
 
         try:
-            await operation()
+            with callback_scope():
+                await operation()
         except BaseException as error:  # noqa: BLE001 - transport without conversion
             return error
         return None
@@ -890,19 +902,11 @@ class RuntimeObservationHub:
             if process_control is None:
                 process_control = error
                 return
-            if isinstance(process_control, asyncio.CancelledError) and not isinstance(
-                error, Exception | asyncio.CancelledError
-            ):
-                # Registration order cannot let cancellation mask process control.
-                error.add_note(
-                    "Runtime Observer cleanup was also cancelled: "
-                    f"{type(process_control).__name__}: {process_control}"
-                )
-                process_control = error
-                return
-            process_control.add_note(
-                "another Runtime Observer process-control outcome occurred in "
-                f"{source}: {type(error).__name__}: {error}"
+            # Registration order cannot let cancellation mask process control.
+            process_control = select_failure(
+                process_control,
+                error,
+                label=f"Runtime Observer cleanup also failed in {source}",
             )
 
         try:
@@ -941,7 +945,8 @@ class RuntimeObservationHub:
             if waiter is not None and not waiter.done():
                 waiter.cancel()
             try:
-                await slot.session.aclose()
+                with callback_scope():
+                    await slot.session.aclose()
             except asyncio.CancelledError as error:
                 retain_process_control(error, source=slot.name)
             except Exception as error:  # noqa: BLE001 - Observer extension boundary
@@ -961,9 +966,10 @@ class RuntimeObservationHub:
             failure.cancel()
         if process_control is not None:
             for name, error in failures:
-                process_control.add_note(
-                    f"Runtime Observer cleanup also failed in {name}: "
-                    f"{type(error).__name__}: {error}"
+                retain_failure(
+                    process_control,
+                    error,
+                    label=f"Runtime Observer cleanup also failed in {name}",
                 )
             raise process_control
         if failures:

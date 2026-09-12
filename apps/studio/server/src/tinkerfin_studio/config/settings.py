@@ -27,7 +27,6 @@ _DEFAULT_ATTACHMENT_DIRECTORY = Path(".data/attachments")
 _DEFAULT_LOG_FILE_PATH = Path("logs/studio.log")
 _SECRET_FILE_TARGETS = {
     "database_url_file": "database_url",
-    "redis_control_password_file": "redis_control_password",
     "redis_runtime_password_file": "redis_runtime_password",
     "open_sandbox_api_key_file": "open_sandbox_api_key",
     "tavily_api_key_file": "tavily_api_key",
@@ -74,7 +73,7 @@ class DatabaseSettings(BaseModel):
 
 
 class RedisConnectionSettings(BaseModel):
-    """一个独立 Redis 故障域的连接配置"""
+    """Studio Redis 连接配置"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -90,23 +89,11 @@ class RedisConnectionSettings(BaseModel):
     )
 
 
-class RedisControlSettings(RedisConnectionSettings):
-    """认证与 Run Coordinator 使用的低延迟 Redis Control 配置"""
-
-    run_key_prefix: str = Field(min_length=1, description="分布式运行协调键前缀")
-    auth_key_prefix: str = Field(min_length=1, description="认证令牌键前缀")
-
-
 class RedisRuntimeSettings(RedisConnectionSettings):
-    """checkpointer 与 Messaging 使用的 Redis Runtime 配置"""
+    """认证、checkpointer 与 Messaging 共用的 Redis 配置"""
 
     checkpoint_database: int = Field(
         ge=0, le=0, description="支持 RediSearch 的 checkpoint 逻辑库"
-    )
-    messaging_key_prefix: str = Field(min_length=1, description="Messaging 独占键前缀")
-    checkpoint_prefix: str = Field(min_length=1, description="checkpoint 记录键前缀")
-    checkpoint_write_prefix: str = Field(
-        min_length=1, description="checkpoint 写入键前缀"
     )
 
 
@@ -189,40 +176,17 @@ class Settings(BaseSettings):
         default=3600, ge=-1, description="数据库连接回收秒数"
     )
     database_connection_budget: int = Field(
-        default=21, ge=2, description="Studio 进程的 MySQL 总连接预算"
+        default=20, ge=1, description="Studio 进程的 MySQL 总连接预算"
     )
     database_management_connection_reserve: int = Field(
         default=10, ge=1, description="数据库管理与故障处理保留连接数"
-    )
-
-    redis_control_host: str = Field(
-        default="127.0.0.1", min_length=1, description="Redis Control 主机"
-    )
-    redis_control_port: int = Field(
-        default=6379, ge=1, le=65535, description="Redis Control 端口"
-    )
-    redis_control_password: SecretStr | None = Field(
-        default=None, repr=False, description="Redis Control 密码"
-    )
-    redis_control_db: int = Field(default=0, ge=0, description="Redis Control 逻辑库")
-    redis_control_max_connections: int = Field(
-        default=32, ge=8, description="Redis Control 最大连接数"
-    )
-    redis_control_socket_timeout_seconds: float = Field(
-        default=10.0, gt=0, description="Redis Control 命令超时秒数"
-    )
-    redis_control_run_key_prefix: str = Field(
-        default="tinkerfin:studio:run", min_length=1, description="运行协调键前缀"
-    )
-    redis_control_auth_key_prefix: str = Field(
-        default="tinkerfin:studio:auth", min_length=1, description="认证键前缀"
     )
 
     redis_runtime_host: str = Field(
         default="127.0.0.1", min_length=1, description="Redis Runtime 主机"
     )
     redis_runtime_port: int = Field(
-        default=6380, ge=1, le=65535, description="Redis Runtime 端口"
+        default=6379, ge=1, le=65535, description="Redis Runtime 端口"
     )
     redis_runtime_password: SecretStr | None = Field(
         default=None, repr=False, description="Redis Runtime 密码"
@@ -237,22 +201,6 @@ class Settings(BaseSettings):
     redis_runtime_socket_timeout_seconds: float = Field(
         default=10.0, gt=0, description="Redis Runtime 命令超时秒数"
     )
-    redis_runtime_messaging_key_prefix: str = Field(
-        default="tinkerfin:studio:messaging",
-        min_length=1,
-        description="Messaging 键前缀",
-    )
-    redis_runtime_checkpoint_prefix: str = Field(
-        default="tinkerfin:studio:checkpoint",
-        min_length=1,
-        description="checkpoint 键前缀",
-    )
-    redis_runtime_checkpoint_write_prefix: str = Field(
-        default="tinkerfin:studio:checkpoint_write",
-        min_length=1,
-        description="checkpoint 写入键前缀",
-    )
-
     open_sandbox_domain: str = Field(
         default="127.0.0.1:8091", min_length=1, description="OpenSandbox 域名与端口"
     )
@@ -278,11 +226,6 @@ class Settings(BaseSettings):
     auth_token_expire_seconds: int = Field(
         default=86400, ge=60, description="访问令牌有效秒数"
     )
-    messaging_retention_seconds: int = Field(
-        default=86400,
-        ge=0,
-        description="Messaging 终态重播保留秒数，0 表示关闭自动过期",
-    )
     tavily_api_key: SecretStr | None = Field(
         default=None, repr=False, description="Tavily API 密钥"
     )
@@ -293,17 +236,11 @@ class Settings(BaseSettings):
 
         if make_url(self.database_url).drivername != "mysql+asyncmy":
             raise ValueError("DATABASE_URL 必须使用 mysql+asyncmy 驱动")
-        required_connections = self.database_pool_size + self.database_max_overflow + 1
+        required_connections = self.database_pool_size + self.database_max_overflow
         if required_connections > self.database_connection_budget:
             raise ValueError(
-                "DATABASE_CONNECTION_BUDGET 必须覆盖 pool_size + max_overflow + "
-                "1 条 Agent Store 连接"
+                "DATABASE_CONNECTION_BUDGET 必须覆盖 pool_size + max_overflow"
             )
-        if (
-            self.redis_control_host == self.redis_runtime_host
-            and self.redis_control_port == self.redis_runtime_port
-        ):
-            raise ValueError("Redis Control 与 Runtime 必须使用不同物理服务地址")
         return self
 
     @property
@@ -321,23 +258,8 @@ class Settings(BaseSettings):
         )
 
     @property
-    def redis_control(self) -> RedisControlSettings:
-        """返回认证与运行协调使用的 Redis Control 配置"""
-
-        return RedisControlSettings(
-            host=self.redis_control_host,
-            port=self.redis_control_port,
-            password=self.redis_control_password,
-            database=self.redis_control_db,
-            max_connections=self.redis_control_max_connections,
-            socket_timeout_seconds=self.redis_control_socket_timeout_seconds,
-            run_key_prefix=self.redis_control_run_key_prefix,
-            auth_key_prefix=self.redis_control_auth_key_prefix,
-        )
-
-    @property
     def redis_runtime(self) -> RedisRuntimeSettings:
-        """返回 Checkpointer 与 Messaging 使用的 Redis Runtime 配置"""
+        """返回认证、Checkpointer 与 Messaging 共用的 Redis 配置"""
 
         return RedisRuntimeSettings(
             host=self.redis_runtime_host,
@@ -347,9 +269,6 @@ class Settings(BaseSettings):
             checkpoint_database=self.redis_runtime_checkpoint_db,
             max_connections=self.redis_runtime_max_connections,
             socket_timeout_seconds=self.redis_runtime_socket_timeout_seconds,
-            messaging_key_prefix=self.redis_runtime_messaging_key_prefix,
-            checkpoint_prefix=self.redis_runtime_checkpoint_prefix,
-            checkpoint_write_prefix=self.redis_runtime_checkpoint_write_prefix,
         )
 
     @property

@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict, cast
+from collections.abc import Callable, Sequence
+from typing import Any, TypedDict
 from uuid import uuid4
 
 import pytest
-from langchain_core.runnables import RunnableConfig
+from ag_ui.core import RunFinishedEvent, RunFinishedInterruptOutcome
+from langchain.tools import tool
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.graph import END, START, StateGraph
@@ -14,38 +20,35 @@ from langgraph.types import interrupt
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from tinkerfin import AgUiResumeBinding, AgUiResumeCheckpoint, RunIdentity, TinkerFin
+from tinkerfin import AgUiResumeCheckpoint, AgUiResumeRequest, TinkerFin
 from tinkerfin._agui_lineage_state import (
-    LINEAGE_STATE_KEY,
-    RESUME_MARKER_STATE_KEY,
+    LINEAGE_METADATA_KEY,
+    RESUME_METADATA_KEY,
     LineageMarker,
-    parse_lineage_marker,
 )
+from tinkerfin._checkpoint import NamespaceCheckpointer
+
+
+class _ReviewModel(FakeMessagesListChatModel):
+    def bind_tools(
+        self,
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
+        **kwargs: Any,
+    ) -> Runnable:
+        del tools, kwargs
+        return self
 
 
 class _RedisResumeState(TypedDict, total=False):
-    _tinkerfin_lineage: dict[str, object]
-    _tinkerfin_resume: dict[str, object]
     result: str
 
 
 def _lineage_marker(checkpoint: CheckpointTuple) -> LineageMarker:
-    """Read the committed or source-input lineage using LangGraph semantics."""
+    """Read saver-owned canonical JSON independently of Graph state."""
 
-    channel_values = checkpoint.checkpoint.get("channel_values", {})
-    committed = channel_values.get(LINEAGE_STATE_KEY)
-    pending = [
-        value
-        for _task_id, channel, value in checkpoint.pending_writes or ()
-        if channel == LINEAGE_STATE_KEY
-    ]
-    value = (
-        pending[-1]
-        if checkpoint.metadata.get("source") == "input" and pending
-        else committed
-    )
-    assert value is not None
-    return parse_lineage_marker(value)
+    value = checkpoint.metadata.get(LINEAGE_METADATA_KEY)
+    assert isinstance(value, str)
+    return LineageMarker.model_validate_json(value)
 
 
 async def _cleanup_saver(
@@ -94,8 +97,7 @@ async def _cleanup_saver(
 
 @pytest.mark.asyncio
 @pytest.mark.redis_e2e
-async def test_real_redis_saver_indexes_run_id_and_resumes_once(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_real_redis_scoped_checkpoints_resume_once(
     redis_checkpoint_url: str,
 ) -> None:
     token = uuid4().hex
@@ -113,45 +115,72 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
         checkpoint_prefix=checkpoint_prefix,
         checkpoint_write_prefix=write_prefix,
     )
-    graphs: list[Any] = []
-    executions: list[object] = []
+    executions: list[str] = []
 
-    def build(*_args: object, **_kwargs: object):
-        async def reviewed(state: _RedisResumeState) -> dict[str, object]:
-            del state
-            answer = interrupt({"question": "continue?"})
-            executions.append(answer)
-            return {"result": "done"}
+    @tool
+    async def first_action() -> str:
+        """Record the approved action."""
+        executions.append("first")
+        return "first"
 
-        builder = StateGraph(_RedisResumeState)
-        builder.add_node("reviewed", reviewed)
-        builder.add_edge(START, "reviewed")
-        builder.add_edge("reviewed", END)
-        graph = builder.compile(checkpointer=saver)
-        graphs.append(graph)
-        return graph
+    @tool
+    async def second_action() -> str:
+        """Record the second action only when approved."""
+        executions.append("second")
+        return "second"
 
-    monkeypatch.setattr(
-        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
-        build,
-    )
     try:
         await saver.asetup()
-        definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
-        parent = cast(Any, definition).new_agui(
-            identity=RunIdentity(threadId=thread_id, runId="run-parent"),
+        runtime = (
+            TinkerFin()
+            .with_namespace("test")
+            .build(
+                model=_ReviewModel(
+                    responses=[
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": name,
+                                    "args": {},
+                                    "id": name,
+                                    "type": "tool_call",
+                                }
+                                for name in ("first_action", "second_action")
+                            ],
+                        ),
+                        AIMessage(content="done"),
+                    ]
+                ),
+                tools=[first_action, second_action],
+                interrupt_on={"first_action": True, "second_action": True},
+                checkpointer=saver,
+            )
         )
-        parent_events = [event async for event in parent.astream({})]
-        assert parent_events[-1].type.value == "RUN_FINISHED"
-        snapshot = await graphs[-1].aget_state(
-            {"configurable": {"thread_id": thread_id}}
+        parent = runtime.open_agui_run(
+            thread_id=thread_id,
+            run_id="run-parent",
+            input={"messages": [HumanMessage(content="Run both actions")]},
         )
-        assert len(snapshot.interrupts) == 1
-
-        binding = AgUiResumeBinding(
-            mode="resume",
-            resume_data={"answer": "continue"},
-            native_interrupt_ids=(snapshot.interrupts[0].id,),
+        parent_events = [event async for event in parent]
+        assert parent.error is None
+        terminal = parent_events[-1]
+        assert isinstance(terminal, RunFinishedEvent)
+        assert isinstance(terminal.outcome, RunFinishedInterruptOutcome)
+        assert len(terminal.outcome.interrupts) == 2
+        request = AgUiResumeRequest.model_validate(
+            {
+                "entries": [
+                    {
+                        "interruptId": pending.id,
+                        "status": "resolved",
+                        "payload": {"type": "approve"},
+                    }
+                    if index == 0
+                    else {"interruptId": pending.id, "status": "cancelled"}
+                    for index, pending in enumerate(terminal.outcome.interrupts)
+                ]
+            }
         )
         checkpoints: list[AgUiResumeCheckpoint] = []
 
@@ -159,53 +188,62 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
             checkpoints.append(value)
             raise RuntimeError("host settlement unavailable")
 
-        failed = cast(Any, definition).new_agui(
-            identity=RunIdentity(threadId=thread_id, runId="run-resume"),
-            resume=binding,
-            on_resume_checkpointed=fail_after_staging,
+        failed_stream = runtime.open_agui_run(
+            thread_id=thread_id,
+            run_id="run-resume",
+            resume=request,
+            on_resume_saved=fail_after_staging,
         )
-        failed_stream = failed.astream()
         failed_events = [event async for event in failed_stream]
 
         assert failed_events[-1].type.value == "RUN_ERROR"
         assert isinstance(failed_stream.error, RuntimeError)
         assert executions == []
         assert len(checkpoints) == 1
-        staged = await saver.aget_tuple(
+        staged = await NamespaceCheckpointer(saver, "test").aget_tuple(
             {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
         )
         assert staged is not None
         assert any(
-            channel == RESUME_MARKER_STATE_KEY
+            channel == RESUME_METADATA_KEY
             for _task_id, channel, _value in staged.pending_writes or ()
         )
 
         async def checkpointed(value: AgUiResumeCheckpoint) -> None:
             checkpoints.append(value)
 
-        resumed = cast(Any, definition).new_agui(
-            identity=RunIdentity(threadId=thread_id, runId="run-resume"),
-            resume=binding,
-            on_resume_checkpointed=checkpointed,
+        resumed_stream = runtime.open_agui_run(
+            thread_id=thread_id,
+            run_id="run-resume",
+            resume=request,
+            on_resume_saved=checkpointed,
         )
-        resumed_stream = resumed.astream()
         resumed_events = [event async for event in resumed_stream]
 
         assert resumed_events[-1].type.value == "RUN_FINISHED"
         assert resumed_stream.error is None
-        assert executions == [{"answer": "continue"}]
+        assert executions == ["first"]
         assert len(checkpoints) == 2
         assert checkpoints[0] == checkpoints[1]
         indexed = [
             checkpoint
-            async for checkpoint in saver.alist(
+            async for checkpoint in NamespaceCheckpointer(saver, "test").alist(
                 {
                     "configurable": {
                         "thread_id": thread_id,
                         "checkpoint_ns": "",
-                        "run_id": "run-resume",
                     }
-                }
+                },
+                filter={
+                    LINEAGE_METADATA_KEY: LineageMarker(
+                        namespace="test",
+                        thread_id=thread_id,
+                        run_id="run-resume",
+                        parent_run_id="run-parent",
+                        runtime_profile="deepagents-v2",
+                        role="native",
+                    ).canonical_json()
+                },
             )
         ]
         assert indexed
@@ -214,6 +252,7 @@ async def test_real_redis_saver_indexes_run_id_and_resumes_once(
         )
         assert set(indexed_run_ids) == {"run-resume"}, indexed_run_ids
     finally:
+        await NamespaceCheckpointer(saver, "test").adelete_thread(thread_id)
         await _cleanup_saver(
             saver,
             client,

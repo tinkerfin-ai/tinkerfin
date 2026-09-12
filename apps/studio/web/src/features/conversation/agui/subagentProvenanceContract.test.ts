@@ -20,7 +20,7 @@ describe("Subagent provenance current contract", () => {
       )
     })()],
     ["unknown field", { ...fixture, unknown: true }],
-    ["wrong namespace", { ...fixture, namespace: ["tools:other"] }],
+    ["wrong graphNamespace", { ...fixture, graphNamespace: ["tools:other"] }],
     ["wrong graph task", { ...fixture, graphTaskId: "other" }],
     ["invalid invocation ID", { ...fixture, subagentInvocationId: "subagent-invalid" }],
     ["empty request run", { ...fixture, requestRunId: "" }],

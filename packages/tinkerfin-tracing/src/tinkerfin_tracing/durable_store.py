@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from pydantic import JsonValue
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 
 from ._graph_projection import trace_graph_record_search_values
 from ._graph_reducer import (
@@ -23,6 +23,7 @@ from ._graph_reducer import (
     graph_revision_mutations,
 )
 from ._prepared import prepare_trace_facts
+from ._tasks import TaskOutcome, capture, join_owned_task, select_failure
 from .backend import (
     StoredTraceCheckpoint,
     StoredTraceEvent,
@@ -79,45 +80,21 @@ _ASCII_LOWER_TRANSLATION = str.maketrans(
 )
 
 
-async def _join_retained_task(task: asyncio.Task[None]) -> None:
-    """Wait for one retained lifecycle task across repeated caller cancellation."""
-
-    current = asyncio.current_task()
-    cancel_count = current.cancelling() if current is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            next_count = current.cancelling() if current is not None else 0
-            if next_count > cancel_count or (cancellation is None and next_count > 0):
-                cancellation = cancellation or error
-                cancel_count = next_count
-                continue
-            if task.done():
-                break
-            raise
-        except BaseException:  # noqa: BLE001 - inspect the retained result below
-            break
-
-    task_error: BaseException | None = None
-    try:
-        task.result()
-    except BaseException as error:  # noqa: BLE001 - preserve exact task result
-        task_error = error
-    if cancellation is not None:
-        if task_error is not None:
-            cancellation.add_note(
-                "retained Trace lifecycle task also failed: "
-                f"{type(task_error).__module__}.{type(task_error).__qualname__}"
-            )
-        raise cancellation.with_traceback(cancellation.__traceback__)
-    if task_error is not None:
-        raise task_error.with_traceback(task_error.__traceback__)
-
-
 class _DurableTraceWriter:
-    """Own one backend-fenced Run writer and its framework heartbeat task."""
+    """Keep a writer leased until close settles its heartbeat and persistence.
+
+    A failed heartbeat prevents further appends. Background process control is
+    retained for the next append or close caller, never raised from an unobserved
+    Task. Close still settles the Ledger before delivering that control failure.
+    If close also fails, its exception chain retains every prior heartbeat failure.
+
+    Args:
+        store: Store whose backend holds the writer lease.
+        key: Exact thread generation owned by this writer.
+        run_id: Run allowed to append facts with this lease.
+        owner_token: Opaque token that distinguishes independent writer instances.
+        fence: Monotonic ownership number checked on every mutation.
+    """
 
     def __init__(
         self,
@@ -135,7 +112,7 @@ class _DurableTraceWriter:
         self._fence = fence
         self._closed = False
         self._failure: BaseException | None = None
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[TaskOutcome[None]] | None = None
         self._mutation_lock = asyncio.Lock()
         self._heartbeat: asyncio.Task[None] | None = None
         if self._store._enforce_writer_leases:
@@ -170,6 +147,8 @@ class _DurableTraceWriter:
         if self._closed:
             raise TraceStoreProtocolError("Trace writer is closed")
         if self._failure is not None:
+            if not isinstance(self._failure, Exception):
+                raise self._failure
             raise TraceStoreProtocolError(
                 "Trace writer heartbeat failed",
                 cause=self._failure,
@@ -179,7 +158,7 @@ class _DurableTraceWriter:
             result = await self._store._commit_ledger_change(
                 TraceLedgerChange(
                     kind="append_events",
-                    namespace=self._store.namespace,
+                    namespace=self._key.namespace,
                     limits=self._store.limits,
                     options=self._store.options,
                     key=self._key,
@@ -202,12 +181,11 @@ class _DurableTraceWriter:
         task = self._close_task
         if task is None:
             task = asyncio.create_task(
-                self._close_once(),
+                capture(self._close_once()),
                 name=f"tinkerfin-trace-ledger-close:{self._run_id}",
             )
-            task.add_done_callback(_consume_task_exception)
             self._close_task = task
-        await _join_retained_task(task)
+        await join_owned_task(task, cancel_operation=False)
 
     async def _heartbeat_forever(self) -> None:
         try:
@@ -219,7 +197,7 @@ class _DurableTraceWriter:
                     await self._store._commit_ledger_change(
                         TraceLedgerChange(
                             kind="renew_writer",
-                            namespace=self._store.namespace,
+                            namespace=self._key.namespace,
                             limits=self._store.limits,
                             options=self._store.options,
                             key=self._key,
@@ -228,9 +206,11 @@ class _DurableTraceWriter:
                             fence=self._fence,
                         )
                     )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            if not self._closed:
+                self._failure = error
             raise
-        except Exception as error:  # noqa: BLE001 - writer observes background health
+        except BaseException as error:  # noqa: BLE001 - the writer's next caller owns background process control
             self._failure = error
 
     async def _close_once(self) -> None:
@@ -239,20 +219,27 @@ class _DurableTraceWriter:
         if heartbeat is not None:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
-        async with self._mutation_lock:
-            await self._store._commit_ledger_change(
-                TraceLedgerChange(
-                    kind="close_writer",
-                    namespace=self._store.namespace,
-                    limits=self._store.limits,
-                    options=self._store.options,
-                    key=self._key,
-                    run_id=self._run_id,
-                    owner_token=self._owner_token,
-                    fence=self._fence,
-                    enforce_writer_lease=self._store._enforce_writer_leases,
+        try:
+            async with self._mutation_lock:
+                await self._store._commit_ledger_change(
+                    TraceLedgerChange(
+                        kind="close_writer",
+                        namespace=self._key.namespace,
+                        limits=self._store.limits,
+                        options=self._store.options,
+                        key=self._key,
+                        run_id=self._run_id,
+                        owner_token=self._owner_token,
+                        fence=self._fence,
+                        enforce_writer_lease=self._store._enforce_writer_leases,
+                    )
                 )
-            )
+        except BaseException as close_error:
+            if self._failure is not None:
+                raise select_failure(self._failure, close_error)
+            raise
+        if self._failure is not None and not isinstance(self._failure, Exception):
+            raise self._failure
 
 
 class _FollowChange:
@@ -274,21 +261,19 @@ class DurableTraceStore:
 
     Args:
         backend: Borrowed five-operation shared Ledger backend.
-        namespace: Stable logical isolation key shared by cooperating Store instances.
         limits: Ledger, event, thread, reserve, and follow capacity limits.
         options: Writer lease, heartbeat, polling, and commit retry settings.
         codec: Canonical fact and Projection-state codec.
 
     Raises:
         TypeError: An argument has the wrong public type.
-        ValueError: The namespace or options are invalid.
+        ValueError: The supplied options are invalid.
     """
 
     def __init__(
         self,
         backend: TraceLedgerBackend,
         *,
-        namespace: str = "default",
         limits: TraceLimits | None = None,
         options: TraceStoreOptions | None = None,
         codec: CanonicalTracePayloadCodec | None = None,
@@ -297,7 +282,6 @@ class DurableTraceStore:
 
         Args:
             backend: Borrowed shared Ledger Backend.
-            namespace: Stable logical isolation key.
             limits: Optional capacity limits.
             options: Optional writer and retry settings.
             codec: Optional canonical payload codec.
@@ -305,13 +289,6 @@ class DurableTraceStore:
 
         if not isinstance(backend, TraceLedgerBackend):
             raise TypeError("backend must implement TraceLedgerBackend")
-        if (
-            not isinstance(namespace, str)
-            or not namespace
-            or namespace != namespace.strip()
-            or len(namespace) > 2048
-        ):
-            raise ValueError("namespace must be canonical text of at most 2048 chars")
         if limits is not None and not isinstance(limits, TraceLimits):
             raise TypeError("limits must be a TraceLimits or None")
         if options is not None and not isinstance(options, TraceStoreOptions):
@@ -319,20 +296,12 @@ class DurableTraceStore:
         if codec is not None and not isinstance(codec, CanonicalTracePayloadCodec):
             raise TypeError("codec must be a CanonicalTracePayloadCodec or None")
         self._backend = backend
-        self._namespace = namespace
         self._limits = limits or TraceLimits()
         self._options = options or TraceStoreOptions()
         self._codec = codec or CanonicalTracePayloadCodec()
-        self._setup_lock = asyncio.Lock()
-        self._setup_task: asyncio.Task[None] | None = None
+        self._setup_task: asyncio.Task[TaskOutcome[None]] | None = None
         self._follow_changes: dict[TraceThreadKey, _FollowChange] = {}
         self._enforce_writer_leases = True
-
-    @property
-    def namespace(self) -> str:
-        """Return the immutable logical Store namespace."""
-
-        return self._namespace
 
     @property
     def limits(self) -> TraceLimits:
@@ -352,26 +321,41 @@ class DurableTraceStore:
 
         return self._backend
 
-    async def setup(self) -> None:
-        """Prepare storage once and settle retained I/O before cancellation returns."""
+    @property
+    def supports_graph_queries(self) -> bool:
+        """Return whether the borrowed backend provides indexed Graph queries."""
 
-        async with self._setup_lock:
-            task = self._setup_task
-            if (
-                task is not None
-                and task.done()
-                and (task.cancelled() or task.exception() is not None)
-            ):
-                self._setup_task = None
-                task = None
-            if task is None:
-                task = asyncio.create_task(
-                    self._backend.prepare_storage(),
-                    name="tinkerfin-trace-prepare-storage",
-                )
-                task.add_done_callback(_consume_task_exception)
-                self._setup_task = task
-        await _join_retained_task(task)
+        return isinstance(self._backend, TraceGraphQueryBackend)
+
+    @property
+    def supports_graph_rebuild(self) -> bool:
+        """Return whether the borrowed backend can replace its derived Graph index."""
+
+        return isinstance(self._backend, TraceGraphRebuildBackend)
+
+    async def setup(self) -> None:
+        """Prepare storage once and wait for accepted work before cancellation returns.
+
+        Concurrent callers share one setup attempt. Cancelling a waiter does not
+        cancel storage initialization; a later explicit call can retry a failed
+        attempt. Backend failure and its original causes remain available even
+        when the caller was cancelled. Process control takes precedence.
+
+        Raises:
+            BaseException: Storage preparation fails, or the caller is cancelled
+                after accepted work has settled.
+        """
+
+        # No await occurs while selecting the shared task. Existing waiters keep
+        # its original outcome; a later explicit call may retry a failed setup.
+        task = self._setup_task
+        if task is None or (task.done() and isinstance(task.result(), BaseException)):
+            task = asyncio.create_task(
+                capture(self._backend.prepare_storage()),
+                name="tinkerfin-trace-prepare-storage",
+            )
+            self._setup_task = task
+        await join_owned_task(task, cancel_operation=False)
 
     async def open_writer(self, identity: RunIdentity) -> TraceWriter:
         """Open one exclusive backend-fenced writer for a semantic Run."""
@@ -382,7 +366,7 @@ class DurableTraceStore:
         result = await self._commit_ledger_change(
             TraceLedgerChange(
                 kind="open_writer",
-                namespace=self._namespace,
+                namespace=identity.namespace,
                 limits=self._limits,
                 options=self._options,
                 identity=identity,
@@ -402,22 +386,23 @@ class DurableTraceStore:
             fence=result.fence,
         )
 
-    async def snapshot(self, thread_id: str) -> StoreThreadSnapshot:
+    async def snapshot(self, identity: ThreadIdentity) -> StoreThreadSnapshot:
         """Return one consistent prefix for the current generation."""
 
-        _validate_thread_id(thread_id)
+        if not isinstance(identity, ThreadIdentity):
+            raise TypeError("identity must be a ThreadIdentity")
         await self.setup()
         state = await self._backend.load_ledger_state(
             TraceLedgerStateRequest(
-                namespace=self._namespace,
-                thread_id=thread_id,
+                namespace=identity.namespace,
+                thread_id=identity.thread_id,
                 include_active_writers=True,
             )
         )
         return _snapshot_from_state(
             state,
-            expected_namespace=self._namespace,
-            expected_thread_id=thread_id,
+            expected_namespace=identity.namespace,
+            expected_thread_id=identity.thread_id,
             expected_key=None,
         )
 
@@ -428,7 +413,7 @@ class DurableTraceStore:
         await self.setup()
         state = await self._backend.load_ledger_state(
             TraceLedgerStateRequest(
-                namespace=self._namespace,
+                namespace=key.namespace,
                 thread_id=key.thread_id,
                 generation=key.generation,
                 include_active_writers=True,
@@ -436,7 +421,7 @@ class DurableTraceStore:
         )
         return _snapshot_from_state(
             state,
-            expected_namespace=self._namespace,
+            expected_namespace=key.namespace,
             expected_thread_id=key.thread_id,
             expected_key=key,
         )
@@ -628,7 +613,7 @@ class DurableTraceStore:
                 status=item.status,
                 name=item.name,
                 run_id=item.run_id,
-                namespace=item.namespace,
+                graph_namespace=item.graph_namespace,
                 agent_name=item.agent_name,
                 provider=item.provider,
                 model=item.model,
@@ -867,7 +852,7 @@ class DurableTraceStore:
         result = await self._commit_ledger_change(
             TraceLedgerChange(
                 kind="save_projection_checkpoint",
-                namespace=self._namespace,
+                namespace=stored_checkpoint.key.namespace,
                 limits=self._limits,
                 options=self._options,
                 key=stored_checkpoint.key,
@@ -958,7 +943,7 @@ class DurableTraceStore:
         await self._commit_ledger_change(
             TraceLedgerChange(
                 kind="delete_generation",
-                namespace=self._namespace,
+                namespace=key.namespace,
                 limits=self._limits,
                 options=self._options,
                 key=key,
@@ -1082,6 +1067,7 @@ class DurableTraceStore:
                 or cached.generation != key.generation
                 or cached.persisted_bytes != record.persisted_bytes
                 or cached.fact.identity.thread_id != key.thread_id
+                or cached.fact.identity.namespace != key.namespace
                 or cached.fact.identity.run_id != record.run_id
                 or cached.fact.kind != record.fact_kind
                 or cached.fact.occurred_at != record.occurred_at
@@ -1095,6 +1081,7 @@ class DurableTraceStore:
         fact = self._codec.decode_fact(record.canonical_payload)
         if (
             fact.identity.thread_id != key.thread_id
+            or fact.identity.namespace != key.namespace
             or fact.identity.run_id != record.run_id
             or fact.kind != record.fact_kind
             or fact.occurred_at != record.occurred_at
@@ -1153,8 +1140,6 @@ class DurableTraceStore:
     def _validate_key(self, key: TraceThreadKey) -> None:
         if not isinstance(key, TraceThreadKey):
             raise TypeError("key must be a TraceThreadKey")
-        if key.namespace != self._namespace:
-            raise TraceThreadNotFound("Trace namespace does not exist")
 
 
 @dataclass(slots=True)
@@ -1586,19 +1571,16 @@ class InMemoryTraceStore(DurableTraceStore):
     def __init__(
         self,
         *,
-        namespace: str = "default",
         limits: TraceLimits | None = None,
     ) -> None:
         """Initialize a bounded process-local Store.
 
         Args:
-            namespace: Stable logical isolation key.
             limits: Optional capacity limits.
         """
 
         super().__init__(
             _InMemoryTraceLedgerBackend(),
-            namespace=namespace,
             limits=limits,
         )
         self._enforce_writer_leases = False
@@ -1639,7 +1621,9 @@ def _graph_node_matches(
         or (where.agent_names and row.agent_name not in where.agent_names)
         or (where.providers and row.provider not in where.providers)
         or (where.models and row.model not in where.models)
-        or (where.namespaces and row.namespace not in where.namespaces)
+        or (
+            where.graph_namespaces and row.graph_namespace not in where.graph_namespaces
+        )
         or (where.started_after is not None and row.started_at <= where.started_after)
         or (where.started_before is not None and row.started_at >= where.started_before)
     )
@@ -1724,7 +1708,7 @@ def _stored_memory_graph_node(
         status=row.status,
         name=row.name,
         run_id=row.run_id,
-        namespace=row.namespace,
+        graph_namespace=row.graph_namespace,
         agent_name=row.agent_name,
         provider=row.provider,
         model=row.model,
@@ -1774,16 +1758,6 @@ def _snapshot_from_state(
         active_writers=state.active_writers,
         observed_at=state.observed_at,
     )
-
-
-def _validate_thread_id(thread_id: str) -> None:
-    if (
-        not isinstance(thread_id, str)
-        or not thread_id
-        or thread_id != thread_id.strip()
-        or len(thread_id) > 2048
-    ):
-        raise ValueError("thread_id must be canonical text of at most 2048 chars")
 
 
 def _validate_commit_result(

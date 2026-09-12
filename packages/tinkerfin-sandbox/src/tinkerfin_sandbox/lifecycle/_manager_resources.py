@@ -20,7 +20,6 @@ __all__ = [
     "_fill_warm_pool",
     "_is_backend_healthy",
     "_maintain_warm_pool",
-    "_owner_key",
     "_reconcile_ready_warm_slot",
     "_release_cleanup_claim",
     "_renew_backend",
@@ -100,15 +99,6 @@ class _BackendAcquisition:
     committed_binding: OpenSandboxBinding | None
     consumed_warm_slot: bool
     retire_after_commit_ids: tuple[str, ...]
-
-
-def _owner_key(value: str) -> str:
-    """Reject values that cannot form a stable owner resource key."""
-    if not isinstance(value, str):
-        raise TypeError("key_resolver must return a string")
-    if not value.strip():
-        raise ValueError("key_resolver must return a non-blank string")
-    return value
 
 
 def _owner_metadata_label(owner_digest: str) -> str:

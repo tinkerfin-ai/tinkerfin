@@ -50,7 +50,7 @@ const graphNode = (
     ? 'HumanMessage'
     : kind === 'assistant_message' ? 'AssistantMessage' : id,
   runId: RUN_ID,
-  namespace: [],
+  graphNamespace: [],
   startedAt: timestamp(
     (startedSeq < 10 ? 0 : SECOND_TURN_OFFSET) + startedSeq * 100,
   ),
@@ -116,23 +116,23 @@ const nodes: TraceGraphNode[] = [
   graphNode('subagent-outer', 'subagent', 15, {
     modelCallId: 'model-current',
     name: 'researcher',
-    namespace: ['tools:outer'],
+    graphNamespace: ['tools:outer'],
     request: { description: '核验链路来源' },
   }),
   graphNode('subagent-human', 'human_message', 16, {
     parentSubagentId: 'subagent-outer',
-    namespace: ['tools:outer'],
+    graphNamespace: ['tools:outer'],
     content: '核验链路来源',
   }),
   graphNode('subagent-context', 'plan', 17, {
     parentSubagentId: 'subagent-outer',
-    namespace: ['tools:outer'],
+    graphNamespace: ['tools:outer'],
     name: 'Plan',
     result: { title: '子智能体计划' },
   }),
   graphNode('subagent-model', 'model', 18, {
     parentSubagentId: 'subagent-outer',
-    namespace: ['tools:outer'],
+    graphNamespace: ['tools:outer'],
     name: 'deepseek-v4-flash',
     provider: 'deepseek',
     model: 'deepseek-v4-flash',
@@ -141,7 +141,7 @@ const nodes: TraceGraphNode[] = [
   graphNode('subagent-tool', 'tool', 19, {
     parentSubagentId: 'subagent-outer',
     modelCallId: 'subagent-model',
-    namespace: ['tools:outer'],
+    graphNamespace: ['tools:outer'],
     name: 'read_file',
     request: { file_path: 'README.md' },
     result: '读取完成',
@@ -149,30 +149,30 @@ const nodes: TraceGraphNode[] = [
   graphNode('subagent-inner', 'subagent', 20, {
     parentSubagentId: 'subagent-outer',
     modelCallId: 'subagent-model',
-    namespace: ['tools:outer', 'tools:inner'],
+    graphNamespace: ['tools:outer', 'tools:inner'],
     name: 'researcher',
     request: { description: '继续核验嵌套链路' },
   }),
   graphNode('inner-human', 'human_message', 21, {
     parentSubagentId: 'subagent-inner',
-    namespace: ['tools:outer', 'tools:inner'],
+    graphNamespace: ['tools:outer', 'tools:inner'],
     content: '继续核验嵌套链路',
   }),
   graphNode('inner-assistant', 'assistant_message', 22, {
     parentSubagentId: 'subagent-inner',
-    namespace: ['tools:outer', 'tools:inner'],
+    graphNamespace: ['tools:outer', 'tools:inner'],
     content: '嵌套核验完成',
   }),
   graphNode('subagent-assistant', 'assistant_message', 23, {
     parentSubagentId: 'subagent-outer',
     modelCallId: 'subagent-model',
-    namespace: ['tools:outer'],
+    graphNamespace: ['tools:outer'],
     content: '',
     toolCallOnly: true,
   }),
   graphNode('subagent-leaf', 'subagent', 24, {
     name: 'researcher',
-    namespace: ['tools:leaf'],
+    graphNamespace: ['tools:leaf'],
     request: { description: '无子节点任务' },
   }),
   graphNode('model-final', 'model', 25, {
@@ -274,7 +274,7 @@ const detail = (
     id: `${threadId}-message-${index + 1}`,
     traceSeq: index + 1,
     sourceId: `assistant-history-${index + 1}`,
-    namespace: [],
+    graphNamespace: [],
     runId: RUN_ID,
     role: 'assistant' as const,
     content: `第 ${index + 1} 段历史回复，用于验证链路与对话切换后仍能精确恢复阅读位置。`,

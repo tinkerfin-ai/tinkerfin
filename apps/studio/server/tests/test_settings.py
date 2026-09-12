@@ -78,10 +78,6 @@ def test_load_settings_groups_external_resource_configuration(
         "\n".join(
             (
                 "DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio",
-                "REDIS_CONTROL_HOST=redis-control.internal",
-                "REDIS_CONTROL_PORT=6380",
-                "REDIS_CONTROL_PASSWORD=control-secret",
-                "REDIS_CONTROL_DB=2",
                 "REDIS_RUNTIME_HOST=redis-runtime.internal",
                 "REDIS_RUNTIME_PORT=6381",
                 "REDIS_RUNTIME_PASSWORD=runtime-secret",
@@ -100,23 +96,16 @@ def test_load_settings_groups_external_resource_configuration(
     settings = load_settings(env_file=env_file)
 
     assert settings.database.url == ("mysql+asyncmy://studio:secret@db:3306/studio")
-    assert settings.redis_control.host == "redis-control.internal"
-    assert settings.redis_control.port == 6380
-    assert settings.redis_control.database == 2
-    assert settings.redis_control.run_key_prefix == "tinkerfin:studio:run"
     assert settings.redis_runtime.host == "redis-runtime.internal"
     assert settings.redis_runtime.port == 6381
     assert settings.redis_runtime.database == 3
     assert settings.redis_runtime.checkpoint_database == 0
-    assert settings.redis_runtime.messaging_key_prefix == "tinkerfin:studio:messaging"
     assert settings.sandbox.domain == "127.0.0.1:8091"
     assert settings.sandbox.warm_pool_size == 3
     assert settings.auth_token_expire_seconds == 86400
-    assert settings.messaging_retention_seconds == 86400
-    assert settings.database.connection_budget == 21
+    assert settings.database.connection_budget == 20
     assert settings.database.management_connection_reserve == 10
     assert settings.tavily_api_key is not None
-    assert "control-secret" not in repr(settings)
     assert "runtime-secret" not in repr(settings)
     assert "tavily-secret" not in repr(settings)
 
@@ -150,7 +139,6 @@ def test_secret_files_override_plain_environment_values(
 
     _clear_settings_environment(monkeypatch)
     database_url_file = tmp_path / "database_url"
-    redis_control_password_file = tmp_path / "redis_control_password"
     redis_runtime_password_file = tmp_path / "redis_runtime_password"
     sandbox_key_file = tmp_path / "sandbox_key"
     tavily_key_file = tmp_path / "tavily_key"
@@ -158,7 +146,6 @@ def test_secret_files_override_plain_environment_values(
         "mysql+asyncmy://studio:file-secret@mysql:3306/tinkerfin\n",
         encoding="utf-8",
     )
-    redis_control_password_file.write_text("control-file-secret\n", encoding="utf-8")
     redis_runtime_password_file.write_text("runtime-file-secret\n", encoding="utf-8")
     sandbox_key_file.write_text("sandbox-file-secret\n", encoding="utf-8")
     tavily_key_file.write_text("tavily-file-secret\n", encoding="utf-8")
@@ -168,8 +155,6 @@ def test_secret_files_override_plain_environment_values(
             (
                 "DATABASE_URL=mysql+asyncmy://studio:plain@db:3306/tinkerfin",
                 f"DATABASE_URL_FILE={database_url_file}",
-                "REDIS_CONTROL_PASSWORD=plain-control",
-                f"REDIS_CONTROL_PASSWORD_FILE={redis_control_password_file}",
                 "REDIS_RUNTIME_PASSWORD=plain-runtime",
                 f"REDIS_RUNTIME_PASSWORD_FILE={redis_runtime_password_file}",
                 "OPEN_SANDBOX_API_KEY=plain-sandbox",
@@ -186,8 +171,6 @@ def test_secret_files_override_plain_environment_values(
     assert settings.database.url == (
         "mysql+asyncmy://studio:file-secret@mysql:3306/tinkerfin"
     )
-    assert settings.redis_control.password is not None
-    assert settings.redis_control.password.get_secret_value() == "control-file-secret"
     assert settings.redis_runtime.password is not None
     assert settings.redis_runtime.password.get_secret_value() == "runtime-file-secret"
     assert settings.sandbox.api_key is not None
@@ -209,7 +192,7 @@ def test_secret_file_rejects_missing_or_blank_content(
         "\n".join(
             (
                 "DATABASE_URL_FILE=" + str(tmp_path / "missing"),
-                "REDIS_CONTROL_PASSWORD_FILE=" + str(tmp_path / "blank"),
+                "REDIS_RUNTIME_PASSWORD_FILE=" + str(tmp_path / "blank"),
             )
         ),
         encoding="utf-8",
@@ -224,11 +207,11 @@ def test_secret_file_rejects_missing_or_blank_content(
         raise AssertionError("缺失的 Secret 文件不应通过配置校验")
 
 
-def test_database_budget_must_cover_shared_pool_and_agent_store(
+def test_database_budget_must_cover_the_shared_pool(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """总连接预算必须覆盖共享 SQLAlchemy 池和一条 Agent Store 连接"""
+    """总连接预算必须覆盖所有业务共用的数据库连接池"""
 
     _clear_settings_environment(monkeypatch)
     env_file = tmp_path / ".env"
@@ -238,38 +221,13 @@ def test_database_budget_must_cover_shared_pool_and_agent_store(
                 "DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio",
                 "DATABASE_POOL_SIZE=10",
                 "DATABASE_MAX_OVERFLOW=10",
-                "DATABASE_CONNECTION_BUDGET=20",
+                "DATABASE_CONNECTION_BUDGET=19",
             )
         ),
         encoding="utf-8",
     )
 
     with pytest.raises(ValueError, match=r"pool_size \+ max_overflow"):
-        load_settings(env_file=env_file)
-
-
-def test_redis_control_and_runtime_must_use_distinct_services(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """两个逻辑域不得通过不同前缀伪装成物理故障域拆分"""
-
-    _clear_settings_environment(monkeypatch)
-    env_file = tmp_path / ".env"
-    env_file.write_text(
-        "\n".join(
-            (
-                "DATABASE_URL=mysql+asyncmy://studio:secret@db:3306/studio",
-                "REDIS_CONTROL_HOST=redis.internal",
-                "REDIS_CONTROL_PORT=6379",
-                "REDIS_RUNTIME_HOST=redis.internal",
-                "REDIS_RUNTIME_PORT=6379",
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="不同物理服务地址"):
         load_settings(env_file=env_file)
 
 

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
 
 import pytest
 from langchain.agents.middleware.types import InputAgentState
@@ -16,7 +16,8 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import BaseTool
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from tinkerfin import DeepAgentDefinition, TinkerFin
+from tinkerfin import TinkerFin
+from tinkerfin.runtime_profile import DeepAgentsV2RuntimeProfile
 from tinkerfin_contracts import (
     NativeTaskObservation,
     RunClosedObservation,
@@ -37,6 +38,16 @@ from tinkerfin_tracing import (
     TraceStore,
     TraceThreadNotFound,
 )
+
+
+class _PreparationProfile(DeepAgentsV2RuntimeProfile):
+    def __init__(self, prepare: Callable[[], Awaitable[None]]) -> None:
+        super().__init__()
+        self._prepare = prepare
+
+    async def create_agent_graph(self, factory, args, kwargs):
+        await self._prepare()
+        return await super().create_agent_graph(factory, args, kwargs)
 
 
 class _LocalModel(FakeMessagesListChatModel):
@@ -62,17 +73,20 @@ async def trace_store(
     if request.param == "memory":
         yield InMemoryTraceStore()
         return
-    url = (
-        request.getfixturevalue("mysql_admin_url")
-        if request.param == "mysql"
-        else f"sqlite+aiosqlite:///{tmp_path / 'call-history.db'}"
-    )
-    assert isinstance(url, str)
-    engine = create_async_engine(url)
-    try:
-        yield SqlAlchemyTraceStore(engine, namespace=f"call-history-{uuid4().hex}")
-    finally:
-        await engine.dispose()
+    async with AsyncExitStack() as databases:
+        url = (
+            await databases.enter_async_context(
+                request.getfixturevalue("trace_mysql_database")()
+            )
+            if request.param == "mysql"
+            else f"sqlite+aiosqlite:///{tmp_path / 'call-history.db'}"
+        )
+        assert isinstance(url, str)
+        engine = create_async_engine(url)
+        try:
+            yield SqlAlchemyTraceStore(engine)
+        finally:
+            await engine.dispose()
 
 
 def _input(identity: RunIdentity) -> InputAgentState:
@@ -82,7 +96,7 @@ def _input(identity: RunIdentity) -> InputAgentState:
 
 
 async def _run_healthy(runtime: TinkerFin, identity: RunIdentity) -> None:
-    definition = runtime.create_deep_agent(
+    definition = runtime.build(
         model=_LocalModel(
             responses=[
                 AIMessage(id=f"assistant-{identity.run_id}", content="local reply")
@@ -91,7 +105,9 @@ async def _run_healthy(runtime: TinkerFin, identity: RunIdentity) -> None:
         tools=[],
         system_prompt="Local test",
     )
-    stream = await runtime.open_run(identity, agent=definition, input=_input(identity))
+    stream = definition.open_run(
+        thread_id=identity.thread_id, run_id=identity.run_id, input=_input(identity)
+    )
     try:
         async for _ in stream:
             pass
@@ -104,25 +120,37 @@ async def test_initialization_failure_keeps_existing_and_future_call_history(
     trace_store: TraceStore, transport: Literal["native", "agui"]
 ) -> None:
     tracer = Tracer(store=trace_store)
-    runtime = TinkerFin().observe(tracer)
-    first = RunIdentity(threadId="call-history", runId="healthy-first")
-    failed = RunIdentity(threadId=first.thread_id, runId="initialization-failed")
-    last = RunIdentity(threadId=first.thread_id, runId="healthy-last")
+    runtime = TinkerFin().with_namespace("test").with_observer(tracer)
+    first = RunIdentity(
+        namespace="test", thread_id="call-history", run_id="healthy-first"
+    )
+    failed = RunIdentity(
+        namespace="test", thread_id=first.thread_id, run_id="initialization-failed"
+    )
+    last = RunIdentity(
+        namespace="test", thread_id=first.thread_id, run_id="healthy-last"
+    )
     failure = RuntimeError("test-owned initialization failure")
 
-    async def create_agent() -> DeepAgentDefinition[None]:
+    async def prepare_graph() -> None:
         raise failure
 
     await _run_healthy(runtime, first)
-    before = await tracer.query(first.thread_id)
+    before = await tracer.query(first.thread)
     original_models = {
         node.id for node in before.nodes if node.kind is TraceGraphNodeKind.MODEL
     }
     assert len(original_models) == 1
     assert not before.completeness.call_tracking_missing
+    failed_runtime = (
+        TinkerFin(runtime_profile=_PreparationProfile(prepare_graph))
+        .with_namespace("test")
+        .with_observer(tracer)
+        .build(model="provider:model")
+    )
     if transport == "native":
-        native = await runtime.open_run(
-            failed, agent=create_agent, input=_input(failed)
+        native = failed_runtime.open_run(
+            thread_id=failed.thread_id, run_id=failed.run_id, input=_input(failed)
         )
         try:
             with pytest.raises(RuntimeError) as captured:
@@ -133,8 +161,8 @@ async def test_initialization_failure_keeps_existing_and_future_call_history(
         finally:
             await native.aclose()
     else:
-        agui = await runtime.open_agui_run(
-            failed, agent=create_agent, input=_input(failed)
+        agui = failed_runtime.open_agui_run(
+            thread_id=failed.thread_id, run_id=failed.run_id, input=_input(failed)
         )
         try:
             lifecycle = [item.type.value async for item in agui]
@@ -143,7 +171,7 @@ async def test_initialization_failure_keeps_existing_and_future_call_history(
         finally:
             await agui.aclose()
 
-    snapshot = await trace_store.snapshot(first.thread_id)
+    snapshot = await trace_store.snapshot(first.thread)
     events = await trace_store.read_events(
         snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=1000
     )
@@ -163,31 +191,31 @@ async def test_initialization_failure_keeps_existing_and_future_call_history(
     assert terminal.outcome == "failed"
     assert terminal.error_type == "builtins.RuntimeError"
 
-    after_failure = await tracer.query(first.thread_id)
+    after_failure = await tracer.query(first.thread)
     assert not after_failure.completeness.call_tracking_missing
     assert original_models <= {node.id for node in after_failure.nodes}
     assert any(node.run_id == failed.run_id for node in after_failure.nodes)
     response = await tracer.query(
-        first.thread_id,
+        first.thread,
         where=TraceGraphFilter(model_call_id=next(iter(original_models))),
     )
     assert response.nodes
     assert not response.completeness.call_tracking_missing
-    history = await tracer.get(first.thread_id, limit=1)
+    history = await tracer.get(first.thread, limit=1)
     assert history.status.execution == "failed"
     assert not history.graph.completeness.call_tracking_missing
     assert history.history_cursor is not None
 
     await _run_healthy(runtime, last)
-    current = await tracer.query(first.thread_id)
+    current = await tracer.query(first.thread)
     assert not current.completeness.call_tracking_missing
     assert (
         len([node for node in current.nodes if node.kind is TraceGraphNodeKind.MODEL])
         == 2
     )
-    assert (await tracer.get(first.thread_id)).status.execution == "succeeded"
+    assert (await tracer.get(first.thread)).status.execution == "succeeded"
     older = await tracer.get(
-        first.thread_id, history_cursor=history.history_cursor, limit=100
+        first.thread, history_cursor=history.history_cursor, limit=100
     )
     assert older.as_of_seq == history.as_of_seq
     assert not older.graph.completeness.call_tracking_missing
@@ -199,7 +227,9 @@ async def test_untracked_execution_failure_remains_unknown_after_a_healthy_run(
     trace_store: TraceStore, has_native_task: bool
 ) -> None:
     tracer = Tracer(store=trace_store)
-    identity = RunIdentity(threadId="untracked", runId="untracked-failure")
+    identity = RunIdentity(
+        namespace="test", thread_id="untracked", run_id="untracked-failure"
+    )
     source = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -223,7 +253,7 @@ async def test_untracked_execution_failure_remains_unknown_after_a_healthy_run(
             await session.observe(
                 NativeTaskObservation(
                     identity=identity,
-                    namespace=(),
+                    graph_namespace=(),
                     phase="start",
                     task_id="untracked-model-task",
                     name="model",
@@ -249,18 +279,16 @@ async def test_untracked_execution_failure_remains_unknown_after_a_healthy_run(
         )
     finally:
         await session.aclose()
-    assert (await tracer.query(identity.thread_id)).completeness.call_tracking_missing
-    assert (
-        await tracer.get(identity.thread_id)
-    ).graph.completeness.call_tracking_missing
+    assert (await tracer.query(identity.thread)).completeness.call_tracking_missing
+    assert (await tracer.get(identity.thread)).graph.completeness.call_tracking_missing
     await _run_healthy(
-        TinkerFin().observe(tracer),
-        RunIdentity(threadId=identity.thread_id, runId="subsequent-healthy"),
+        TinkerFin().with_namespace("test").with_observer(tracer),
+        RunIdentity(
+            namespace="test", thread_id=identity.thread_id, run_id="subsequent-healthy"
+        ),
     )
-    assert (await tracer.query(identity.thread_id)).completeness.call_tracking_missing
-    assert (
-        await tracer.get(identity.thread_id)
-    ).graph.completeness.call_tracking_missing
+    assert (await tracer.query(identity.thread)).completeness.call_tracking_missing
+    assert (await tracer.get(identity.thread)).graph.completeness.call_tracking_missing
 
 
 @pytest.mark.parametrize("transport", ("native", "agui"))
@@ -268,21 +296,33 @@ async def test_cancelled_initialization_preserves_cancellation_and_next_run(
     trace_store: TraceStore, transport: Literal["native", "agui"]
 ) -> None:
     tracer = Tracer(store=trace_store)
-    runtime = TinkerFin().observe(tracer)
-    identity = RunIdentity(threadId="cancelled-initialization", runId="cancelled")
+    runtime = TinkerFin().with_namespace("test").with_observer(tracer)
+    identity = RunIdentity(
+        namespace="test", thread_id="cancelled-initialization", run_id="cancelled"
+    )
     entered = asyncio.Event()
 
-    async def create_agent() -> DeepAgentDefinition[None]:
+    async def prepare_graph() -> None:
         entered.set()
         await asyncio.Future[None]()
         raise AssertionError("cancelled initialization continued")
 
-    operation = (
-        runtime.open_run(identity, agent=create_agent, input=_input(identity))
-        if transport == "native"
-        else runtime.open_agui_run(identity, agent=create_agent, input=_input(identity))
+    cancelled_runtime = (
+        TinkerFin(runtime_profile=_PreparationProfile(prepare_graph))
+        .with_namespace("test")
+        .with_observer(tracer)
+        .build(model="provider:model")
     )
-    pending = asyncio.create_task(operation)
+    stream = (
+        cancelled_runtime.open_run(
+            thread_id=identity.thread_id, run_id=identity.run_id, input=_input(identity)
+        )
+        if transport == "native"
+        else cancelled_runtime.open_agui_run(
+            thread_id=identity.thread_id, run_id=identity.run_id, input=_input(identity)
+        )
+    )
+    pending = asyncio.create_task(stream.messaging_owner_preflight())
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         for attempt in range(6):
@@ -297,11 +337,13 @@ async def test_cancelled_initialization_preserves_cancellation_and_next_run(
         if not pending.done():
             pending.cancel()
         await asyncio.gather(pending, return_exceptions=True)
+        await stream.aclose()
     with pytest.raises(TraceThreadNotFound):
-        await trace_store.snapshot(identity.thread_id)
+        await trace_store.snapshot(identity.thread)
     await _run_healthy(
-        runtime, RunIdentity(threadId=identity.thread_id, runId="after-cancellation")
+        runtime,
+        RunIdentity(
+            namespace="test", thread_id=identity.thread_id, run_id="after-cancellation"
+        ),
     )
-    assert not (
-        await tracer.query(identity.thread_id)
-    ).completeness.call_tracking_missing
+    assert not (await tracer.query(identity.thread)).completeness.call_tracking_missing

@@ -20,6 +20,7 @@ Build agent applications for enterprise workflows that people can interact with,
 | Query conversations and execution records | [Tracing](tracing/index.md) |
 | Persist events and reconnect to receive output | [Messaging](messaging/index.md) |
 | Work with files and commands in isolation | [Sandbox](sandbox/index.md) |
+| Run or schedule Agent tasks | [Automation](automation/index.md) |
 
 ## Go deeper
 

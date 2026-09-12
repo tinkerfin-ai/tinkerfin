@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
-from uuid import uuid4
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -74,6 +75,7 @@ def _source(identity: RunIdentity, sequence: int) -> _ObservationSource:
         "memory",
         "sqlite",
         pytest.param("mysql", marks=pytest.mark.docker_integration),
+        pytest.param("postgresql", marks=pytest.mark.docker_integration),
     )
 )
 async def assistant_store(
@@ -83,17 +85,27 @@ async def assistant_store(
     if request.param == "memory":
         yield InMemoryTraceStore(), None
         return
-    url = (
-        request.getfixturevalue("mysql_admin_url")
-        if request.param == "mysql"
-        else f"sqlite+aiosqlite:///{tmp_path / 'assistant.db'}"
-    )
-    assert isinstance(url, str)
-    engine = create_async_engine(url, hide_parameters=True)
-    try:
-        yield SqlAlchemyTraceStore(engine, namespace=f"assistant-{uuid4().hex}"), engine
-    finally:
-        await engine.dispose()
+    async with AsyncExitStack() as databases:
+        if request.param == "postgresql":
+            engine = await databases.enter_async_context(
+                request.getfixturevalue("trace_postgresql_database")()
+            )
+            assert isinstance(engine, AsyncEngine)
+            yield SqlAlchemyTraceStore(engine), engine
+            return
+        url = (
+            await databases.enter_async_context(
+                request.getfixturevalue("trace_mysql_database")()
+            )
+            if request.param == "mysql"
+            else f"sqlite+aiosqlite:///{tmp_path / 'assistant.db'}"
+        )
+        assert isinstance(url, str)
+        engine = create_async_engine(url, hide_parameters=True)
+        try:
+            yield SqlAlchemyTraceStore(engine), engine
+        finally:
+            await engine.dispose()
 
 
 async def _start(tracer: Tracer, identity: RunIdentity) -> RunObservationSession:
@@ -124,7 +136,7 @@ async def _message(
     await session.observe(
         NativeMessageObservation(
             **_source(identity, sequence),
-            namespace=namespace,
+            graph_namespace=namespace,
             message=NativeMessageRecord(
                 message_type="assistant" if complete else "assistant_chunk",
                 id=message_id,
@@ -159,7 +171,7 @@ async def test_native_tail_after_model_callback_settles_at_run_drain(
 ) -> None:
     store, _engine = assistant_store
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="delivery", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="delivery", run_id="run")
     session = await _start(tracer, identity)
     await session.observe(
         ModelCallObservation(
@@ -191,13 +203,13 @@ async def test_native_tail_after_model_callback_settles_at_run_drain(
     await _message(session, identity, 7, "tail")
     if complete:
         await _message(session, identity, 8, "first tail", complete=True)
-    before = await tracer.query(identity.thread_id)
+    before = await tracer.query(identity.thread)
     before_message = next(
         n for n in before.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
     assert before_message.content == ("first tail" if complete else None)
     await _finish(session, identity, outcome)
-    graph = await tracer.query(identity.thread_id)
+    graph = await tracer.query(identity.thread)
     message = next(
         n for n in graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
@@ -217,13 +229,13 @@ async def test_native_tail_after_model_callback_settles_at_run_drain(
         else NOW + timedelta(milliseconds=8 if complete else 90)
     )
     assert message.model_call_id == scope_id("model-call", (), "model")
-    history = await tracer.get(identity.thread_id)
+    history = await tracer.get(identity.thread)
     assistant = next(m for m in history.messages if m.role == "assistant")
     assert assistant.content == "first tail"
     assert assistant.status == "completed"
     original = graph.snapshot.model_dump(mode="json")
-    await tracer.rebuild_graph(identity.thread_id)
-    rebuilt = await tracer.query(identity.thread_id)
+    await tracer.rebuild_graph(identity.thread)
+    rebuilt = await tracer.query(identity.thread)
     assert rebuilt.snapshot.model_dump(mode="json") == original
 
 
@@ -232,7 +244,7 @@ async def test_parallel_namespaces_completed_and_removed_messages_remain_indepen
 ) -> None:
     store, _engine = assistant_store
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="parallel", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="parallel", run_id="run")
     session = await _start(tracer, identity)
     await _message(session, identity, 3, "root", message_id="same")
     await _message(
@@ -245,14 +257,14 @@ async def test_parallel_namespaces_completed_and_removed_messages_remain_indepen
     await session.observe(
         NativeMessageObservation(
             **_source(identity, 7),
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="remove", id="removed", content=""
             ),
         )
     )
     await _finish(session, identity, "cancelled")
-    graph = await tracer.query(identity.thread_id)
+    graph = await tracer.query(identity.thread)
     assistants = {
         n.id: n for n in graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     }
@@ -277,7 +289,7 @@ async def test_omitted_prefix_cannot_be_replaced_by_a_later_small_suffix(
 ) -> None:
     limits = TraceLimits(max_event_bytes=4096)
     tracer = Tracer(limits=limits)
-    identity = RunIdentity(threadId="omitted", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="omitted", run_id="run")
     session = await _start(tracer, identity)
     chunks = (
         ("x" * 10000, "suffix")
@@ -287,7 +299,7 @@ async def test_omitted_prefix_cannot_be_replaced_by_a_later_small_suffix(
     for sequence, chunk in enumerate(chunks, start=3):
         await _message(session, identity, sequence, chunk)
     await _finish(session, identity, "cancelled")
-    graph = await tracer.query(identity.thread_id)
+    graph = await tracer.query(identity.thread)
     message = next(
         n for n in graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
@@ -310,7 +322,7 @@ async def test_committed_terminal_closes_only_its_active_assistant_and_rebuild_p
 ) -> None:
     store, engine = assistant_store
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="raw", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="raw", run_id="run")
     writer = await store.open_writer(identity)
     shared = _fact_source(identity, 1)
     initial: tuple[TraceSemanticFact, ...] = (
@@ -384,7 +396,7 @@ async def test_committed_terminal_closes_only_its_active_assistant_and_rebuild_p
         ),
     )
     await writer.append(initial)
-    await tracer.query(identity.thread_id)
+    await tracer.query(identity.thread)
     statements: list[str] = []
 
     def record_statement(
@@ -426,11 +438,11 @@ async def test_committed_terminal_closes_only_its_active_assistant_and_rebuild_p
         mandatory=True,
     )
     await writer.aclose()
-    snapshot = await store.snapshot(identity.thread_id)
+    snapshot = await store.snapshot(identity.thread)
     before = await store.read_events(
         snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
     )
-    graph = await tracer.query(identity.thread_id)
+    graph = await tracer.query(identity.thread)
     nodes = {n.id: n for n in graph.nodes}
     active = nodes[scope_id("message", (), "active")]
     assert active.status is TraceGraphNodeStatus.CANCELLED
@@ -443,7 +455,7 @@ async def test_committed_terminal_closes_only_its_active_assistant_and_rebuild_p
         nodes[scope_id("message", (), "different-output")].source_id
         == "different-output"
     )
-    history = await tracer.get(identity.thread_id)
+    history = await tracer.get(identity.thread)
     assert (
         next(node for node in history.graph.nodes if node.id == active.id).source_id
         == "active"
@@ -454,12 +466,12 @@ async def test_committed_terminal_closes_only_its_active_assistant_and_rebuild_p
     )
     assert nodes["approval"].status is TraceGraphNodeStatus.WAITING
     assert nodes[scope_id("tool", (), "tool")].status is TraceGraphNodeStatus.WAITING
-    await tracer.rebuild_graph(identity.thread_id)
+    await tracer.rebuild_graph(identity.thread)
     after = await store.read_events(
         snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
     )
     assert after == before
-    assert (await tracer.query(identity.thread_id)).snapshot.model_dump(
+    assert (await tracer.query(identity.thread)).snapshot.model_dump(
         mode="json"
     ) == graph.snapshot.model_dump(mode="json")
     if engine is not None:
@@ -484,13 +496,15 @@ async def test_committed_terminal_closes_only_its_active_assistant_and_rebuild_p
                 {
                     "stamp": (NOW + timedelta(milliseconds=8)).replace(tzinfo=None),
                     "generation": snapshot.key.generation,
-                    "node_id": scope_id("message", (), "completed"),
+                    "node_id": json.dumps(
+                        scope_id("message", (), "completed"), ensure_ascii=False
+                    ),
                 },
             )
         with pytest.raises(TraceStoreProtocolError):
-            await tracer.query(identity.thread_id)
-        await tracer.rebuild_graph(identity.thread_id)
-        assert (await tracer.query(identity.thread_id)).snapshot == graph.snapshot
+            await tracer.query(identity.thread)
+        await tracer.rebuild_graph(identity.thread)
+        assert (await tracer.query(identity.thread)).snapshot == graph.snapshot
 
 
 class _WholeMessageRedactor:
@@ -504,13 +518,13 @@ async def test_assembled_partial_content_is_redacted_and_empty_output_is_not_inv
     None
 ):
     tracer = Tracer(redactor=_WholeMessageRedactor())
-    identity = RunIdentity(threadId="redaction", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="redaction", run_id="run")
     session = await _start(tracer, identity)
     await _message(session, identity, 3, "private-")
     await _message(session, identity, 4, "value")
     await _message(session, identity, 5, "", message_id="empty")
     await _finish(session, identity, "cancelled")
-    nodes = {n.id: n for n in (await tracer.query(identity.thread_id)).nodes}
+    nodes = {n.id: n for n in (await tracer.query(identity.thread)).nodes}
     assert nodes[scope_id("message", (), "assistant")].content == "[REDACTED]"
     assert nodes[scope_id("message", (), "empty")].content is None
     assert (
@@ -520,14 +534,14 @@ async def test_assembled_partial_content_is_redacted_and_empty_output_is_not_inv
 
 async def test_complete_snapshot_can_replace_an_omitted_partial_prefix() -> None:
     tracer = Tracer(limits=TraceLimits(max_event_bytes=4096))
-    identity = RunIdentity(threadId="snapshot", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="snapshot", run_id="run")
     session = await _start(tracer, identity)
     await _message(session, identity, 3, "x" * 10000)
     await _message(session, identity, 4, "real snapshot", complete=True)
     await _finish(session, identity, "cancelled")
     message = next(
         n
-        for n in (await tracer.query(identity.thread_id)).nodes
+        for n in (await tracer.query(identity.thread)).nodes
         if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
     assert message.content == "real snapshot"
@@ -542,7 +556,9 @@ async def test_model_success_and_native_response_completeness_have_separate_evid
 ) -> None:
     store, _engine = assistant_store
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="completion-evidence", runId="run")
+    identity = RunIdentity(
+        namespace="test", thread_id="completion-evidence", run_id="run"
+    )
     session = await _start(tracer, identity)
     await session.observe(
         ModelCallObservation(
@@ -573,7 +589,7 @@ async def test_model_success_and_native_response_completeness_have_separate_evid
         await session.observe(
             NativeStateObservation(
                 **_source(identity, 7),
-                namespace=(),
+                graph_namespace=(),
                 state={},
                 messages=(
                     NativeMessageRecord(
@@ -585,7 +601,7 @@ async def test_model_success_and_native_response_completeness_have_separate_evid
             )
         )
     await _finish(session, identity, "succeeded")
-    graph = await tracer.query(identity.thread_id)
+    graph = await tracer.query(identity.thread)
     model = next(n for n in graph.nodes if n.kind is TraceGraphNodeKind.MODEL)
     message = next(
         n for n in graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
@@ -594,12 +610,12 @@ async def test_model_success_and_native_response_completeness_have_separate_evid
     assert message.status is TraceGraphNodeStatus.SUCCEEDED
     assert message.content == ("complete response" if complete_state else None)
     assert message.content_omitted is not complete_state
-    history = await tracer.get(identity.thread_id)
+    history = await tracer.get(identity.thread)
     assistant = next(m for m in history.messages if m.role == "assistant")
     assert assistant.status == "completed"
     assert assistant.content_omitted is not complete_state
     if not complete_state:
-        snapshot = await store.snapshot(identity.thread_id)
+        snapshot = await store.snapshot(identity.thread)
         events = await store.read_events(
             snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
         )
@@ -621,17 +637,17 @@ async def test_interrupted_message_can_resume_with_its_same_id_without_duplicate
 ) -> None:
     store, _engine = assistant_store
     tracer = Tracer(store=store)
-    first = RunIdentity(threadId="resume-message", runId="first")
+    first = RunIdentity(namespace="test", thread_id="resume-message", run_id="first")
     session = await _start(tracer, first)
     await _message(session, first, 3, "first ")
     await _finish(session, first, "interrupted")
     waiting = next(
         n
-        for n in (await tracer.query(first.thread_id)).nodes
+        for n in (await tracer.query(first.thread)).nodes
         if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
     assert waiting.status is TraceGraphNodeStatus.WAITING
-    second = RunIdentity(threadId=first.thread_id, runId="second")
+    second = RunIdentity(namespace="test", thread_id=first.thread_id, run_id="second")
     source = RunSourceContext(
         identity=second,
         runtime_profile="deepagents-v2",
@@ -644,7 +660,7 @@ async def test_interrupted_message_can_resume_with_its_same_id_without_duplicate
     await resumed.observe(RunStartedObservation(**_source(second, 101)))
     await resumed.observe(RunInputObservation(**_source(second, 102), source=source))
     await _message(resumed, second, 103, "second")
-    current = await tracer.get(first.thread_id)
+    current = await tracer.get(first.thread)
     assert (
         next(m for m in current.messages if m.role == "assistant").status == "streaming"
     )
@@ -656,7 +672,7 @@ async def test_interrupted_message_can_resume_with_its_same_id_without_duplicate
         RunClosedObservation(**_source(second, 191), outcome="succeeded")
     )
     await resumed.aclose()
-    result = await tracer.get(first.thread_id)
+    result = await tracer.get(first.thread)
     messages = [m for m in result.messages if m.role == "assistant"]
     assert len(messages) == 1 and messages[0].content == "first second"
     assert messages[0].status == "completed"
@@ -664,26 +680,26 @@ async def test_interrupted_message_can_resume_with_its_same_id_without_duplicate
         n for n in result.graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
     assert node.id == waiting.id and node.status is TraceGraphNodeStatus.SUCCEEDED
-    await tracer.rebuild_graph(first.thread_id)
-    assert (await tracer.get(first.thread_id)).graph == result.graph
+    await tracer.rebuild_graph(first.thread)
+    assert (await tracer.get(first.thread)).graph == result.graph
 
 
 async def test_assistant_settlement_respects_ordinary_event_quota() -> None:
     tracer = Tracer(limits=TraceLimits(max_thread_events=16))
-    identity = RunIdentity(threadId="quota", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="quota", run_id="run")
     session = await _start(tracer, identity)
     for sequence in range(3, 9):
         await _message(
             session, identity, sequence, "part", message_id=f"message-{sequence}"
         )
     # Starts fit the ordinary quota, but six additional retained deliveries do not.
-    await tracer.query(identity.thread_id)
+    await tracer.query(identity.thread)
     with pytest.raises(TraceQuotaExceeded):
         await session.observe(
             RunTerminalObservation(**_source(identity, 90), outcome="cancelled")
         )
     await session.aclose()
-    thread = await tracer.get(identity.thread_id)
+    thread = await tracer.get(identity.thread)
     assert thread.status.execution == "unknown"
     assert thread.completeness.missing_tail
 
@@ -695,7 +711,7 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
 ) -> None:
     store, _engine = assistant_store
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="child", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="child", run_id="run")
     session = await _start(tracer, identity)
     await session.observe(
         ModelCallObservation(
@@ -716,7 +732,7 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
     await session.observe(
         NativeTaskObservation(
             **_source(identity, 5),
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id="parent-task",
             name="tools",
@@ -732,7 +748,7 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
     await session.observe(
         ToolExecutionObservation(
             **_source(identity, 6),
-            namespace=(),
+            graph_namespace=(),
             phase="started",
             execution_id="parent-execution",
             tool_call_id="delegate",
@@ -744,7 +760,7 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
     await session.observe(
         ModelCallObservation(
             **_source(identity, 7),
-            namespace=child,
+            graph_namespace=child,
             phase="started",
             call_id="child-model",
             messages=(NativeMessageRecord(message_type="human", content="child"),),
@@ -753,7 +769,7 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
     await session.observe(
         ModelCallObservation(
             **_source(identity, 8),
-            namespace=child,
+            graph_namespace=child,
             phase="first_output",
             call_id="child-model",
             output_message_ids=("assistant",),
@@ -764,7 +780,7 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
         await session.observe(
             NativeTaskObservation(
                 **_source(identity, 10),
-                namespace=(),
+                graph_namespace=(),
                 phase="result",
                 task_id="parent-task",
                 name="tools",
@@ -772,23 +788,23 @@ async def test_child_assistant_uses_its_own_native_scope_at_cancellation(
             )
         )
     await _finish(session, identity, "cancelled")
-    graph = await tracer.query(identity.thread_id)
+    graph = await tracer.query(identity.thread)
     message = next(
         n for n in graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE
     )
     owner = next(n for n in graph.nodes if n.kind is TraceGraphNodeKind.SUBAGENT)
-    assert message.namespace == child and message.parent_subagent_id == owner.id
+    assert message.graph_namespace == child and message.parent_subagent_id == owner.id
     assert message.status is TraceGraphNodeStatus.CANCELLED
     assert message.content == "child partial"
-    await tracer.rebuild_graph(identity.thread_id)
-    assert (await tracer.query(identity.thread_id)).snapshot == graph.snapshot
+    await tracer.rebuild_graph(identity.thread)
+    assert (await tracer.query(identity.thread)).snapshot == graph.snapshot
 
 
 @pytest.mark.parametrize("phase", ("cancelled", "interrupted", "abandoned"))
 def test_partial_phases_do_not_claim_state_snapshots_or_non_assistant_roles(
     phase: str,
 ) -> None:
-    identity = RunIdentity(threadId="fact", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="fact", run_id="run")
     values = {
         **_fact_source(identity, 1),
         "phase": phase,
@@ -807,8 +823,8 @@ async def test_terminal_cannot_close_or_supply_a_locator_for_another_run(
 ) -> None:
     store, engine = assistant_store
     tracer = Tracer(store=store)
-    first = RunIdentity(threadId="run-isolation", runId="first")
-    second = RunIdentity(threadId=first.thread_id, runId="second")
+    first = RunIdentity(namespace="test", thread_id="run-isolation", run_id="first")
+    second = RunIdentity(namespace="test", thread_id=first.thread_id, run_id="second")
     writers = [await store.open_writer(first), await store.open_writer(second)]
     try:
         for identity, writer in zip((first, second), writers, strict=True):
@@ -858,7 +874,7 @@ async def test_terminal_cannot_close_or_supply_a_locator_for_another_run(
             ),
             mandatory=True,
         )
-        graph = await tracer.query(first.thread_id, head_run_id=second.run_id)
+        graph = await tracer.query(first.thread, head_run_id=second.run_id)
         nodes = {n.id: n for n in graph.nodes}
         assert (
             nodes[scope_id("message", (), first.run_id)].status
@@ -869,7 +885,7 @@ async def test_terminal_cannot_close_or_supply_a_locator_for_another_run(
             is TraceGraphNodeStatus.CANCELLED
         )
         if engine is not None:
-            snapshot = await store.snapshot(first.thread_id)
+            snapshot = await store.snapshot(first.thread)
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
@@ -881,14 +897,16 @@ async def test_terminal_cannot_close_or_supply_a_locator_for_another_run(
                         "stamp": (NOW + timedelta(milliseconds=2)).replace(tzinfo=None),
                         "sequence": terminal[-1].trace_seq,
                         "generation": snapshot.key.generation,
-                        "node_id": scope_id("message", (), first.run_id),
+                        "node_id": json.dumps(
+                            scope_id("message", (), first.run_id), ensure_ascii=False
+                        ),
                     },
                 )
             with pytest.raises(TraceStoreProtocolError):
-                await tracer.query(first.thread_id, head_run_id=second.run_id)
-        await tracer.rebuild_graph(first.thread_id)
+                await tracer.query(first.thread, head_run_id=second.run_id)
+        await tracer.rebuild_graph(first.thread)
         assert (
-            await tracer.query(first.thread_id, head_run_id=second.run_id)
+            await tracer.query(first.thread, head_run_id=second.run_id)
         ).snapshot == graph.snapshot
     finally:
         for writer in writers:
@@ -898,7 +916,7 @@ async def test_terminal_cannot_close_or_supply_a_locator_for_another_run(
 @pytest.mark.parametrize("unchecked", ("copy", "construct"))
 @pytest.mark.parametrize("phase", ("started", "terminal", "closed"))
 @pytest.mark.parametrize(
-    "invalid_scope", ({"namespace": ("child",)}, {"in_subagent_scope": True})
+    "invalid_scope", ({"graph_namespace": ("child",)}, {"in_subagent_scope": True})
 )
 async def test_unchecked_run_scope_is_rejected_atomically_before_any_batch_fact(
     assistant_store: tuple[TraceStore, AsyncEngine | None],
@@ -908,7 +926,9 @@ async def test_unchecked_run_scope_is_rejected_atomically_before_any_batch_fact(
 ) -> None:
     store, _engine = assistant_store
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="invalid-run-scope", runId="run")
+    identity = RunIdentity(
+        namespace="test", thread_id="invalid-run-scope", run_id="run"
+    )
     writer = await store.open_writer(identity)
     try:
         await writer.append(
@@ -938,11 +958,11 @@ async def test_unchecked_run_scope_is_rejected_atomically_before_any_batch_fact(
                 ),
             )
         )
-        snapshot = await store.snapshot(identity.thread_id)
+        snapshot = await store.snapshot(identity.thread)
         original_events = await store.read_events(
             snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
         )
-        original_graph = (await tracer.query(identity.thread_id)).snapshot
+        original_graph = (await tracer.query(identity.thread)).snapshot
         root_terminal = RunFact.model_validate(
             {**_fact_source(identity, 4), "phase": "terminal", "outcome": "cancelled"}
         )
@@ -991,7 +1011,7 @@ async def test_unchecked_run_scope_is_rejected_atomically_before_any_batch_fact(
         )
         with pytest.raises(TraceStoreProtocolError, match="root scope"):
             await writer.append(batch, mandatory=phase != "started")
-        after = await store.snapshot(identity.thread_id)
+        after = await store.snapshot(identity.thread)
         assert after.key == snapshot.key and after.as_of_seq == snapshot.as_of_seq
         assert (
             await store.read_events(
@@ -999,10 +1019,10 @@ async def test_unchecked_run_scope_is_rejected_atomically_before_any_batch_fact(
             )
             == original_events
         )
-        assert (await tracer.query(identity.thread_id)).snapshot == original_graph
+        assert (await tracer.query(identity.thread)).snapshot == original_graph
         # Terminal/closed admission flags and reserves also remain usable after rejection.
         await writer.append((root_terminal, root_closed), mandatory=True)
-        graph = await tracer.query(identity.thread_id)
+        graph = await tracer.query(identity.thread)
         assert (
             next(
                 n for n in graph.nodes if n.kind is TraceGraphNodeKind.ASSISTANT_MESSAGE

@@ -219,7 +219,7 @@ class ModelCallObservation(ObservationModel):
     ]
     call_id: str = Field(min_length=1, max_length=1024)
     parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
     provider: str | None = Field(default=None, min_length=1, max_length=1024)
     model: str | None = Field(default=None, min_length=1, max_length=1024)
@@ -305,7 +305,7 @@ class ToolExecutionObservation(ObservationModel):
     ]
     execution_id: str = Field(min_length=1, max_length=1024)
     parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
     tool_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
     tool_name: str = Field(min_length=1, max_length=1024)
@@ -359,7 +359,7 @@ class ContextContributionObservation(ObservationModel):
     ]
     contribution_id: str = Field(min_length=1, max_length=1024)
     parent_call_id: str | None = Field(default=None, min_length=1, max_length=1024)
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     context_kind: ContextKind
     name: str = Field(min_length=1, max_length=1024)
     input: FiniteJsonValue | None = Field(
@@ -397,7 +397,7 @@ class NativeMessageObservation(ObservationModel):
 
     kind: Literal["native.message"] = "native.message"
     identity: RunIdentity
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     message: NativeMessageRecord
     metadata: dict[str, FiniteJsonValue] = Field(default_factory=dict)
 
@@ -412,7 +412,7 @@ class NativeReasoningObservation(ObservationModel):
 
     kind: Literal["native.reasoning"] = "native.reasoning"
     identity: RunIdentity
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     message_id: str = Field(min_length=1, max_length=1024)
     extractor: str = Field(min_length=1, max_length=1024)
     content: FiniteJsonValue
@@ -426,7 +426,7 @@ class NativeTaskObservation(ObservationModel):
 
     kind: Literal["native.task"] = "native.task"
     identity: RunIdentity
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     phase: Literal["start", "result"]
     task_id: str = Field(min_length=1, max_length=1024)
     name: str = Field(min_length=1, max_length=1024)
@@ -443,7 +443,7 @@ class NativeStateObservation(ObservationModel):
 
     kind: Literal["native.state"] = "native.state"
     identity: RunIdentity
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     state: dict[str, FiniteJsonValue]
     messages: tuple[NativeMessageRecord, ...] = ()
     interrupts: tuple[NativeInterruptRecord, ...] = ()
@@ -454,7 +454,7 @@ class NativeExtraObservation(ObservationModel):
 
     kind: Literal["native.extra"] = "native.extra"
     identity: RunIdentity
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     mode: NativeExtraMode
     data_type: str = Field(min_length=1, max_length=1024)
     safe_size_bytes: int = Field(ge=0)

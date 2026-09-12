@@ -88,21 +88,12 @@ downloads = await backend.adownload_files(["/output/report.json"])
 
 受限上传和下载要求 Sandbox 镜像提供 Python 3、Linux procfs，并允许命令服务与文件服务共享进程视图。默认 TinkerFin Sandbox 镜像满足该要求。
 
-## 接入 Deep Agents middleware
+## 接入 AgentRuntime
 
 ```python
-agent = create_deep_agent(
-    model=model,
-    backend=backend,
-    middleware=manager.build_agent_middleware(backend),
-)
-```
+from deepagents import FilesystemPermission
+from tinkerfin import TinkerFin
 
-如果使用 `CompositeBackend`，把最终组合后的 backend 传给 `build_agent_middleware()`，而不是只传默认 Sandbox backend。
-
-如果要限制虚拟路由中的文件操作：
-
-```python
 permissions = [
     FilesystemPermission(
         operations=["write"],
@@ -111,14 +102,17 @@ permissions = [
     )
 ]
 
-middleware = manager.build_agent_middleware(
-    composite_backend,
-    permissions=permissions,
+runtime = (
+    TinkerFin(checkpointer=checkpointer)
+    .with_namespace(namespace)
+    .build(
+        model=model,
+        backend=manager.workspace(workspace_key),
+        permissions=permissions,
+    )
 )
 ```
 
-同一份 permissions 也要传给 `create_deep_agent()`。需要 interrupt 的权限配置还必须提供 checkpointer。
-
-如果没有 manager，但已经有 rooted backend，可以直接调用 `build_rooted_filesystem_middleware(backend, permissions=...)`。
+Runtime 在运行开始时一起准备 rooted backend 和文件 middleware。权限规则需要 interrupt 而非 deny 时，必须配置 checkpointer。只有由调用方自行管理的 Deep Agents Graph 才需要直接使用 `build_rooted_filesystem_middleware()`。
 
 下一篇：[多进程持久化与自定义扩展](persistence-and-extensions.md)。

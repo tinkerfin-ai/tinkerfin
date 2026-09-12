@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Protocol, runtime_checkable
@@ -10,6 +11,34 @@ from typing import Protocol, runtime_checkable
 from tinkerfin_contracts import RunIdentity
 
 from ._tasks import join_task
+from .errors import (
+    RunCoordinationError,
+    RunCoordinationOwnershipLostError,
+    RunCoordinationTimeoutError,
+    RunCoordinationUnavailableError,
+)
+
+
+def _coordination_key(
+    identity: RunIdentity,
+    key_resolver: Callable[[RunIdentity], str] | None,
+) -> str:
+    if not isinstance(identity, RunIdentity):
+        raise TypeError("identity must be a RunIdentity")
+    key = identity.thread_id if key_resolver is None else key_resolver(identity)
+    if not isinstance(key, str):
+        raise TypeError("key_resolver must return a string")
+    if not key or key != key.strip():
+        raise ValueError(
+            "key_resolver must return a non-blank string without surrounding whitespace"
+        )
+    try:
+        key.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("key_resolver must return a UTF-8 encodable key") from error
+    return json.dumps(
+        (identity.namespace, key), ensure_ascii=False, separators=(",", ":")
+    )
 
 
 @runtime_checkable
@@ -43,13 +72,16 @@ class InMemoryRunCoordinator:
     Redis implementation when workers or processes must share the same run boundary.
 
     Args:
-        key_resolver: Convert a run identity into a stable, non-blank key.
+        key_resolver: Choose an optional coordination key within the namespace.
+            The default serializes runs in the same namespace and thread.
     """
 
-    def __init__(self, *, key_resolver: Callable[[RunIdentity], str]) -> None:
+    def __init__(
+        self, *, key_resolver: Callable[[RunIdentity], str] | None = None
+    ) -> None:
         """Initialize process-local coordination for one event loop."""
 
-        if not callable(key_resolver):
+        if key_resolver is not None and not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         self._key_resolver = key_resolver
         self._entries: dict[str, _LockEntry] = {}
@@ -67,16 +99,7 @@ class InMemoryRunCoordinator:
 
     @asynccontextmanager  # pyright: ignore[reportDeprecated]
     async def _coordinate(self, identity: RunIdentity) -> AsyncIterator[None]:
-        if not isinstance(identity, RunIdentity):
-            raise TypeError("identity must be a RunIdentity")
-        key = self._key_resolver(identity)
-        if not isinstance(key, str):
-            raise TypeError("key_resolver must return a string")
-        if not key or key != key.strip():
-            raise ValueError(
-                "key_resolver must return a non-blank string without surrounding "
-                "whitespace"
-            )
+        key = _coordination_key(identity, self._key_resolver)
 
         async with self._entries_lock:
             entry = self._entries.get(key)
@@ -148,4 +171,11 @@ class InMemoryRunCoordinator:
             task.exception()
 
 
-__all__ = ["InMemoryRunCoordinator", "RunCoordinator"]
+__all__ = [
+    "InMemoryRunCoordinator",
+    "RunCoordinationError",
+    "RunCoordinationOwnershipLostError",
+    "RunCoordinationTimeoutError",
+    "RunCoordinationUnavailableError",
+    "RunCoordinator",
+]

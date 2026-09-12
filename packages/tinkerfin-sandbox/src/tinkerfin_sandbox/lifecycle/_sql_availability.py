@@ -6,12 +6,14 @@ from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import case, delete, insert, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import ColumnElement
 
 from ..errors import OpenSandboxStateError, OpenSandboxStateOwnershipError
+from ._sql_fencing import current_claim_time
 from ._sql_schema import _availability, _holders, _owners
 from ._sql_transactions import _read_rows
 from .availability import (
@@ -78,18 +80,7 @@ async def _check_claim(
     connection: AsyncConnection,
     claim: OpenSandboxOwnerClaim,
 ) -> None:
-    # The database row lock lasts only for this short transaction. The remote
-    # pause operation holds a lease token, never an open database transaction.
-    statement = select(_owners.c.owner_digest).where(
-        _owners.c.namespace == self._namespace,
-        _owners.c.owner_digest == claim.owner_digest,
-        _owners.c.claim_token == claim.token,
-        _owners.c.generation == claim.generation,
-        _owners.c.lease_expires_at > self._now(),
-    )
-    if self._require_capabilities().name == "mysql":
-        statement = statement.with_for_update()
-    if (await connection.execute(statement)).one_or_none() is None:
+    if await current_claim_time(self, connection, claim) is None:
         raise OpenSandboxStateOwnershipError("Owner claim is no longer current")
 
 
@@ -102,7 +93,7 @@ async def _read_locked(
         _availability.c.namespace == self._namespace,
         _availability.c.owner_digest == owner_digest,
     )
-    if self._require_capabilities().name == "mysql":
+    if self._require_capabilities().row_locks:
         statement = statement.with_for_update()
     row = (await connection.execute(statement)).mappings().one_or_none()
     return None if row is None else _snapshot(row)
@@ -127,7 +118,7 @@ async def initialize_binding(
     retained_connection = case(
         (same_binding, _availability.c.connection_generation), else_=0
     )
-    if self._require_capabilities().name == "mysql":
+    if self._dialect == "mysql":
         statement = mysql_insert(_availability).values(
             namespace=self._namespace,
             owner_digest=claim.owner_digest,
@@ -151,7 +142,10 @@ async def initialize_binding(
             )
         )
     else:
-        statement = sqlite_insert(_availability).values(
+        insert_row = (
+            postgresql_insert if self._dialect == "postgresql" else sqlite_insert
+        )
+        statement = insert_row(_availability).values(
             namespace=self._namespace,
             owner_digest=claim.owner_digest,
             sandbox_id=sandbox_id,
@@ -330,7 +324,7 @@ async def _all_holders_idle(
         )
         .limit(1)
     )
-    if self._require_capabilities().name == "mysql":
+    if self._require_capabilities().row_locks:
         statement = statement.with_for_update()
     return (await connection.execute(statement)).one_or_none() is None
 

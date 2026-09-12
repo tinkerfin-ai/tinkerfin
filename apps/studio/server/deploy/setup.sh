@@ -41,7 +41,7 @@ done <<< "$configuration"
 [[ "$mysql_port" =~ ^[0-9]+$ ]] && ((10#$mysql_port > 0 && 10#$mysql_port <= 65535)) \
     || fail "MYSQL_PORT 必须在 1 至 65535 之间"
 
-password_files=(mysql_root_password mysql_password redis_control_password redis_runtime_password opensandbox_api_key)
+password_files=(mysql_root_password mysql_password redis_runtime_password opensandbox_api_key)
 if [[ ! -e "$SECRETS_DIR" ]]; then
     mkdir "$SECRETS_DIR"
     for name in "${password_files[@]}"; do

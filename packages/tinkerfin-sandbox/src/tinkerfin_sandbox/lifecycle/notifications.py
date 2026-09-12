@@ -66,6 +66,7 @@ class OpenSandboxLifecycleEvent:
         event_id: Unique identity of this observation, shared by all observers.
         type: Confirmed lifecycle change.
         owner_key: Host-resolved owner identity, or ``None`` for warm capacity.
+        namespace: Logical resource scope, or None for standalone or warm capacity.
         occurred_at: Time of observation as an aware UTC datetime.
         reason: Stable cause without provider exception text.
         workspace_may_have_changed: Whether this event flags possible workspace
@@ -86,6 +87,7 @@ class OpenSandboxLifecycleEvent:
     diagnostic_context: Mapping[str, str] = field(
         default_factory=dict[str, str], repr=False
     )
+    namespace: str | None = None
 
     def __post_init__(self) -> None:
         """Detach diagnostic values from their caller-owned mapping."""

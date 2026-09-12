@@ -34,14 +34,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
 
 from tinkerfin import (
-    DeepAgentsRuntimeProfile,
-    DeepAgentsV2RuntimeProfile,
-    DeepAgentsV3RuntimeProfile,
     RunIdentity,
     TinkerFin,
     trace_contribution,
 )
 from tinkerfin._observation import RuntimeObservationHub
+from tinkerfin.runtime_profile import (
+    DeepAgentsRuntimeProfile,
+    DeepAgentsV2RuntimeProfile,
+    DeepAgentsV3RuntimeProfile,
+)
 from tinkerfin_contracts import (
     ContextContributionObservation,
     ModelCallObservation,
@@ -160,7 +162,9 @@ class _FailBeforeModel(AgentMiddleware[Any, Any, Any]):
 
 
 def _identity(run_id: str) -> RunIdentity:
-    return RunIdentity(threadId="thread-call-observation", runId=run_id)
+    return RunIdentity(
+        namespace="test", thread_id="thread-call-observation", run_id=run_id
+    )
 
 
 def test_error_claim_retains_identity_for_the_run_lifetime() -> None:
@@ -194,15 +198,15 @@ async def test_model_call_records_final_request_and_first_output_before_native()
     """The provider lifecycle does not wait for the Native message projection."""
 
     session = _Session()
-    tinkerfin = TinkerFin().observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(_Observer(session))
+    definition = tinkerfin.build(
         model=_StreamingModel(responses=["done"]),
         tools=[],
         middleware=[_RewriteRequest()],
     )
-    stream = await tinkerfin.open_run(
-        _identity("run-model"),
-        agent=definition,
+    stream = definition.open_run(
+        thread_id=_identity("run-model").thread_id,
+        run_id=_identity("run-model").run_id,
         input={"messages": [HumanMessage(content="original-user")]},
     )
 
@@ -256,15 +260,12 @@ async def test_managed_ainvoke_records_the_same_runtime_observations() -> None:
     """Managed invoke keeps tracing while returning only the final root state."""
 
     session = _Session()
-    tinkerfin = TinkerFin().observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
-        model=_StreamingModel(responses=["done"]),
-        tools=[],
-    )
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(_Observer(session))
+    definition = tinkerfin.build(model=_StreamingModel(responses=["done"]), tools=[])
 
-    state = await tinkerfin.ainvoke(
-        _identity("run-managed-invoke"),
-        agent=definition,
+    state = await definition.ainvoke(
+        thread_id=_identity("run-managed-invoke").thread_id,
+        run_id=_identity("run-managed-invoke").run_id,
         input={"messages": [HumanMessage(content="invoke", id="invoke-user")]},
     )
 
@@ -284,17 +285,16 @@ async def test_v3_managed_ainvoke_preserves_model_and_native_message_identity() 
     """The explicit v3 source feeds the same protocol-neutral observation boundary."""
 
     session = _Session()
-    tinkerfin = TinkerFin(
-        runtime_profile=DeepAgentsV3RuntimeProfile(),
-    ).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
-        model=_StreamingModel(responses=["done"]),
-        tools=[],
+    tinkerfin = (
+        TinkerFin(runtime_profile=DeepAgentsV3RuntimeProfile())
+        .with_namespace("test")
+        .with_observer(_Observer(session))
     )
+    definition = tinkerfin.build(model=_StreamingModel(responses=["done"]), tools=[])
 
-    state = await tinkerfin.ainvoke(
-        _identity("run-managed-v3"),
-        agent=definition,
+    state = await definition.ainvoke(
+        thread_id=_identity("run-managed-v3").thread_id,
+        run_id=_identity("run-managed-v3").run_id,
         input={"messages": [HumanMessage(content="invoke", id="invoke-user-v3")]},
     )
 
@@ -340,10 +340,12 @@ async def test_v3_restores_the_stable_tool_message_from_state() -> None:
         return value
 
     session = _Session()
-    tinkerfin = TinkerFin(
-        runtime_profile=DeepAgentsV3RuntimeProfile(),
-    ).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = (
+        TinkerFin(runtime_profile=DeepAgentsV3RuntimeProfile())
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(
         model=_MessageModel(
             responses=[
                 AIMessage(
@@ -363,9 +365,9 @@ async def test_v3_restores_the_stable_tool_message_from_state() -> None:
         tools=[echo],
     )
 
-    await tinkerfin.ainvoke(
-        _identity("run-v3-tool"),
-        agent=definition,
+    await definition.ainvoke(
+        thread_id=_identity("run-v3-tool").thread_id,
+        run_id=_identity("run-v3-tool").run_id,
         input={"messages": [HumanMessage(content="use the Tool")]},
     )
 
@@ -386,10 +388,12 @@ async def test_v3_preserves_subagent_namespaces_and_model_calls() -> None:
     """Nested work remains visible after v3 events enter the Native boundary."""
 
     session = _Session()
-    tinkerfin = TinkerFin(
-        runtime_profile=DeepAgentsV3RuntimeProfile(),
-    ).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = (
+        TinkerFin(runtime_profile=DeepAgentsV3RuntimeProfile())
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(
         model=_MessageModel(
             responses=[
                 AIMessage(
@@ -421,25 +425,25 @@ async def test_v3_preserves_subagent_namespaces_and_model_calls() -> None:
         ],
     )
 
-    await tinkerfin.ainvoke(
-        _identity("run-v3-subagent"),
-        agent=definition,
+    await definition.ainvoke(
+        thread_id=_identity("run-v3-subagent").thread_id,
+        run_id=_identity("run-v3-subagent").run_id,
         input={"messages": [HumanMessage(content="delegate")]},
     )
 
     assert any(
-        observation.kind == "native.task" and observation.namespace
+        observation.kind == "native.task" and observation.graph_namespace
         for observation in session.observations
     )
     assert any(
         isinstance(observation, ModelCallObservation)
         and observation.agent_name == "researcher"
-        and observation.namespace
+        and observation.graph_namespace
         for observation in session.observations
     )
     assert any(
         isinstance(observation, NativeMessageObservation)
-        and observation.namespace
+        and observation.graph_namespace
         and observation.message.message_type == "assistant"
         and observation.message.content == "child done"
         for observation in session.observations
@@ -508,15 +512,19 @@ async def test_before_model_failure_does_not_create_middleware_observations(
     runtime_profile: DeepAgentsRuntimeProfile,
 ) -> None:
     session = _Session()
-    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = (
+        TinkerFin(runtime_profile=runtime_profile)
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(
         model=_StreamingModel(responses=["unused"]),
         tools=[],
         middleware=[_FailBeforeModel()],
     )
-    stream = await tinkerfin.open_run(
-        _identity("run-middleware-error"),
-        agent=definition,
+    stream = definition.open_run(
+        thread_id=_identity("run-middleware-error").thread_id,
+        run_id=_identity("run-middleware-error").run_id,
         input={"messages": [HumanMessage(content="check guardrail")]},
     )
 
@@ -572,11 +580,11 @@ async def test_tool_execution_records_the_actual_input_and_result() -> None:
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin().observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(model=model, tools=[add_values])
-    stream = await tinkerfin.open_run(
-        _identity("run-tool"),
-        agent=definition,
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(_Observer(session))
+    definition = tinkerfin.build(model=model, tools=[add_values])
+    stream = definition.open_run(
+        thread_id=_identity("run-tool").thread_id,
+        run_id=_identity("run-tool").run_id,
         input={"messages": [HumanMessage(content="add")]},
     )
 
@@ -645,11 +653,15 @@ async def test_runtime_cancellation_closes_an_unmatched_tool_execution(
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(model=model, tools=[wait_until_cancelled])
-    stream = await tinkerfin.open_run(
-        _identity("run-cancel"),
-        agent=definition,
+    tinkerfin = (
+        TinkerFin(runtime_profile=runtime_profile)
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(model=model, tools=[wait_until_cancelled])
+    stream = definition.open_run(
+        thread_id=_identity("run-cancel").thread_id,
+        run_id=_identity("run-cancel").run_id,
         input={"messages": [HumanMessage(content="wait")]},
     )
 
@@ -694,15 +706,15 @@ async def test_middleware_execution_is_preserved_without_trace_metadata() -> Non
     visible = _ContributingMiddleware("customer-memory", calls)
     session = _Session()
     observer = _Observer(session)
-    tinkerfin = TinkerFin().observe(observer)
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(observer)
+    definition = tinkerfin.build(
         model=_StreamingModel(responses=["done"]),
         tools=[],
         middleware=[metrics, visible],
     )
-    stream = await tinkerfin.open_run(
-        _identity("run-middleware"),
-        agent=definition,
+    stream = definition.open_run(
+        thread_id=_identity("run-middleware").thread_id,
+        run_id=_identity("run-middleware").run_id,
         input={"messages": [HumanMessage(content="remember")]},
     )
 
@@ -769,22 +781,21 @@ async def test_rejected_tool_review_never_records_an_execution(
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin(
-        checkpointer=MemorySaver(),
-        runtime_profile=runtime_profile,
-    ).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = (
+        TinkerFin(checkpointer=MemorySaver(), runtime_profile=runtime_profile)
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(
         model=model,
         tools=[protected_action],
         interrupt_on={
-            "protected_action": {
-                "allowed_decisions": ["approve", "edit", "reject"],
-            }
+            "protected_action": {"allowed_decisions": ["approve", "edit", "reject"]}
         },
     )
-    first = await tinkerfin.open_run(
-        _identity("run-review-reject-start"),
-        agent=definition,
+    first = definition.open_run(
+        thread_id=_identity("run-review-reject-start").thread_id,
+        run_id=_identity("run-review-reject-start").run_id,
         input={"messages": [HumanMessage(content="review")]},
     )
     async for _part in first:
@@ -798,9 +809,9 @@ async def test_rejected_tool_review_never_records_an_execution(
         observation.kind == "run.terminal" and observation.outcome == "interrupted"
         for observation in interrupted_observations
     )
-    resumed = await tinkerfin.open_run(
-        _identity("run-review-reject-resume"),
-        agent=definition,
+    resumed = definition.open_run(
+        thread_id=_identity("run-review-reject-resume").thread_id,
+        run_id=_identity("run-review-reject-resume").run_id,
         input=Command(
             resume={"decisions": [{"type": "reject", "message": "not allowed"}]}
         ),
@@ -854,29 +865,28 @@ async def test_edited_tool_review_records_only_the_actual_input(
         ]
     )
     session = _Session()
-    tinkerfin = TinkerFin(
-        checkpointer=MemorySaver(),
-        runtime_profile=runtime_profile,
-    ).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = (
+        TinkerFin(checkpointer=MemorySaver(), runtime_profile=runtime_profile)
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(
         model=model,
         tools=[add_reviewed],
         interrupt_on={
-            "add_reviewed": {
-                "allowed_decisions": ["approve", "edit", "reject"],
-            }
+            "add_reviewed": {"allowed_decisions": ["approve", "edit", "reject"]}
         },
     )
-    first = await tinkerfin.open_run(
-        _identity("run-review-edit-start"),
-        agent=definition,
+    first = definition.open_run(
+        thread_id=_identity("run-review-edit-start").thread_id,
+        run_id=_identity("run-review-edit-start").run_id,
         input={"messages": [HumanMessage(content="review")]},
     )
     async for _part in first:
         pass
-    resumed = await tinkerfin.open_run(
-        _identity("run-review-edit-resume"),
-        agent=definition,
+    resumed = definition.open_run(
+        thread_id=_identity("run-review-edit-resume").thread_id,
+        run_id=_identity("run-review-edit-resume").run_id,
         input=Command(
             resume={
                 "decisions": [

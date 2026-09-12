@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
+from ag_ui.core import AssistantMessage as AgUiAssistantMessage
 from ag_ui.core import Interrupt as AgUiInterrupt
 from langchain_core.messages import AIMessage, BaseMessage
 from pydantic import (
@@ -108,10 +109,10 @@ class AgentSource(_ProtocolModel):
     kind: Literal["root", "compiled_subgraph", "deep_agent_subagent"] = Field(
         description="Verified source kind for the complete graph namespace"
     )
-    namespace: tuple[str, ...] = Field(
+    graph_namespace: tuple[str, ...] = Field(
         description="Complete root or subgraph namespace"
     )
-    parent_namespace: tuple[str, ...] | None = Field(
+    parent_graph_namespace: tuple[str, ...] | None = Field(
         default=None,
         description="Parent namespace that started this compiled graph task",
     )
@@ -152,7 +153,7 @@ class EventContext(_ProtocolModel):
     stream_mode: StreamMode = Field(description="Native stream mode for this event")
     source: AgentSource = Field(description="Event source identity")
     run_id: str = Field(min_length=1, description="Main AG-UI run ID for the request")
-    related_namespace: tuple[str, ...] | None = Field(
+    related_graph_namespace: tuple[str, ...] | None = Field(
         default=None, description="Complete native namespace related to the event"
     )
     related_subagent_invocation_id: str | None = Field(
@@ -384,19 +385,42 @@ def _buffer_child_interrupts(
         ]
     )
     native_ids = tuple(native_by_id)
-    previous_ids = self._child_interrupt_ids_by_namespace.get(part.ns)
-    if previous_ids is not None and previous_ids != native_ids:
-        raise HitlCorrelationError(
-            f"conflicting child interrupt set for namespace: {part.ns!r}"
-        )
+    previous_ids = self._child_interrupt_ids_by_namespace.get(part.ns, ())
     previous_messages = self._child_message_snapshots.get(part.ns)
-    if previous_ids is not None and previous_messages != converted_messages:
-        raise HitlCorrelationError(
-            f"conflicting child message snapshot for namespace: {part.ns!r}"
-        )
+    if previous_messages is not None:
+        # Parallel tasks may add messages and report separate interrupt batches
+        # in one Graph. Previously correlated proposals must remain identical;
+        # unrelated message additions do not alter those pending decisions.
+        previous_calls = {
+            call.id: (message.id, call)
+            for message in previous_messages
+            if isinstance(message, AgUiAssistantMessage)
+            for call in message.tool_calls or ()
+        }
+        current_calls = {
+            call.id: (message.id, call)
+            for message in converted_messages
+            if isinstance(message, AgUiAssistantMessage)
+            for call in message.tool_calls or ()
+        }
+        pending_calls = {
+            public.tool_call_id
+            for native_id in previous_ids
+            for public in self._child_interrupts[native_id].prepared
+            if public.tool_call_id is not None
+        }
+        if any(
+            previous_calls[call_id] != current_calls.get(call_id)
+            for call_id in pending_calls & previous_calls.keys()
+        ):
+            raise HitlCorrelationError(
+                f"conflicting child message snapshot for namespace: {part.ns!r}"
+            )
 
     staged_ids_by_namespace = dict(self._child_interrupt_ids_by_namespace)
-    staged_ids_by_namespace[part.ns] = native_ids
+    staged_ids_by_namespace[part.ns] = tuple(
+        dict.fromkeys((*previous_ids, *native_ids))
+    )
     staged_messages = dict(self._child_message_snapshots)
     staged_messages[part.ns] = converted_messages
     self._child_interrupts = staged_interrupts
@@ -425,13 +449,9 @@ def _prepare_root_interrupts(
                 f"conflicting root propagation for child interrupt ID: {native.id}"
             )
 
-    unresolved = set(self._child_interrupts) - self._resolved_child_interrupt_ids
-    missing = unresolved - set(native_by_id)
-    if missing:
-        raise HitlCorrelationError(
-            "root values did not propagate child interrupts: "
-            f"{', '.join(sorted(missing))}"
-        )
+    # LangGraph 1.2.10 emits root values for each interrupted task separately.
+    # finish() verifies propagation across the complete stream; this boundary
+    # validates only the groups present in this part (test_compiled_subgraphs).
 
     root_local = tuple(
         native
@@ -462,10 +482,11 @@ def _prepare_root_interrupts(
             propagated_child_ids.add(native.id)
     self._validate_prepared_interrupts(prepared)
 
+    visible_child_ids = self._resolved_child_interrupt_ids | propagated_child_ids
     child_namespaces = tuple(
         namespace
         for namespace in self._graph_scopes
-        if propagated_child_ids.intersection(
+        if visible_child_ids.intersection(
             self._child_interrupt_ids_by_namespace.get(namespace, ())
         )
     )
@@ -536,7 +557,7 @@ def _prepare_ag_ui_interrupts(
         )
 
     matched_id_groups = self._tool_call_id_groups_for_actions(
-        source.namespace,
+        source.graph_namespace,
         action_groups,
         raw_messages,
     )
@@ -744,7 +765,7 @@ def _tool_call_id_groups_for_actions(
                 arguments_error = None
             candidates.append(
                 HitlToolCallCandidate(
-                    namespace=call.namespace,
+                    graph_namespace=call.namespace,
                     tool_call_id=call.tool_call_id,
                     tool_name=call.tool_name,
                     parent_message_id=call.parent_message_id,

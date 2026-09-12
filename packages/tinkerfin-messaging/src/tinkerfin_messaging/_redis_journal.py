@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from tinkerfin_contracts import RunIdentity
 
-from ._identity import required_identifier, required_identity
+from ._identity import required_identifier, required_identity, thread_key
 from ._messaging_ledger import (
     BackendRunHandle,
     PreparedRun,
@@ -144,7 +144,7 @@ async def prepare(
                 owner_token,
                 str(self._lease_ms),
                 channel,
-                identity.thread_id,
+                thread_key(identity),
                 str(self._limits.max_message_payload_bytes),
                 str(self._limits.max_checkpoint_bytes),
                 str(self._limits.max_thread_messages),
@@ -201,8 +201,9 @@ async def prepare(
     if code == "RUN_ACTIVE":
         raise RunAlreadyActive(
             active_identity=RunIdentity(
-                threadId=identity.thread_id,
-                runId=self._text(response[1]),
+                namespace=identity.namespace,
+                thread_id=identity.thread_id,
+                run_id=self._text(response[1]),
             ),
             requested_identity=identity,
         )
@@ -495,8 +496,9 @@ def _decode_entry(
     return MessageEnvelope(
         channel=channel,
         identity=RunIdentity(
-            threadId=identity.thread_id,
-            runId=self._text(fields["run"]),
+            namespace=identity.namespace,
+            thread_id=identity.thread_id,
+            run_id=self._text(fields["run"]),
         ),
         seq=seq,
         message_id=self._text(fields["message_id"]),

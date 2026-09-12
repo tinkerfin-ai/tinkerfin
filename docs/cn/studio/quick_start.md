@@ -15,8 +15,8 @@
 从仓库源码构建并启动：
 
 ```bash
-git clone https://github.com/tinkerfin-ai/tinkerfin.git
-cd tinkerfin/apps/studio/server/deploy
+git clone https://github.com/tinkerfin-ai/tinkerfin-harness.git
+cd tinkerfin-harness/apps/studio/server/deploy
 ./deploy.sh --build
 ```
 

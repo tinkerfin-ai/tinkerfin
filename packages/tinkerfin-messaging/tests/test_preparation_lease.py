@@ -16,12 +16,14 @@ from tinkerfin_messaging import (
     MemoryBackend,
     MessageSourceBinding,
     Messaging,
-    MessagingBackendSettings,
     MessagingClosed,
-    MessagingTransition,
-    MessagingTransitionResult,
     RecoverableMessage,
     RecoveryCheckpoint,
+)
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackendSettings,
+    MessagingTransition,
+    MessagingTransitionResult,
 )
 
 T = TypeVar("T")
@@ -98,7 +100,7 @@ async def test_deferred_ownership_is_renewed_during_each_stage(stage: str) -> No
                 cancellable=False,
                 on_owner_preflight=lambda: delay("preflight"),
             ),
-            identity=RunIdentity(threadId="thread", runId="run"),
+            identity=RunIdentity(namespace="test", thread_id="thread", run_id="run"),
             after=0,
             on_source_ready=lambda: delay("ready"),
         )
@@ -143,7 +145,7 @@ async def test_recoverable_ownership_is_renewed_during_each_stage(stage: str) ->
             name="events", codec=_TextCodec()
         ).wrap_recoverable(
             Factory(),
-            identity=RunIdentity(threadId="thread", runId="run"),
+            identity=RunIdentity(namespace="test", thread_id="thread", run_id="run"),
             after=0,
             on_source_ready=lambda: delay("ready"),
         )
@@ -157,7 +159,7 @@ async def test_preparation_failure_remains_failed_after_slow_cleanup(
 ) -> None:
     backend = _LeaseBackend()
     closed = asyncio.Event()
-    identity = RunIdentity(threadId="thread", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
 
     class Source:
         def __aiter__(self) -> AsyncIterator[str]:
@@ -208,7 +210,9 @@ async def test_caller_cancellation_during_deferred_preparation_is_propagated() -
         operation = asyncio.create_task(
             messaging.channel(name="events", codec=_TextCodec()).wrap(
                 DeferredMessageSource(opener, cancellable=False),
-                identity=RunIdentity(threadId="thread", runId="run"),
+                identity=RunIdentity(
+                    namespace="test", thread_id="thread", run_id="run"
+                ),
                 after=0,
             )
         )
@@ -226,30 +230,40 @@ async def test_caller_cancellation_during_deferred_preparation_is_propagated() -
 async def test_managed_initialization_timeout_emits_one_failed_lifecycle() -> None:
     from ag_ui.core import RunErrorEvent, RunStartedEvent
 
-    from tinkerfin import DeepAgentDefinition, TinkerFin
-    from tinkerfin_messaging import create_agui_run_source
+    from tinkerfin import TinkerFin
+    from tinkerfin.runtime_profile import DeepAgentsV2RuntimeProfile
 
-    backend = _LeaseBackend()
-    runtime = TinkerFin()
-    identity = RunIdentity(threadId="thread", runId="run")
+    renewed = asyncio.Event()
 
-    async def agent() -> DeepAgentDefinition:
-        await asyncio.sleep(0.15)
-        raise TimeoutError("private infrastructure timeout")
+    class Backend(_LeaseBackend):
+        async def commit_messaging_transition(
+            self, transition: MessagingTransition
+        ) -> MessagingTransitionResult:
+            result = await super().commit_messaging_transition(transition)
+            if transition.kind == "renew_producer_ownership":
+                renewed.set()
+            return result
 
-    async def open_events(run_identity: RunIdentity):
-        return await runtime.open_agui_run(
-            run_identity,
-            agent=agent,
-            messages=[{"id": "user", "role": "user", "content": "hello"}],
-        )
+    class TimedOutPreparation(DeepAgentsV2RuntimeProfile):
+        async def create_agent_graph(self, factory, args, kwargs):
+            await renewed.wait()
+            raise TimeoutError("private infrastructure timeout")
 
+    backend = Backend()
+    runtime = (
+        TinkerFin(runtime_profile=TimedOutPreparation())
+        .with_namespace("test")
+        .build(model="provider:model")
+    )
+    identity = runtime.run_identity("thread", "run")
+    source = runtime.open_agui_run(
+        thread_id="thread",
+        run_id="run",
+        messages=[{"id": "user", "role": "user", "content": "hello"}],
+    )
     async with Messaging(backend=backend) as messaging:
         channel = messaging.channel(name="events")
-        subscription = await channel.wrap(
-            create_agui_run_source(identity, open_events=open_events),
-            after=0,
-        )
+        subscription = await channel.wrap(source, after=0)
         events = [message.data async for message in subscription]
         assert backend.renewed > 0
         assert sum(isinstance(event, RunStartedEvent) for event in events) == 1
@@ -323,7 +337,7 @@ async def test_lease_loss_during_cancel_cleanup_does_not_interrupt_resources(
 
     async with Messaging(backend=Backend()) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
-        identity = RunIdentity(threadId="thread", runId="run")
+        identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
         operation = asyncio.create_task(
             channel.wrap_recoverable(Factory(), identity=identity)
             if recoverable
@@ -375,7 +389,9 @@ async def test_recoverable_opener_can_close_its_leased_messaging_owner() -> None
         await asyncio.wait_for(
             messaging.channel(name="events", codec=_TextCodec()).wrap_recoverable(
                 Factory(),
-                identity=RunIdentity(threadId="thread", runId="run"),
+                identity=RunIdentity(
+                    namespace="test", thread_id="thread", run_id="run"
+                ),
             ),
             1,
         )
@@ -405,7 +421,10 @@ async def test_cancelled_recoverable_opener_can_close_messaging_during_cleanup()
 
         operation = asyncio.create_task(
             messaging.channel(name="events", codec=_TextCodec()).wrap_recoverable(
-                Factory(), identity=RunIdentity(threadId="thread", runId="run")
+                Factory(),
+                identity=RunIdentity(
+                    namespace="test", thread_id="thread", run_id="run"
+                ),
             )
         )
         await entered.wait()
@@ -452,7 +471,7 @@ async def test_cancelled_preparation_retains_cleanup_failure_without_unhandled_e
     try:
         async with Messaging(backend=_LeaseBackend()) as messaging:
             channel = messaging.channel(name="events", codec=_TextCodec())
-            identity = RunIdentity(threadId="thread", runId="run")
+            identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
             operation = asyncio.create_task(
                 channel.wrap_recoverable(Factory(), identity=identity)
                 if recoverable

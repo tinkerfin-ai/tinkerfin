@@ -9,7 +9,7 @@
 | `Messaging(...)` | `backend=None`、`settlement_timeout=None` | 创建单次应用生命周期 |
 | `Messaging.channel(...)` | `name`、可选 `codec`、可选 `renderer` | 创建可并发复用的 channel |
 | `Messaging.aclose()` | 无 | 等待 preflight、producer 和清理任务完成 |
-| `create_agui_run_source(...)` | identity、`open_events`、可选 transform | 创建普通惰性 TinkerFin AG-UI source |
+| `create_agui_run_source(...)` | 带完整声明的 AG-UI 事件流、可选转换函数 | 转换事件内容或元数据，并保留协议身份 |
 
 默认 backend 是 `MemoryBackend`。
 
@@ -17,7 +17,7 @@
 
 | 方法 | 关键参数 | 结果 |
 | --- | --- | --- |
-| `sse(...)` | source、可选 identity、after、callback | 调用方拥有且可关闭的 SSE bytes 迭代器 |
+| `open_sse(...)` | source、可选 identity、after、callback | 调用方拥有且可关闭的 SSE bytes 迭代器 |
 | `publish(...)` | message、identity、可选 message_id | 向已有运行持久化通知，返回 MessageEnvelope |
 | `wrap(...)` | source、可选 identity、after、callback | `MessageSubscription` |
 | `wrap_recoverable(...)` | recoverable source、可选 identity、after、callback | 可恢复 subscription |
@@ -35,7 +35,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 
 | API | 用途 |
 | --- | --- |
-| `MessageSubscription` | 仅由 channel `wrap()`/`follow()` 返回，不直接构造；异步迭代 `DecodedMessage`，并支持 `sse()`/`aclose()` |
+| `MessageSubscription` | 仅由 channel `wrap()`/`follow()` 返回，不直接构造；异步迭代 `DecodedMessage`，并支持 `to_sse()`/`aclose()` |
 | `DecodedMessage` | `envelope` 与 codec 解码后的 `data` |
 | `MessageEnvelope` | 已提交的不可变持久消息 |
 
@@ -43,7 +43,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 
 | 字段 | 约束或含义 |
 | --- | --- |
-| `channel` | 非空 channel name |
+| `channel` | 非空频道名称 |
 | `identity` | 嵌套的共享 `RunIdentity` |
 | `seq` | thread 内从 1 开始的连续位置 |
 | `message_id` | thread 内稳定幂等 ID |
@@ -55,7 +55,7 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 
 | API | 用途 |
 | --- | --- |
-| `create_agui_run_source(...)` | 隐藏 Binding、codec/type profile、转换与首事件取消，只为 owner 打开 managed AG-UI run |
+| `create_agui_run_source(...)` | 转换惰性 AG-UI 事件流，并保留准备、取消和关闭行为 |
 | `parse_sse_event_id(value)` | 解析 `None` 或 canonical 非负 ASCII 十进制 SSE ID |
 | `is_active_run_status(status)` | 收窄 `running` 与 `cancel_requested` 的 TypeGuard |
 | `is_final_run_status(status)` | 收窄全部 durable 终态的 TypeGuard |
@@ -65,6 +65,32 @@ TinkerFin profile source 的 `identity` 可省略；普通自定义 source 必�
 普通 AG-UI source 的 transform 只用于补充产品 metadata 或内容；事件类型以及 Run、消息、Tool、快照或
 interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消息、工具、上下文、forwarded props
 与 resume 等全部字段也保持调用方原始输入。需要主动改变输出协议时，应使用高级 `map_source()`。
+
+使用已构建的 Runtime 和应用持有的频道，为事件添加产品字段：
+
+```python
+from ag_ui.core import BaseEvent
+from tinkerfin_messaging import create_agui_run_source
+
+
+def add_label(event: BaseEvent) -> BaseEvent:
+    return event.model_copy(update={"label": "Report"})
+
+
+source = create_agui_run_source(
+    runtime.open_agui_run(
+        thread_id="conversation-1",
+        run_id="run-1",
+        messages=[{"id": "message-1", "role": "user", "content": "Summarize this report"}],
+    ),
+    transform_event=add_label,
+)
+body = await channel.open_sse(source, after=0)
+```
+
+HTTP 服务发送 `body`，并在完成或断连时调用 `await body.aclose()`。
+适配器构造失败时，输入流仍由调用方关闭；清理等待超时后，应再次调用 `aclose()`，
+等待资源释放完成，再关闭借用的数据库等应用资源。
 
 ## 高级 source 工具
 
@@ -94,13 +120,19 @@ interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消�
 | `NativeStreamPartCodec` | 安装 `[native]` 后可用的 canonical Native replay codec 与 renderer |
 | `NativeStreamPart` | 安装 `[native]` 后可用的有限 canonical Native replay 值 |
 | `MemoryBackend` | 单进程实现 |
+| `SqlAlchemyBackend(engine)` | 安装 `[sqlalchemy]`，借用 AsyncEngine；支持 SQLite、MySQL、PostgreSQL |
 | `RedisBackend` | 安装 `[redis]` 后可用的多进程实现 |
+| `MessagingRetentionPolicy` | 关闭或配置正数秒的终态重播窗口 |
+
+Backend 实现者契约由 `tinkerfin_messaging.backend_contract` 导出：
+
+| API | 用途 |
+| --- | --- |
 | `MessagingBackend` | 六操作自定义存储协议 |
 | `MessagingBackendSettings` | 不可变 limits、retention、lease、续租与等待设置 |
 | `MessagingTransition` | 框架定义的原子生命周期意图 |
 | `MessagingStateSnapshot` | 有界且与存储时钟一致的 transition 证据 |
 | `MessagingStorageEffect` | `resolve_messaging_transition()` 产生的完整替换效果 |
-| `MessagingRetentionPolicy` | 关闭或配置正数秒的终态重播窗口 |
 
 ### `MessagingBackend` 操作
 
@@ -133,6 +165,8 @@ interrupt ID 发生变化时会被拒绝。可选 `RUN_STARTED.input` 中的消�
 Attachment 不调用两个 delivery callback。`on_owner_preflight` 属于 source，在 deferred opener
 之前执行；`on_source_ready` 在 opener 完成后执行。
 
+取消请求会等待已经开始的交付回调执行完毕。回调中的数据库和网络操作应设置超时，以限制等待时间。
+
 ## 常见错误
 
 | 错误 | 含义 |
@@ -152,4 +186,4 @@ Attachment 不调用两个 delivery callback。`on_owner_preflight` 属于 sourc
 | `StreamExpired` | 终态 generation 已超出重播保留窗口 |
 | `StreamDeleted` / `StreamDeleteConflict` | generation 已删除或有活跃 producer |
 
-Messaging 不读取或比较请求正文。同一个 `runId` 的请求事实一致性由调用方负责。
+Messaging 不读取或比较请求正文。同一个 `run_id` 的请求事实一致性由调用方负责。

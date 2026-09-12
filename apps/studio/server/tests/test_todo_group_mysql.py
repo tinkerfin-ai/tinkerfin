@@ -14,7 +14,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 from tinkerfin_studio.api.responses import ApiResponse
 from tinkerfin_studio.conversation.failures import ConversationFailureProjection
 from tinkerfin_studio.conversation.todo_groups import TodoGroupQueryExecutor
@@ -74,7 +74,7 @@ async def _append_trace(
     thread_id: str,
     run_id: str,
 ) -> TraceThreadKey:
-    identity = RunIdentity(threadId=thread_id, runId=run_id)
+    identity = RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
     writer = await store.open_writer(identity)
     occurred_at = datetime.now(UTC)
     todos: list[JsonValue] = [
@@ -182,7 +182,7 @@ async def _append_trace(
         )
     finally:
         await writer.aclose()
-    snapshot = await store.snapshot(thread_id)
+    snapshot = await store.snapshot(identity.thread)
     assert snapshot.as_of_seq == _TRACE_EVENTS
     return snapshot.key
 
@@ -206,7 +206,6 @@ async def test_12k_trace_projects_and_encodes_without_checkpoint(
         )
         store = SqlAlchemyTraceStore(
             engine,
-            namespace=f"todo-trace-{uuid4().hex}",
         )
         key = await _append_trace(
             store,
@@ -214,7 +213,10 @@ async def test_12k_trace_projects_and_encodes_without_checkpoint(
             run_id="run-12k",
         )
         tracer = Tracer(projections=(ConversationFailureProjection(),), store=store)
-        trace = await tracer.get("todo-trace-12k", head_run_id="run-12k")
+        trace = await tracer.get(
+            ThreadIdentity(namespace="test", thread_id="todo-trace-12k"),
+            head_run_id="run-12k",
+        )
         executor = TodoGroupQueryExecutor(capacity=2)
 
         started = time.perf_counter()

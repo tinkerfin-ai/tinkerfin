@@ -29,7 +29,7 @@ const page: TraceGraphPage = {
     status: 'succeeded',
     name: 'HumanMessage',
     runId: 'run-1',
-    namespace: [],
+    graphNamespace: [],
     startedAt: '2026-08-31T00:00:00Z',
     completedAt: '2026-08-31T00:00:00Z',
     startedSeq: 1,
@@ -77,11 +77,11 @@ const stableIdentityChanges: Array<[string, Partial<TraceGraphDelta>]> = [
     { nodeUpserts: [{ ...page.nodes[0]!, name: 'Changed', updatedSeq: 2 }] },
   ],
   [
-    'namespace',
+    'graphNamespace',
     {
       nodeUpserts: [{
         ...page.nodes[0]!,
-        namespace: ['changed'],
+        graphNamespace: ['changed'],
         updatedSeq: 2,
       }],
     },

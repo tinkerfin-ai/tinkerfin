@@ -13,6 +13,8 @@ from typing import Literal, Self
 from opensandbox.models.sandboxes import SandboxInfo, Volume
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from tinkerfin_contracts.identity import validate_namespace
+
 DEFAULT_SANDBOX_IMAGE = (
     "ghcr.io/tinkerfin-ai/sandbox-runtime@"
     "sha256:babb5d624ebfd0509577dc87a6862e89f8499c4ef7d42a09145db214b9d1e524"
@@ -377,6 +379,10 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
     owner_key: str = Field(
         description="User ID or other business key that owns the sandbox."
     )
+    namespace: str | None = Field(
+        default=None,
+        description="Logical resource scope; None identifies standalone Sandbox use",
+    )
     cached: bool = Field(
         description="Whether the manager currently holds an in-memory handle."
     )
@@ -385,6 +391,13 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
         description="Framework admission state, separate from remote runtime status; None when not queried",
     )
 
+    @field_validator("namespace")
+    @classmethod
+    def validate_resource_namespace(cls, value: str | None) -> str | None:
+        """Use the shared Runtime identity rules for logical resource scopes."""
+
+        return None if value is None else validate_namespace(value)
+
     @classmethod
     def from_runtime(
         cls,
@@ -392,6 +405,7 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
         *,
         owner_key: str,
         cached: bool,
+        namespace: str | None = None,
         access_state: _AccessState | None = None,
     ) -> Self:
         """Add ownership and local handle state to a runtime snapshot.
@@ -400,6 +414,7 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
             runtime: Runtime snapshot without business ownership.
             owner_key: User ID or another stable business key.
             cached: Whether an open in-memory handle exists at query time.
+            namespace: Logical resource scope, or None for standalone use.
             access_state: Authoritative framework admission state when queried.
 
         Returns:
@@ -408,6 +423,7 @@ class OpenSandboxDetails(OpenSandboxRuntimeInfo):
         return cls(
             **runtime.model_dump(),
             owner_key=owner_key,
+            namespace=namespace,
             cached=cached,
             access_state=access_state,
         )

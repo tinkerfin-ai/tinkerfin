@@ -9,7 +9,7 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 
 from ._models import TraceModel
 from .errors import TraceStoreProtocolError
@@ -23,21 +23,26 @@ from .graph import (
 from .limits import TraceLimits
 
 
-class TraceThreadKey(TraceModel):
+class TraceThreadKey(ThreadIdentity):
     """Bind a Trace handle to one namespace, thread, and non-reusable generation."""
 
-    namespace: str = Field(min_length=1, max_length=2048)
-    thread_id: str = Field(min_length=1, max_length=2048)
     generation: str = Field(min_length=1, max_length=2048)
 
-    @field_validator("namespace", "thread_id", "generation")
+    @field_validator("generation")
     @classmethod
     def components_are_canonical(cls, value: str) -> str:
         """Reject whitespace aliases before a Store operation is selected."""
 
         if value != value.strip():
             raise ValueError("Trace thread key components must be canonical")
+        value.encode("utf-8")
         return value
+
+    @property
+    def thread(self) -> ThreadIdentity:
+        """Return the complete logical thread without selecting a generation."""
+
+        return ThreadIdentity(namespace=self.namespace, thread_id=self.thread_id)
 
 
 class StoreWriterSnapshot(TraceModel):
@@ -156,7 +161,7 @@ class TraceGraphNodeRecord:
     status: TraceGraphNodeStatus
     name: str
     run_id: str
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     agent_name: str | None
     provider: str | None
     model: str | None
@@ -253,12 +258,6 @@ class TraceStore(Protocol):
     """Persist, read, follow, and delete semantic Trace Ledger generations."""
 
     @property
-    def namespace(self) -> str:
-        """Return the immutable logical Store namespace."""
-
-        ...
-
-    @property
     def limits(self) -> TraceLimits:
         """Return the immutable limits enforced by this Store."""
 
@@ -281,11 +280,11 @@ class TraceStore(Protocol):
 
         ...
 
-    async def snapshot(self, thread_id: str) -> StoreThreadSnapshot:
+    async def snapshot(self, identity: ThreadIdentity) -> StoreThreadSnapshot:
         """Return one consistent event prefix for the current generation.
 
         Args:
-            thread_id: Canonical thread identity.
+            identity: Complete logical namespace and thread identity.
 
         Returns:
             Metadata-only generation snapshot with active writer evidence.
@@ -463,6 +462,12 @@ class TraceStore(Protocol):
 class TraceGraphStore(Protocol):
     """Optional Store capability for direct indexed Graph queries."""
 
+    @property
+    def supports_graph_queries(self) -> bool:
+        """Whether this Store provides indexed Graph queries for its actual backend."""
+
+        ...
+
     async def query_trace_graph(
         self,
         key: TraceThreadKey,
@@ -482,6 +487,12 @@ class TraceGraphStore(Protocol):
 @runtime_checkable
 class TraceGraphRebuildStore(Protocol):
     """Reconstruct the disposable Graph index from authoritative Ledger facts."""
+
+    @property
+    def supports_graph_rebuild(self) -> bool:
+        """Whether this Store can rebuild its backend's derived Graph index."""
+
+        ...
 
     async def rebuild_trace_graph(self, key: TraceThreadKey) -> int:
         """Replace derived Graph nodes for one exact generation."""

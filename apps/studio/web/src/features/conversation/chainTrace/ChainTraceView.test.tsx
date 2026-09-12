@@ -35,7 +35,7 @@ const node = (
     ? 'HumanMessage'
     : kind === 'assistant_message' ? 'AssistantMessage' : id,
   runId: startedSeq < 10 ? 'run-1' : 'run-2',
-  namespace: [],
+  graphNamespace: [],
   startedAt: new Date(BASE_TIME + startedSeq * 100).toISOString(),
   completedAt: new Date(BASE_TIME + startedSeq * 100 + 50).toISOString(),
   startedSeq,
@@ -89,7 +89,7 @@ const nodes: TraceGraphNode[] = [
   node('subagent-2', 'subagent', 15, {
     modelCallId: 'model-2',
     name: 'researcher',
-    namespace: ['tools:child'],
+    graphNamespace: ['tools:child'],
     request: {
       description: '核验子任务',
       subagent_type: 'researcher',
@@ -98,18 +98,18 @@ const nodes: TraceGraphNode[] = [
   }),
   node('subagent-input', 'human_message', 16, {
     parentSubagentId: 'subagent-2',
-    namespace: ['tools:child'],
+    graphNamespace: ['tools:child'],
     content: '核验子任务',
   }),
   node('child-model', 'model', 17, {
     parentSubagentId: 'subagent-2',
-    namespace: ['tools:child'],
+    graphNamespace: ['tools:child'],
     name: 'deepseek-research',
   }),
   node('child-assistant', 'assistant_message', 18, {
     parentSubagentId: 'subagent-2',
     modelCallId: 'child-model',
-    namespace: ['tools:child'],
+    graphNamespace: ['tools:child'],
     content: '子任务完成',
   }),
 ]

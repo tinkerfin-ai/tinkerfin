@@ -10,7 +10,58 @@ from tinkerfin.coordination import InMemoryRunCoordinator
 
 
 def _identity(thread_id: str, *, run_id: str = "run-1") -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
+
+
+@pytest.mark.parametrize("custom_key", [False, True])
+async def test_namespaces_isolate_default_and_custom_coordination(
+    custom_key: bool,
+) -> None:
+    coordinator = InMemoryRunCoordinator(
+        key_resolver=(lambda _: "same-resource") if custom_key else None
+    )
+    entered = asyncio.Event()
+    attempted = asyncio.Event()
+    release = asyncio.Event()
+
+    async def other_namespace() -> None:
+        attempted.set()
+        async with coordinator(
+            RunIdentity(namespace="other", thread_id="same", run_id="run")
+        ):
+            entered.set()
+            await release.wait()
+
+    async with coordinator(
+        RunIdentity(namespace="test", thread_id="same", run_id="run")
+    ):
+        other = asyncio.create_task(other_namespace())
+        try:
+            await attempted.wait()
+            assert entered.is_set()
+        finally:
+            release.set()
+            other.cancel()
+            await asyncio.gather(other, return_exceptions=True)
+
+
+async def test_default_coordination_serializes_different_runs_in_one_thread() -> None:
+    coordinator = InMemoryRunCoordinator()
+    active = 0
+    peak = 0
+
+    async def run(run_id: str) -> None:
+        nonlocal active, peak
+        async with coordinator(
+            RunIdentity(namespace="test", thread_id="same", run_id=run_id)
+        ):
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0)
+            active -= 1
+
+    await asyncio.gather(run("one"), run("two"))
+    assert peak == 1
 
 
 class _ControllableLock:
@@ -46,8 +97,7 @@ async def _wait_for_registered_users(
 ) -> None:
     for _ in range(100):
         entries = coordinator._entries
-        entry = entries.get(key)
-        if entry is not None and entry.users == users:
+        if any(entry.users == users for entry in entries.values()):
             return
         await asyncio.sleep(0)
     raise AssertionError(f"{key!r} did not reach {users} registered users")
@@ -94,7 +144,7 @@ async def test_different_resolved_keys_enter_without_waiting_for_each_other() ->
         assert all(event.is_set() for event in entered)
     finally:
         release.set()
-        await asyncio.gather(*tasks)
+    await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio

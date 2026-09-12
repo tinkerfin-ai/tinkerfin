@@ -8,8 +8,8 @@
 需要 Docker、Docker Compose 2.24 或更高版本，以及 Bash。Windows 请在 WSL 中执行。
 
 ```bash
-git clone https://github.com/tinkerfin-ai/tinkerfin.git
-cd tinkerfin/apps/studio/server/deploy
+git clone https://github.com/tinkerfin-ai/tinkerfin-harness.git
+cd tinkerfin-harness/apps/studio/server/deploy
 ./deploy.sh
 ```
 
@@ -17,8 +17,8 @@ cd tinkerfin/apps/studio/server/deploy
 `http://127.0.0.1:8090/api`，健康检查地址为 `http://127.0.0.1:8090/health/ready`。
 首次预热 Sandbox 时还需要下载运行镜像，耗时取决于网络。
 
-Docker 项目名为 `tinkerfin-studio`，包含 `server`、`mysql`、`redis-control`、
-`redis-runtime` 和 `opensandbox`。只部署后端，不包含 Web 页面。
+Docker 项目名为 `tinkerfin-studio`，包含 `server`、`mysql`、`redis-runtime` 和
+`opensandbox`。只部署后端，不包含 Web 页面。
 全新数据库初始化时预置账号 `tinkerfin`，密码 `123456`。已有数据卷不重新初始化或覆盖账号。
 当前没有公开注册接口；对外开放前按[上手指南](../../../docs/cn/studio/quick_start.md#修改初始密码)修改初始密码。
 
@@ -53,13 +53,12 @@ Docker 项目名为 `tinkerfin-studio`，包含 `server`、`mysql`、`redis-cont
 | `MYSQL_HOST` / `MYSQL_PORT` | `mysql` / `3306` | 后端连接的数据库地址和端口 |
 | `MYSQL_DATABASE` / `MYSQL_USER` | `tinkerfin` / `studio` | 数据库名和账号 |
 | `MYSQL_PUBLISHED_PORT` | `13306` | 从本机连接内置 MySQL 的端口 |
-| `REDIS_CONTROL_PUBLISHED_PORT` | `6379` | 本机访问 Redis Control 的端口 |
-| `REDIS_RUNTIME_PUBLISHED_PORT` | `6380` | 本机访问 Redis Runtime 的端口 |
+| `REDIS_RUNTIME_PUBLISHED_PORT` | `6379` | 本机访问 Redis 的端口 |
 | `OPEN_SANDBOX_PUBLISHED_PORT` | `8091` | 本机访问 OpenSandbox 的端口 |
 | `LOG_LEVEL` | `INFO` | 后端日志等级 |
 
 中间件端口仅绑定宿主机的 `127.0.0.1`。修改 `MYSQL_PUBLISHED_PORT` 不改变容器内部的
-数据库连接。MySQL 密码保存在 `secrets/mysql_password`，Redis 与 OpenSandbox 密码分别
+数据库连接。MySQL 密码保存在 `secrets/mysql_password`，Redis 与 OpenSandbox 密钥分别
 保存在同名 Secret 文件中；`secrets/database_url` 由脚本根据 MySQL 配置自动生成，不要手动编辑。
 
 内置 MySQL 只在新数据卷首次启动时创建账号、数据库并导入业务表。已有数据库的账号、密码
@@ -87,7 +86,7 @@ docker compose -f docker-compose-base.yaml up -d --wait
 ```
 
 随后可在 PyCharm 或命令行启动 Studio。宿主机连接 MySQL 使用 `127.0.0.1:13306`，
-两个 Redis 使用 `127.0.0.1:6379` 和 `127.0.0.1:6380`，OpenSandbox 使用 `127.0.0.1:8091`。
+Redis 使用 `127.0.0.1:6379`，OpenSandbox 使用 `127.0.0.1:8091`。
 本地后端配置中的密码应与 `deploy/secrets/` 中对应文件一致。
 
 ## 使用外部依赖
@@ -99,13 +98,13 @@ docker compose -f docker-compose-base.yaml up -d --wait
 ./deploy.sh --external
 ```
 
-此模式只启动 `server`。两个 Redis 必须使用不同物理服务。
+此模式只启动 `server`。
 外部 MySQL 需要事先创建数据库，并在新库中导入 `database/mysql/schema.sql`。
 
 只替换 MySQL 时，在 `.env` 中设置外部 MySQL 参数和：
 
 ```dotenv
-COMPOSE_PROFILES=redis-control,redis-runtime,opensandbox
+COMPOSE_PROFILES=redis-runtime,opensandbox
 ```
 
 然后执行普通的 `./deploy.sh`。容器访问宿主机服务时可使用 `host.docker.internal`。

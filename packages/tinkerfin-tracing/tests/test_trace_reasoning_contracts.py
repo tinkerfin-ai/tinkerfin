@@ -26,7 +26,9 @@ from tinkerfin_tracing import ReasoningCapturePolicy, ReasoningFact, RunFact, Tr
 
 def _context(run_id: str) -> RunSourceContext:
     return RunSourceContext(
-        identity=RunIdentity(threadId="thread-reasoning", runId=run_id),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-reasoning", run_id=run_id
+        ),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={
@@ -99,7 +101,7 @@ def _reasoning(
 ) -> NativeReasoningObservation:
     return NativeReasoningObservation(
         identity=context.identity,
-        namespace=(),
+        graph_namespace=(),
         message_id="assistant-reasoning",
         extractor="deepseek.additional_kwargs.reasoning_content",
         content=content,
@@ -125,7 +127,7 @@ async def test_default_policy_omits_reasoning_without_a_digest() -> None:
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"reasoning_content": "business value"},
             observed_at=datetime.now(UTC),
             monotonic_ns=6,
@@ -133,7 +135,7 @@ async def test_default_policy_omits_reasoning_without_a_digest() -> None:
     )
     await _finish(session, context)
 
-    thread = await tracer.get(context.identity.thread_id)
+    thread = await tracer.get(context.identity.thread)
     page = await thread.events(limit=100)
     encoded = page.model_dump_json(by_alias=True)
     facts = [item.fact for item in page.items if isinstance(item.fact, ReasoningFact)]
@@ -162,7 +164,7 @@ async def test_explicit_content_policy_reconciles_deltas_with_snapshot() -> None
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant_chunk",
                 id="assistant-reasoning",
@@ -181,7 +183,7 @@ async def test_explicit_content_policy_reconciles_deltas_with_snapshot() -> None
     )
     await _finish(session, context)
 
-    thread = await tracer.get(context.identity.thread_id)
+    thread = await tracer.get(context.identity.thread)
     page = await thread.events(limit=100)
     facts = [item.fact for item in page.items if isinstance(item.fact, ReasoningFact)]
     assistant = next(item for item in thread.messages if item.role == "assistant")
@@ -206,7 +208,7 @@ async def test_snapshot_replaces_a_non_matching_reasoning_prefix() -> None:
     )
     await _finish(session, context)
 
-    thread = await tracer.get(context.identity.thread_id)
+    thread = await tracer.get(context.identity.thread)
     page = await thread.events(limit=100)
     facts = [item.fact for item in page.items if isinstance(item.fact, ReasoningFact)]
 
@@ -227,7 +229,7 @@ async def test_terminal_completes_open_reasoning_before_the_run_terminal() -> No
     )
     await _finish(session, context)
 
-    page = await (await tracer.get(context.identity.thread_id)).events(limit=100)
+    page = await (await tracer.get(context.identity.thread)).events(limit=100)
     semantic_tail = [
         item.fact
         for item in page.items
@@ -246,7 +248,7 @@ async def test_follow_emits_reasoning_entity_deltas() -> None:
     tracer = Tracer(reasoning_capture_policy=ReasoningCapturePolicy.content())
     context = _context("follow")
     session = await _start(tracer, context)
-    thread = await tracer.get(context.identity.thread_id)
+    thread = await tracer.get(context.identity.thread)
     updates = thread.follow()
     pending = asyncio.create_task(anext(updates))
     await asyncio.sleep(0)

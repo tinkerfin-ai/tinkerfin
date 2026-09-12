@@ -1,8 +1,43 @@
-# Redis, custom codecs, and backends
+# Storage, codecs, and custom backends
 
 [Cancellation, deferred sources, and recovery](cancellation-and-recovery.md) · [中文](../../cn/messaging/backends-and-codecs.md)
 
-The default `MemoryBackend` is for one-process development. To share events, run state, and cancellation across processes, use the built-in `RedisBackend` or integrate custom shared storage through the public contract below.
+The default `MemoryBackend` is for one-process development. To share events, run state, and cancellation across processes, use `SqlAlchemyBackend` or `RedisBackend`, or integrate custom shared storage through the public contract below.
+
+## Use SQLAlchemy
+
+Install the SQL extra and your asynchronous driver:
+
+```bash
+pip install "tinkerfin-messaging[sqlalchemy]" aiosqlite
+```
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+from tinkerfin_messaging import Messaging, SqlAlchemyBackend
+
+engine = create_async_engine("sqlite+aiosqlite:///messages.db")
+try:
+    async with Messaging(backend=SqlAlchemyBackend(engine)) as messaging:
+        channel = messaging.channel(name="events", codec=codec)
+finally:
+    await engine.dispose()
+```
+
+You can pass an existing Engine. The application owns its connection pool and shutdown;
+Messaging prepares its tables automatically. Select `postgresql+asyncpg` with `asyncpg`,
+`mysql+asyncmy` with `asyncmy`, or `sqlite+aiosqlite` with `aiosqlite`. The SQL extra
+installs no database driver. SQLite in-memory Engines require exclusive checkouts:
+use `AsyncAdaptedQueuePool` with `pool_size=1, max_overflow=0`.
+
+`SqlAlchemyBackend` accepts `producer_lease_seconds=15`, `poll_interval_seconds=0.1`,
+`limits=MessagingLimits()` and `retention_policy=MessagingRetentionPolicy()`.
+All channels in the database share these settings and the total capacity budget.
+Complete namespace and thread identities isolate messages and producer control.
+Polling holds no connection between queries. Configure connection and statement
+timeouts on the Engine; table setup has a 30-second lock wait. Total capacity checks
+serialize writes across channels. Failed commit acknowledgements are reported without
+automatically replaying the transition.
 
 ## Use Redis
 
@@ -79,12 +114,12 @@ channel = messaging.channel(
 | --- | --- | --- |
 | `[agui]` | `AgUiCodec` | AG-UI encoding, decoding, and SSE |
 | `[native]` | `NativeStreamPartCodec` | Canonical Native replay encoding, decoding, and SSE |
+| `[sqlalchemy]` | `SqlAlchemyBackend` | SQL message storage; install an async driver separately |
 | `[redis]` | `RedisBackend` | Multi-process durable backend |
 
-Canonical TinkerFin streams include immutable codec and RunIdentity profiles, so a
-name-only channel infers both. Native Runtime sources additionally transfer the
-Driver-owned `NativeStreamPart` through `MessageCodecInputSource`; the codec never
-reparses a live upstream mapping. Custom sources need an explicit codec and RunIdentity.
+TinkerFin streams carry their codec and complete RunIdentity. When wrapping one,
+a channel needs only its name; identity and codec do not need to be repeated.
+Custom sources require an explicit codec and RunIdentity.
 
 RedisBackend stores the limits, per-generation payload counters, and the current and
 immediately previous owner's successful lease-renewal counts and UTC timestamps for
@@ -95,7 +130,7 @@ These fields never enter `MessageEnvelope`.
 
 Default limits are 16 MiB per encoded message, 1 MiB per checkpoint position, 100,000
 messages and 1 GiB of payload per thread generation, and 1 GiB / 100,000 retained records
-across one MemoryBackend instance or Redis prefix. Configure `max_total_bytes` and
+across one MemoryBackend instance, SQL database, or Redis prefix. Configure `max_total_bytes` and
 `max_total_records` in `MessagingLimits` to change the totals.
 
 Total bytes count payloads, per-message checkpoint evidence, and each Run's latest
@@ -119,7 +154,7 @@ import json
 
 
 class JsonEventCodec:
-    codec_id = "my-app.event.v1"
+    codec_id = "my-app.event"
 
     def encode(self, item: dict[str, object]) -> bytes:
         return json.dumps(item, separators=(",", ":")).encode()
@@ -172,6 +207,18 @@ class QueueSource:
 Implement `ProfiledMessageSource` only when the source can declare a complete immutable codec profile. For most application sources, an explicit channel codec is simpler.
 
 ## Define a custom backend
+
+Import the storage extension contract from its focused module:
+
+```python
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackend,
+    MessagingStateSnapshot,
+    MessagingStorageEffect,
+    MessagingTransition,
+    resolve_messaging_transition,
+)
+```
 
 Implement `MessagingBackend` only when another durable store is required. Messaging owns
 producer tasks, cancellation, follow loops, settlement, retention decisions, and error

@@ -170,7 +170,9 @@ def _normalize_cancel_callback(
         signature.bind(
             CancelContext(
                 channel="callback",
-                identity=RunIdentity(threadId="callback", runId="callback"),
+                identity=RunIdentity(
+                    namespace="callback", thread_id="callback", run_id="callback"
+                ),
             )
         )
     except TypeError as error:
@@ -310,7 +312,7 @@ def __aiter__(
     return delivery
 
 
-def sse(self: MessageSubscription[ReplayT]) -> AsyncGenerator[bytes, None]:
+def to_sse(self: MessageSubscription[ReplayT]) -> AsyncGenerator[bytes, None]:
     """Render committed messages while preserving their durable sequences."""
 
     renderer = self._renderer

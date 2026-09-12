@@ -24,7 +24,7 @@ def test_failure_uses_terminal_evidence(kind, outcome, code, expected):
     projection = ConversationFailureProjection()
     common = dict(
         source_observation_id="observation-1",
-        identity=RunIdentity(threadId="thread-1", runId="run-1"),
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1"),
         occurred_at=datetime.now(UTC),
         monotonic_ns=1,
     )

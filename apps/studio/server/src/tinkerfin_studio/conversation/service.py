@@ -11,7 +11,6 @@ from ag_ui.core import BaseEvent, CustomEvent, RunStartedEvent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tinkerfin import AgUiResumeCheckpoint, RunIdentity, SseBody
-from tinkerfin.deep_agent import DeepAgentDefinition
 from tinkerfin_messaging import (
     AgUiCodec,
     MessageEnvelope,
@@ -25,7 +24,7 @@ from tinkerfin_messaging.errors import (
     MessagingErrorCode,
     RunProducerFailed,
 )
-from tinkerfin_studio.agent.factory import ConversationAgentFactory
+from tinkerfin_studio.agent.runtime import build_conversation_runtime
 from tinkerfin_studio.api.errors import (
     AttachmentErrorCode,
     BusinessException,
@@ -204,22 +203,32 @@ class ConversationChatService:
             AgentModelRepository(self._session, user_id=self._user.user_id)
         ).resolve(request.forwarded_props.model)
         request = await self._resolve_attachments(request, model)
+        image_model = await AgentModelService(
+            AgentModelRepository(self._session, user_id=self._user.user_id)
+        ).resolve_image_model()
         intent = classify_intent(request)
         run_preparer, prepared, execution = await self._prepare_execution(
             request,
             intent=intent,
             model=model,
         )
-        image_model = await AgentModelService(
-            AgentModelRepository(self._session, user_id=self._user.user_id)
-        ).resolve_image_model()
-        events = self._create_events(
-            intent=intent,
-            execution=execution,
-            prepared=prepared,
-            model=model,
-            image_model=image_model,
-        )
+        try:
+            events = self._create_events(
+                intent=intent,
+                execution=execution,
+                prepared=prepared,
+                model=model,
+                image_model=image_model,
+            )
+        except BaseException:
+            # 流尚未交给消息服务，本次业务登记仍由请求负责清理
+            await run_preparer.cleanup_unstarted(
+                thread_pk=execution.thread.id,
+                identity_run_id=prepared.identity.run_id,
+                registered=execution.registered,
+                thread_created=execution.thread_created,
+            )
+            raise
         body = await self._start_delivery(
             events,
             after=after,
@@ -305,6 +314,7 @@ class ConversationChatService:
             previous_identity = conversation_identity(
                 thread.thread_id,
                 thread.last_run_id,
+                user_id=self._user.user_id,
             )
             try:
                 await self._resources.conversation_trace.reconcile(
@@ -349,7 +359,7 @@ class ConversationChatService:
         model: AgentModelConfig,
         image_model: AgentModelConfig | None,
     ) -> ProfiledMessageSource[BaseEvent, BaseEvent]:
-        """创建仅由 Messaging owner 打开的统一 AG-UI 事件源"""
+        """创建会话事件流，在执行开始时准备运行资源"""
 
         resume_request = None
         if isinstance(intent, StartChatIntent):
@@ -359,20 +369,12 @@ class ConversationChatService:
                 raise RuntimeError("恢复请求缺少 AgUiResumeRequest")
             messages = None
             resume_request = execution.resume
-        tinkerfin = self._resources.tinkerfin
-        factory = ConversationAgentFactory(
-            persistence=self._resources.agent_persistence,
-            model_http_client=self._resources.model_http_client,
-            model_allowed_origins=self._resources.settings.model_allowed_origins,
-            attachments=self._resources.attachments,
+        runtime = build_conversation_runtime(
+            resources=self._resources,
+            user_id=self._user.user_id,
             thread_id=execution.thread.thread_id,
+            model_config=model,
             image_model=image_model,
-            sandbox_manager=self._resources.sandbox_manager,
-            tavily_api_key=(
-                None
-                if self._resources.settings.tavily_api_key is None
-                else self._resources.settings.tavily_api_key.get_secret_value()
-            ),
         )
 
         async def record_resume_checkpoint(checkpoint: AgUiResumeCheckpoint) -> None:
@@ -393,30 +395,6 @@ class ConversationChatService:
                 )
                 await repository.commit()
 
-        async def create_agent() -> DeepAgentDefinition[None]:
-            return await factory.create_agent(
-                tinkerfin=tinkerfin,
-                user_id=self._user.user_id,
-                model_config=model,
-            )
-
-        async def open_events(identity: RunIdentity):
-            return await tinkerfin.open_agui_run(
-                identity,
-                agent=create_agent,
-                messages=messages,
-                resume=resume_request,
-                parent_run_id=prepared.parent_run_id,
-                mode=prepared.mode,
-                config=prepared.graph_config,
-                on_resume_saved=(
-                    record_resume_checkpoint if resume_request is not None else None
-                ),
-                on_resume_not_saved=(
-                    release_resume_claims if resume_request is not None else None
-                ),
-            )
-
         def attach_run_metadata(event: BaseEvent) -> BaseEvent:
             """补充 Studio 标题与取消文案"""
 
@@ -429,11 +407,28 @@ class ConversationChatService:
                 title_generation_status=execution.thread.title_generation_status,
             )
 
-        return create_agui_run_source(
-            prepared.identity,
-            open_events=open_events,
-            transform_event=attach_run_metadata,
-        )
+        if resume_request is None:
+            assert messages is not None
+            events = runtime.open_agui_run(
+                thread_id=prepared.identity.thread_id,
+                run_id=prepared.identity.run_id,
+                messages=messages,
+                parent_run_id=prepared.parent_run_id,
+                mode=prepared.mode,
+                config=prepared.graph_config,
+            )
+        else:
+            events = runtime.open_agui_run(
+                thread_id=prepared.identity.thread_id,
+                run_id=prepared.identity.run_id,
+                resume=resume_request,
+                parent_run_id=prepared.parent_run_id,
+                mode=prepared.mode,
+                config=prepared.graph_config,
+                on_resume_saved=record_resume_checkpoint,
+                on_resume_not_saved=release_resume_claims,
+            )
+        return create_agui_run_source(events, transform_event=attach_run_metadata)
 
     async def _start_delivery(
         self,
@@ -446,7 +441,7 @@ class ConversationChatService:
         title_text: str,
         model: AgentModelConfig,
     ) -> AsyncGenerator[bytes, None] | SseBody[bytes]:
-        """让 Messaging 完成 owner/attachment 选择并返回 SSE 内容"""
+        """接入会话事件持久化与重连回放，并返回 SSE 内容"""
 
         title_ready = asyncio.Event()
         owner = False
@@ -487,7 +482,7 @@ class ConversationChatService:
             )
 
         try:
-            body = await self._resources.conversation_channel.sse(
+            body = await self._resources.conversation_channel.open_sse(
                 events,
                 after=after,
                 on_source_ready=activate_ready_source,
@@ -596,7 +591,9 @@ class ConversationChatService:
         # 提交隐式只读事务可释放连接，并保留活跃流仍会读取的 thread 事实
         await self._repository.commit()
         try:
-            identity = conversation_identity(thread_id, run_id)
+            identity = conversation_identity(
+                thread_id, run_id, user_id=self._user.user_id
+            )
             cancelled = await self._resources.conversation_channel.cancel(
                 identity=identity,
             )

@@ -94,12 +94,12 @@ it('子智能体图片留在对应卡片中，重复附件事件不会复制图�
 
 function nativeContractEvents(): ConversationAgUiEvent[] {
   const subRunId = 'subagent-11111111-1111-5111-8111-111111111111'
-  const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
+  const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', graphNamespace: [] }
   const provenance = {
     schema: 'tinkerfin.subagent-provenance' as const,
     subagentInvocationId: subRunId,
-    namespace: ['tools:graph-research'],
-    parentNamespace: [],
+    graphNamespace: ['tools:graph-research'],
+    parentGraphNamespace: [],
     graphTaskId: 'graph-research',
     agentName: 'researcher',
     parentToolCallId: 'call-task',
@@ -110,8 +110,8 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
     kind: 'deep_agent_subagent' as const,
     agentType: 'subagent' as const,
     agentName: 'researcher',
-    namespace: [...provenance.namespace],
-    parentNamespace: [],
+    graphNamespace: [...provenance.graphNamespace],
+    parentGraphNamespace: [],
     graphTaskId: 'graph-research',
     parentToolCallId: 'call-task',
     subagentInput: provenance.description,
@@ -164,7 +164,7 @@ function nativeContractEvents(): ConversationAgUiEvent[] {
         data: { id: 'graph-research', name: 'tools' },
         provenance: {
           kind: 'root',
-          namespace: [],
+          graphNamespace: [],
           agentType: 'main',
           agentName: 'main',
           subagents: [provenance],
@@ -471,14 +471,14 @@ function interrupt(
 describe('AG-UI runtime reducer', () => {
   it('uses server-owned RAW task identities for live subagent cards and child tools', () => {
     const subRunId = 'subagent-22222222-2222-5222-8222-222222222222'
-    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', graphNamespace: [] }
     const subSource = {
       kind: 'deep_agent_subagent' as const,
       agentType: 'subagent' as const,
       agentName: 'researcher',
-      namespace: ['tools:graph-server'],
+      graphNamespace: ['tools:graph-server'],
       graphTaskId: 'graph-server',
-      parentNamespace: [],
+      parentGraphNamespace: [],
       parentToolCallId: 'call-task-server',
       subagentInput: '检索 LangGraph',
       subagentInvocationId: subRunId,
@@ -508,14 +508,14 @@ describe('AG-UI runtime reducer', () => {
           data: { id: 'graph-server', name: 'tools' },
           provenance: {
             kind: 'root',
-            namespace: [],
+            graphNamespace: [],
             agentType: 'main',
             agentName: 'main',
             subagents: [{
               schema: 'tinkerfin.subagent-provenance',
               subagentInvocationId: subRunId,
-              namespace: ['tools:graph-server'],
-              parentNamespace: [],
+              graphNamespace: ['tools:graph-server'],
+              parentGraphNamespace: [],
               graphTaskId: 'graph-server',
               agentName: 'researcher',
               parentToolCallId: 'call-task-server',
@@ -607,8 +607,8 @@ describe('AG-UI runtime reducer', () => {
     const descriptor = (requestRunId: string) => ({
       schema: 'tinkerfin.subagent-provenance' as const,
       subagentInvocationId: subRunId,
-      namespace: [`tools:${graphTaskId}`],
-      parentNamespace: [],
+      graphNamespace: [`tools:${graphTaskId}`],
+      parentGraphNamespace: [],
       graphTaskId,
       agentName: 'researcher',
       parentToolCallId,
@@ -623,7 +623,7 @@ describe('AG-UI runtime reducer', () => {
         data: { id: graphTaskId, name: 'tools' },
         provenance: {
           kind: 'root',
-          namespace: [],
+          graphNamespace: [],
           agentType: 'main',
           agentName: 'main',
           subagents: [descriptor(requestRunId)],
@@ -653,7 +653,7 @@ describe('AG-UI runtime reducer', () => {
         role: 'tool',
         rawEvent: {
           streamMode: 'messages',
-          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
           runId: 'run-resume',
           relatedSubagentInvocationId: subRunId,
           toolResultStatus: 'success',
@@ -673,7 +673,7 @@ describe('AG-UI runtime reducer', () => {
   })
 
   it('isolates parallel server subruns that share one graph task id', () => {
-    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', graphNamespace: [] }
     const graphTaskId = 'shared-graph-task'
     const invocationIds = {
       a: 'subagent-77777777-7777-5777-8777-777777777777',
@@ -682,8 +682,8 @@ describe('AG-UI runtime reducer', () => {
     const descriptors = (['a', 'b'] as const).map((suffix) => ({
       schema: 'tinkerfin.subagent-provenance' as const,
       subagentInvocationId: invocationIds[suffix],
-      namespace: [`tools:${graphTaskId}:${suffix}`],
-      parentNamespace: [],
+      graphNamespace: [`tools:${graphTaskId}:${suffix}`],
+      parentGraphNamespace: [],
       graphTaskId,
       agentName: 'researcher',
       parentToolCallId: `call-task-${suffix}`,
@@ -698,7 +698,7 @@ describe('AG-UI runtime reducer', () => {
         data: { id: graphTaskId, name: 'tools' },
         provenance: {
           kind: 'root',
-          namespace: [],
+          graphNamespace: [],
           agentType: 'main',
           agentName: 'main',
           subagents: descriptors,
@@ -733,9 +733,9 @@ describe('AG-UI runtime reducer', () => {
         kind: 'deep_agent_subagent' as const,
         agentType: 'subagent' as const,
         agentName: descriptor.agentName,
-        namespace: descriptor.namespace,
+        graphNamespace: descriptor.graphNamespace,
         graphTaskId,
-        parentNamespace: [],
+        parentGraphNamespace: [],
         parentToolCallId: descriptor.parentToolCallId,
         subagentInput: descriptor.description,
         subagentInvocationId: descriptor.subagentInvocationId,
@@ -774,14 +774,14 @@ describe('AG-UI runtime reducer', () => {
 
   it('fails a discovered subrun and its child tools when the main run errors', () => {
     const subRunId = 'subagent-33333333-3333-5333-8333-333333333333'
-    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', graphNamespace: [] }
     const subSource = {
       kind: 'deep_agent_subagent' as const,
       agentType: 'subagent' as const,
       agentName: 'researcher',
-      namespace: ['tools:graph-main-error'],
+      graphNamespace: ['tools:graph-main-error'],
       graphTaskId: 'graph-main-error',
-      parentNamespace: [],
+      parentGraphNamespace: [],
       parentToolCallId: 'call-task-main-error',
       subagentInput: '执行研究',
       subagentInvocationId: subRunId,
@@ -802,14 +802,14 @@ describe('AG-UI runtime reducer', () => {
           data: { id: 'graph-main-error', name: 'tools' },
           provenance: {
             kind: 'root',
-            namespace: [],
+            graphNamespace: [],
             agentType: 'main',
             agentName: 'main',
             subagents: [{
               schema: 'tinkerfin.subagent-provenance',
               subagentInvocationId: subRunId,
-              namespace: subSource.namespace,
-              parentNamespace: [],
+              graphNamespace: subSource.graphNamespace,
+              parentGraphNamespace: [],
               graphTaskId: subSource.graphTaskId,
               agentName: subSource.agentName,
               parentToolCallId: 'call-task-main-error',
@@ -1017,7 +1017,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'TOOL_CALL_START',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         langgraphNode: 'model',
       },
       toolCallId: 'call-write-todos-test',
@@ -1029,7 +1029,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'TOOL_CALL_ARGS',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         langgraphNode: 'model',
       },
       toolCallId: 'call-write-todos-test',
@@ -1040,7 +1040,7 @@ describe('AG-UI runtime reducer', () => {
       type: 'TOOL_CALL_END',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
       },
       toolCallId: 'call-write-todos-test',
     })
@@ -1107,7 +1107,7 @@ describe('AG-UI runtime reducer', () => {
         parentMessageId: 'assistant-mixed-batch',
         rawEvent: {
           streamMode: 'messages',
-          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
           runId,
         },
       })
@@ -1158,7 +1158,7 @@ describe('AG-UI runtime reducer', () => {
       toolCallName: 'read_file',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId: RUN_ID,
       },
     })
@@ -1171,7 +1171,7 @@ describe('AG-UI runtime reducer', () => {
       role: 'tool',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId: RUN_ID,
         toolResultStatus: 'error',
       },
@@ -1188,7 +1188,7 @@ describe('AG-UI runtime reducer', () => {
     })
     const mainRawEvent = {
       streamMode: 'messages' as const,
-      source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] },
+      source: { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', graphNamespace: [] },
       runId: RUN_ID,
     }
     const mainReasoning: ConversationAgUiEvent[] = [
@@ -1230,7 +1230,7 @@ describe('AG-UI runtime reducer', () => {
         kind: 'deep_agent_subagent' as const,
         agentType: 'subagent' as const,
         agentName: 'researcher',
-        namespace: ['tools:graph-reasoning'],
+        graphNamespace: ['tools:graph-reasoning'],
         graphTaskId: 'graph-reasoning',
         subagentInvocationId: subRunId,
       },
@@ -1310,7 +1310,7 @@ describe('AG-UI runtime reducer', () => {
     const apply = (event: ConversationAgUiEvent) => {
       current = applyConversationEvent(current, event)
     }
-    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', namespace: [] }
+    const mainSource = { kind: 'root' as const, agentType: 'main' as const, agentName: 'main', graphNamespace: [] }
     const subRunIds = {
       a: 'subagent-aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa',
       b: 'subagent-bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb',
@@ -1319,8 +1319,8 @@ describe('AG-UI runtime reducer', () => {
       kind: 'deep_agent_subagent' as const,
       agentType: 'subagent' as const,
       agentName: 'researcher',
-      namespace: [`tools:graph-${suffix}`],
-      parentNamespace: [],
+      graphNamespace: [`tools:graph-${suffix}`],
+      parentGraphNamespace: [],
       graphTaskId: `graph-${suffix}`,
       parentToolCallId: `task-${suffix}`,
       subagentInput: `研究任务 ${suffix.toUpperCase()}`,
@@ -1358,14 +1358,14 @@ describe('AG-UI runtime reducer', () => {
           data: { id: graphTaskId, name: 'tools' },
           provenance: {
             kind: 'root',
-            namespace: [],
+            graphNamespace: [],
             agentType: 'main',
             agentName: 'main',
             subagents: [{
               schema: 'tinkerfin.subagent-provenance',
               subagentInvocationId: subRunId,
-              namespace: [`tools:${graphTaskId}`],
-              parentNamespace: [],
+              graphNamespace: [`tools:${graphTaskId}`],
+              parentGraphNamespace: [],
               graphTaskId,
               agentName: 'researcher',
               parentToolCallId: `task-${suffix}`,
@@ -1635,7 +1635,7 @@ describe('AG-UI runtime reducer', () => {
           type: 'TOOL_CALL_START',
           rawEvent: {
             streamMode: 'messages',
-            source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+            source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
             langgraphNode: 'model',
           },
           toolCallId: 'call-write-file-running',
@@ -1757,7 +1757,7 @@ describe('AG-UI runtime reducer', () => {
       toolCallName: 'task',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId: RUN_ID,
       },
     })
@@ -1770,14 +1770,14 @@ describe('AG-UI runtime reducer', () => {
         data: { id: 'graph-error', name: 'tools' },
         provenance: {
           kind: 'root',
-          namespace: [],
+          graphNamespace: [],
           agentType: 'main',
           agentName: 'main',
           subagents: [{
             schema: 'tinkerfin.subagent-provenance',
             subagentInvocationId: subRunId,
-            namespace: ['tools:graph-error'],
-            parentNamespace: [],
+            graphNamespace: ['tools:graph-error'],
+            parentGraphNamespace: [],
             graphTaskId: 'graph-error',
             agentName: 'researcher',
             parentToolCallId: 'call-subagent-error',
@@ -1796,7 +1796,7 @@ describe('AG-UI runtime reducer', () => {
       role: 'tool',
       rawEvent: {
         streamMode: 'messages',
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId: RUN_ID,
         relatedSubagentInvocationId: subRunId,
         toolResultStatus: 'error',

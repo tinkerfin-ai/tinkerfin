@@ -29,11 +29,13 @@ from langgraph.types import Interrupt
 from pydantic import BaseModel
 
 from tinkerfin import (
-    DeepAgentDefinition,
-    DeepAgentsV2RuntimeProfile,
-    DeepAgentsV3RuntimeProfile,
+    AgentRuntime,
     RunObservationError,
     TinkerFin,
+)
+from tinkerfin.runtime_profile import (
+    DeepAgentsV2RuntimeProfile,
+    DeepAgentsV3RuntimeProfile,
 )
 from tinkerfin_contracts import (
     ModelCallObservation,
@@ -47,12 +49,11 @@ from tinkerfin_contracts import (
     RunStartedObservation,
     RunTerminalObservation,
     RuntimeObservation,
+    ThreadIdentity,
     ToolExecutionObservation,
 )
 from tinkerfin_tracing import (
     AmbiguousTraceHead,
-    FactCountProjection,
-    FactCountResult,
     InMemoryTraceStore,
     MessageFact,
     ReasoningCapturePolicy,
@@ -70,6 +71,7 @@ from tinkerfin_tracing import (
     TraceThreadKey,
     TurnFact,
 )
+from tinkerfin_tracing.examples import FactCountProjection, FactCountResult
 from tinkerfin_tracing.graph import (
     TraceGraphFilter,
     TraceGraphNodeKind,
@@ -159,7 +161,7 @@ async def _record_run(
     parent_run_id: str | None = None,
     input_kind: RunInputKind = "ordinary",
 ) -> None:
-    identity = RunIdentity(threadId="thread-lineage", runId=run_id)
+    identity = RunIdentity(namespace="test", thread_id="thread-lineage", run_id=run_id)
     context = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -200,7 +202,9 @@ async def test_model_context_spans_preparation_without_duplicating_model_request
     None
 ):
     tracer = Tracer(store=InMemoryTraceStore())
-    identity = RunIdentity(threadId="thread-context-time", runId="run-context-time")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-context-time", run_id="run-context-time"
+    )
     source = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -297,7 +301,7 @@ async def test_model_context_spans_preparation_without_duplicating_model_request
         await session.observe(observation)
     await session.aclose()
 
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     contexts = [node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT]
 
     assert [
@@ -324,7 +328,9 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
     store = InMemoryTraceStore()
     tracer = Tracer(store=store)
     thread_id = "thread-resumed-subagent-context"
-    parent_identity = RunIdentity(threadId=thread_id, runId="run-parent")
+    parent_identity = RunIdentity(
+        namespace="test", thread_id=thread_id, run_id="run-parent"
+    )
     parent_source = RunSourceContext(
         identity=parent_identity,
         runtime_profile="deepagents-v2",
@@ -349,7 +355,7 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
         ),
         NativeTaskObservation(
             identity=parent_identity,
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id="delegation",
             name="tools",
@@ -368,7 +374,7 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
         ),
         NativeTaskObservation(
             identity=parent_identity,
-            namespace=child_namespace,
+            graph_namespace=child_namespace,
             phase="start",
             task_id="child-model-task",
             name="model",
@@ -393,7 +399,9 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
         await parent.observe(observation)
     await parent.aclose()
 
-    resumed_identity = RunIdentity(threadId=thread_id, runId="run-resumed")
+    resumed_identity = RunIdentity(
+        namespace="test", thread_id=thread_id, run_id="run-resumed"
+    )
     resumed_source = RunSourceContext(
         identity=resumed_identity,
         runtime_profile="deepagents-v2",
@@ -418,7 +426,7 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
         ),
         ModelCallObservation(
             identity=resumed_identity,
-            namespace=child_namespace,
+            graph_namespace=child_namespace,
             phase="started",
             call_id="resumed-child-model",
             messages=(
@@ -432,7 +440,7 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
         ),
         ModelCallObservation(
             identity=resumed_identity,
-            namespace=child_namespace,
+            graph_namespace=child_namespace,
             phase="completed",
             call_id="resumed-child-model",
             observed_at=resumed_at + timedelta(milliseconds=40),
@@ -440,7 +448,7 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
         ),
         NativeTaskObservation(
             identity=resumed_identity,
-            namespace=(),
+            graph_namespace=(),
             phase="result",
             task_id="delegation",
             name="tools",
@@ -466,7 +474,7 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
     await resumed.aclose()
 
     graph = await tracer.query(
-        thread_id,
+        ThreadIdentity(namespace="test", thread_id=thread_id),
         head_run_id=resumed_identity.run_id,
         limit=100,
     )
@@ -485,7 +493,9 @@ async def test_resumed_subagent_context_excludes_prior_wait_time() -> None:
 
 async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
     tracer = Tracer(store=InMemoryTraceStore())
-    identity = RunIdentity(threadId="thread-parallel-context", runId="run-parallel")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-parallel-context", run_id="run-parallel"
+    )
     source = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -511,7 +521,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         NativeTaskObservation(
             identity=identity,
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id="delegation",
             name="tools",
@@ -538,7 +548,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         NativeTaskObservation(
             identity=identity,
-            namespace=first_namespace,
+            graph_namespace=first_namespace,
             phase="start",
             task_id="first-model-task",
             name="model",
@@ -548,7 +558,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         NativeTaskObservation(
             identity=identity,
-            namespace=second_namespace,
+            graph_namespace=second_namespace,
             phase="start",
             task_id="second-model-task",
             name="model",
@@ -558,7 +568,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         ModelCallObservation(
             identity=identity,
-            namespace=second_namespace,
+            graph_namespace=second_namespace,
             phase="started",
             call_id="second-model",
             messages=(
@@ -569,7 +579,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         ModelCallObservation(
             identity=identity,
-            namespace=first_namespace,
+            graph_namespace=first_namespace,
             phase="started",
             call_id="first-model",
             messages=(
@@ -580,7 +590,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         ModelCallObservation(
             identity=identity,
-            namespace=second_namespace,
+            graph_namespace=second_namespace,
             phase="completed",
             call_id="second-model",
             observed_at=started + timedelta(milliseconds=40),
@@ -588,7 +598,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         ModelCallObservation(
             identity=identity,
-            namespace=first_namespace,
+            graph_namespace=first_namespace,
             phase="completed",
             call_id="first-model",
             observed_at=started + timedelta(milliseconds=45),
@@ -596,7 +606,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         ),
         NativeTaskObservation(
             identity=identity,
-            namespace=(),
+            graph_namespace=(),
             phase="result",
             task_id="delegation",
             name="tools",
@@ -621,7 +631,7 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
         await session.observe(observation)
     await session.aclose()
 
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     contexts = {
         node.content: node
         for node in graph.nodes
@@ -640,7 +650,9 @@ async def test_parallel_subagents_keep_independent_context_boundaries() -> None:
 
 async def test_non_subagent_graph_context_uses_the_turn_root_boundary() -> None:
     tracer = Tracer(store=InMemoryTraceStore())
-    identity = RunIdentity(threadId="thread-planning-context", runId="run-planning")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-planning-context", run_id="run-planning"
+    )
     source = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -665,7 +677,7 @@ async def test_non_subagent_graph_context_uses_the_turn_root_boundary() -> None:
         ),
         ModelCallObservation(
             identity=identity,
-            namespace=planning_namespace,
+            graph_namespace=planning_namespace,
             phase="started",
             call_id="planning-model",
             messages=(
@@ -676,7 +688,7 @@ async def test_non_subagent_graph_context_uses_the_turn_root_boundary() -> None:
         ),
         ModelCallObservation(
             identity=identity,
-            namespace=planning_namespace,
+            graph_namespace=planning_namespace,
             phase="completed",
             call_id="planning-model",
             observed_at=started + timedelta(milliseconds=40),
@@ -699,12 +711,12 @@ async def test_non_subagent_graph_context_uses_the_turn_root_boundary() -> None:
         await session.observe(observation)
     await session.aclose()
 
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     context = next(
         node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT
     )
 
-    assert context.namespace == planning_namespace
+    assert context.graph_namespace == planning_namespace
     assert context.parent_subagent_id is None
     assert context.started_at == started + timedelta(milliseconds=1)
     assert context.completed_at == started + timedelta(milliseconds=15)
@@ -712,7 +724,9 @@ async def test_non_subagent_graph_context_uses_the_turn_root_boundary() -> None:
 
 async def test_cancelled_model_keeps_completed_context_without_system_message() -> None:
     tracer = Tracer(store=InMemoryTraceStore())
-    identity = RunIdentity(threadId="thread-cancelled-context", runId="run-cancelled")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-cancelled-context", run_id="run-cancelled"
+    )
     source = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -766,7 +780,7 @@ async def test_cancelled_model_keeps_completed_context_without_system_message() 
         await session.observe(observation)
     await session.aclose()
 
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     context = next(
         node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT
     )
@@ -782,7 +796,9 @@ async def test_cancelled_model_keeps_completed_context_without_system_message() 
 
 async def test_model_retry_starts_context_at_the_failed_attempt_boundary() -> None:
     tracer = Tracer(store=InMemoryTraceStore())
-    identity = RunIdentity(threadId="thread-retry-context", runId="run-retry")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-retry-context", run_id="run-retry"
+    )
     source = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",
@@ -856,7 +872,7 @@ async def test_model_retry_starts_context_at_the_failed_attempt_boundary() -> No
         await session.observe(observation)
     await session.aclose()
 
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     contexts = sorted(
         (node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT),
         key=lambda node: node.started_at,
@@ -887,24 +903,29 @@ async def test_managed_ainvoke_builds_the_same_context_boundary(
     runtime_profile: DeepAgentsV2RuntimeProfile | DeepAgentsV3RuntimeProfile,
 ) -> None:
     tracer = Tracer(store=InMemoryTraceStore())
-    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(tracer)
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = (
+        TinkerFin(runtime_profile=runtime_profile)
+        .with_namespace("test")
+        .with_observer(tracer)
+    )
+    definition = tinkerfin.build(
         model=_SubagentToolBindingModel(responses=[AIMessage(content="done")]),
         tools=[],
         system_prompt="Use concise answers.",
     )
     identity = RunIdentity(
-        threadId=f"thread-context-{runtime_profile.profile_id}",
-        runId=f"run-context-{runtime_profile.profile_id}",
+        namespace="test",
+        thread_id=f"thread-context-{runtime_profile.profile_id}",
+        run_id=f"run-context-{runtime_profile.profile_id}",
     )
 
-    await tinkerfin.ainvoke(
-        identity,
-        agent=definition,
+    await definition.ainvoke(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         input={"messages": [HumanMessage(content="question", id="user-question")]},
     )
 
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     context = next(
         node for node in graph.nodes if node.kind is TraceGraphNodeKind.CONTEXT
     )
@@ -930,9 +951,13 @@ async def test_managed_ainvoke_stores_one_delegated_task_payload(
     runtime_profile: DeepAgentsV2RuntimeProfile | DeepAgentsV3RuntimeProfile,
 ) -> None:
     tracer = Tracer(store=InMemoryTraceStore())
-    tinkerfin = TinkerFin(runtime_profile=runtime_profile).observe(tracer)
+    tinkerfin = (
+        TinkerFin(runtime_profile=runtime_profile)
+        .with_namespace("test")
+        .with_observer(tracer)
+    )
     task_description = "Complete the delegated work"
-    definition = tinkerfin.create_deep_agent(
+    definition = tinkerfin.build(
         model=_SubagentToolBindingModel(
             responses=[
                 AIMessage(
@@ -966,17 +991,18 @@ async def test_managed_ainvoke_stores_one_delegated_task_payload(
         ],
     )
     identity = RunIdentity(
-        threadId=f"thread-subagent-{runtime_profile.profile_id}",
-        runId=f"run-subagent-{runtime_profile.profile_id}",
+        namespace="test",
+        thread_id=f"thread-subagent-{runtime_profile.profile_id}",
+        run_id=f"run-subagent-{runtime_profile.profile_id}",
     )
 
-    await tinkerfin.ainvoke(
-        identity,
-        agent=definition,
+    await definition.ainvoke(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         input={"messages": [HumanMessage(content="delegate", id="user-delegate")]},
     )
 
-    thread = await tracer.get(identity.thread_id)
+    thread = await tracer.get(identity.thread)
     events = (await thread.events(limit=100)).items
     subagent = next(
         event.fact
@@ -987,7 +1013,7 @@ async def test_managed_ainvoke_stores_one_delegated_task_payload(
         event.fact
         for event in events
         if isinstance(event.fact, MessageFact)
-        and event.fact.namespace == subagent.namespace
+        and event.fact.graph_namespace == subagent.graph_namespace
         and event.fact.role == "user"
     ]
     subagent_node = next(
@@ -1022,7 +1048,7 @@ def _definition(
     *,
     tracer: Tracer,
     runtime_profile: DeepAgentsV2RuntimeProfile | None = None,
-) -> DeepAgentDefinition[None]:
+) -> AgentRuntime[None]:
     def build(*_args: object, **_kwargs: object) -> _Graph:
         return graph
 
@@ -1031,17 +1057,17 @@ def _definition(
         build,
     )
     tinkerfin = (
-        TinkerFin()
+        TinkerFin().with_namespace("test")
         if runtime_profile is None
-        else TinkerFin(runtime_profile=runtime_profile)
+        else TinkerFin(runtime_profile=runtime_profile).with_namespace("test")
     )
     factory = cast(
         Callable[..., object],
-        tinkerfin.observe(tracer).create_deep_agent,
+        tinkerfin.with_observer(tracer).build,
     )
     definition = factory(model="provider:model", tools=[])
-    if not isinstance(definition, DeepAgentDefinition):
-        raise TypeError("patched factory must return DeepAgentDefinition")
+    if not isinstance(definition, AgentRuntime):
+        raise TypeError("patched factory must return AgentRuntime")
     return definition
 
 
@@ -1163,29 +1189,32 @@ async def test_managed_run_is_queryable_before_native_output(
         build,
     )
     tracer = Tracer()
-    tinkerfin = TinkerFin().observe(tracer)
-    definition = tinkerfin.create_deep_agent(model="provider:model", tools=[])
-    identity = RunIdentity(threadId="thread-ready", runId="run-ready")
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(tracer)
+    definition = tinkerfin.build(model="provider:model", tools=[])
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-ready", run_id="run-ready"
+    )
 
-    stream = await tinkerfin.open_run(
-        identity,
-        agent=definition,
+    stream = definition.open_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         input=InputAgentState(
             messages=[HumanMessage(id="user-ready", content="Start the work")]
         ),
     )
 
-    thread = await tracer.get(identity.thread_id, head_run_id=identity.run_id)
+    await stream.messaging_owner_preflight()
+    thread = await tracer.get(identity.thread, head_run_id=identity.run_id)
     assert thread.head_run_id == identity.run_id
     assert [(message.role, message.content) for message in thread.messages] == [
         ("user", "Start the work")
     ]
     assert thread.status.execution == "running"
-    query = await tracer.query(identity.thread_id, head_run_id=identity.run_id)
+    query = await tracer.query(identity.thread, head_run_id=identity.run_id)
     assert query.nodes
 
     await stream.aclose()
-    settled = await tracer.get(identity.thread_id, head_run_id=identity.run_id)
+    settled = await tracer.get(identity.thread, head_run_id=identity.run_id)
     assert settled.status.execution == "cancelled"
 
 
@@ -1195,15 +1224,19 @@ async def test_in_memory_graph_index_rebuild_matches_online_reduction(
     store = InMemoryTraceStore()
     tracer = Tracer(store=store)
     definition = _definition(monkeypatch, _Graph(_parts()), tracer=tracer)
-    identity = RunIdentity(threadId="thread-graph-index", runId="run-graph-index")
-    runtime = definition.new(identity=identity)
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-graph-index", run_id="run-graph-index"
+    )
+    runtime = definition
 
-    async for _part in runtime.astream(
-        InputAgentState(messages=[HumanMessage(id="user-1", content="do work")]),
+    async for _part in runtime.open_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        input=InputAgentState(messages=[HumanMessage(id="user-1", content="do work")]),
     ):
         pass
 
-    snapshot = await store.snapshot(identity.thread_id)
+    snapshot = await store.snapshot(identity.thread)
     where = TraceGraphFilter()
     before = await store.query_trace_graph(
         snapshot.key,
@@ -1228,7 +1261,7 @@ async def test_in_memory_graph_index_rebuild_matches_online_reduction(
             TraceGraphNodeKind.TOOL,
         }
     )
-    graph = await tracer.query(identity.thread_id, limit=100)
+    graph = await tracer.query(identity.thread, limit=100)
     assert graph.nodes[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
     assert [node.kind for node in graph.nodes].count(TraceGraphNodeKind.TOOL) == 1
 
@@ -1238,16 +1271,27 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
 ) -> None:
     tracer = Tracer(projections=(FactCountProjection(),))
     definition = _definition(monkeypatch, _Graph(_parts()), tracer=tracer)
-    runtime = definition.new(identity=RunIdentity(threadId="thread-1", runId="run-1"))
+    runtime = definition
 
     delivered = [
         part
-        async for part in runtime.astream(
-            InputAgentState(messages=[HumanMessage(id="user-1", content="do work")]),
+        async for part in runtime.open_run(
+            thread_id=RunIdentity(
+                namespace="test", thread_id="thread-1", run_id="run-1"
+            ).thread_id,
+            run_id=RunIdentity(
+                namespace="test", thread_id="thread-1", run_id="run-1"
+            ).run_id,
+            input=InputAgentState(
+                messages=[HumanMessage(id="user-1", content="do work")]
+            ),
             config=cast(RunnableConfig, {"configurable": {"thread_id": "thread-1"}}),
         )
     ]
-    thread = await tracer.get("thread-1", projections=("fact_counts",))
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-1"),
+        projections=("fact_counts",),
+    )
 
     assert delivered == list(_parts())
     assert [(message.role, message.content) for message in thread.messages] == [
@@ -1269,7 +1313,7 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
     )
     indexed = (
         await tracer.query(
-            "thread-1",
+            ThreadIdentity(namespace="test", thread_id="thread-1"),
             where=TraceGraphFilter(),
             limit=200,
         )
@@ -1313,7 +1357,7 @@ async def test_runtime_trace_projects_messages_tree_state_todos_and_safe_events(
     assert [fact.phase for fact in assistant_facts] == ["started", "reconciled"]
     assert assistant_facts[-1].content is not None
     assert assistant_facts[-1].content.value == "hello world"
-    assert all(fact.namespace == () for fact in tool_facts)
+    assert all(fact.graph_namespace == () for fact in tool_facts)
     assert any(
         isinstance(fact.changes.value, dict) and "todos" in fact.changes.value
         for fact in state_facts
@@ -1398,25 +1442,32 @@ async def test_propagated_subagent_interrupt_uses_the_deepest_trace_scope(
     )
     tracer = Tracer()
     definition = _definition(monkeypatch, _Graph(parts), tracer=tracer)
-    runtime = definition.new(
-        identity=RunIdentity(threadId="thread-child-review", runId="run-review")
-    )
+    runtime = definition
 
     delivered = [
         part
-        async for part in runtime.astream(
-            InputAgentState(messages=[HumanMessage(id="user", content="Delegate")]),
+        async for part in runtime.open_run(
+            thread_id=RunIdentity(
+                namespace="test", thread_id="thread-child-review", run_id="run-review"
+            ).thread_id,
+            run_id=RunIdentity(
+                namespace="test", thread_id="thread-child-review", run_id="run-review"
+            ).run_id,
+            input=InputAgentState(
+                messages=[HumanMessage(id="user", content="Delegate")]
+            ),
             config=cast(
-                RunnableConfig,
-                {"configurable": {"thread_id": "thread-child-review"}},
+                RunnableConfig, {"configurable": {"thread_id": "thread-child-review"}}
             ),
         )
     ]
-    thread = await tracer.get("thread-child-review")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-child-review")
+    )
 
     assert delivered == list(parts)
     assert [
-        (interaction.namespace, interaction.source_id, interaction.status)
+        (interaction.graph_namespace, interaction.source_id, interaction.status)
         for interaction in thread.interactions
     ] == [(namespace, "child-review", "pending")]
     assert thread.status.execution == "waiting"
@@ -1457,20 +1508,24 @@ async def test_locked_subagent_hitl_remains_an_interrupt_with_tracing() -> None:
         ]
     )
     tracer = Tracer(store=InMemoryTraceStore())
-    tinkerfin = TinkerFin().observe(tracer)
-    definition = tinkerfin.create_deep_agent(
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(tracer)
+    definition = tinkerfin.build(
         model=model,
         tools=[reviewed_child_tool],
         interrupt_on={"reviewed_child_tool": {"allowed_decisions": ["approve"]}},
         checkpointer=InMemorySaver(),
     )
-    identity = RunIdentity(threadId="thread-real-child-review", runId="run-review")
-    stream = definition.new_agui(identity=identity).astream(
-        {"messages": [HumanMessage(content="Delegate", id="user")]}
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-real-child-review", run_id="run-review"
+    )
+    stream = definition.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        input={"messages": [HumanMessage(content="Delegate", id="user")]},
     )
     events = [event async for event in stream]
     terminal = events[-1]
-    thread = await tracer.get(identity.thread_id)
+    thread = await tracer.get(identity.thread)
 
     assert isinstance(terminal, RunFinishedEvent)
     assert terminal.outcome is not None
@@ -1478,10 +1533,10 @@ async def test_locked_subagent_hitl_remains_an_interrupt_with_tracing() -> None:
     assert len(terminal.outcome.interrupts) == 1
     assert stream.error is None
     assert len(thread.interactions) == 1
-    assert thread.interactions[0].namespace
+    assert thread.interactions[0].graph_namespace
     assert thread.interactions[0].status == "pending"
     assert thread.status.execution == "waiting"
-    graph = await tracer.query(identity.thread_id, limit=200)
+    graph = await tracer.query(identity.thread, limit=200)
     assert graph.nodes
     assert all(node.failure is None for node in graph.nodes)
     assert not any(
@@ -1521,21 +1576,20 @@ async def test_canonical_graph_links_messages_models_and_one_aggregated_tool() -
         ]
     )
     tracer = Tracer(store=InMemoryTraceStore())
-    tinkerfin = TinkerFin().observe(tracer)
-    definition = tinkerfin.create_deep_agent(
-        model=model,
-        tools=[graph_tool],
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(tracer)
+    definition = tinkerfin.build(model=model, tools=[graph_tool])
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-canonical-graph", run_id="run-graph"
     )
-    identity = RunIdentity(threadId="thread-canonical-graph", runId="run-graph")
-    stream = await tinkerfin.open_run(
-        identity,
-        agent=definition,
+    stream = definition.open_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         input={"messages": [HumanMessage(content="Use the Tool", id="human-graph")]},
     )
     async for _part in stream:
         pass
 
-    semantic = await tracer.query(identity.thread_id, limit=200)
+    semantic = await tracer.query(identity.thread, limit=200)
     assert semantic.nodes[0].kind is TraceGraphNodeKind.HUMAN_MESSAGE
     assert [node.kind for node in semantic.nodes].count(TraceGraphNodeKind.TOOL) == 1
     assert [node.kind for node in semantic.nodes].count(
@@ -1609,15 +1663,14 @@ async def test_real_subagent_cancellation_settles_every_child_graph_node() -> No
         ]
     )
     tracer = Tracer(store=InMemoryTraceStore())
-    tinkerfin = TinkerFin().observe(tracer)
-    definition = tinkerfin.create_deep_agent(
-        model=model,
-        tools=[wait_for_child_cancellation],
+    tinkerfin = TinkerFin().with_namespace("test").with_observer(tracer)
+    definition = tinkerfin.build(model=model, tools=[wait_for_child_cancellation])
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-child-cancel", run_id="run-cancel"
     )
-    identity = RunIdentity(threadId="thread-child-cancel", runId="run-cancel")
-    stream = await tinkerfin.open_run(
-        identity,
-        agent=definition,
+    stream = definition.open_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         input={"messages": [HumanMessage(content="Delegate", id="user")]},
     )
 
@@ -1632,7 +1685,7 @@ async def test_real_subagent_cancellation_settles_every_child_graph_node() -> No
         await consumer
 
     graph = await tracer.query(
-        identity.thread_id,
+        identity.thread,
         where=TraceGraphFilter(),
         limit=200,
     )
@@ -1668,8 +1721,12 @@ async def test_branches_require_an_explicit_head_and_window_loads_older_turns() 
     await _record_run(tracer, run_id="branch-b", parent_run_id="root")
 
     with pytest.raises(AmbiguousTraceHead):
-        await tracer.get("thread-lineage")
-    branch = await tracer.get("thread-lineage", head_run_id="branch-a", limit=1)
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-lineage"))
+    branch = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"),
+        head_run_id="branch-a",
+        limit=1,
+    )
     assert branch.head_run_id == "branch-a"
     assert branch.has_older is True
     assert len(branch.graph.turns) == 1
@@ -1685,9 +1742,13 @@ async def test_incremental_core_checkpoint_reads_only_the_visible_turn_window() 
         await _record_run(tracer, run_id=f"bounded-{index}")
 
     store.read_calls.clear()
-    thread = await tracer.get("thread-lineage", limit=2)
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"), limit=2
+    )
     query_calls = tuple(store.read_calls)
-    snapshot = await store.snapshot("thread-lineage")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage")
+    )
     full_events = await store.read_events(
         snapshot.key,
         after_seq=0,
@@ -1718,7 +1779,9 @@ async def test_implicit_resume_matches_full_fold_for_every_incremental_batch() -
         run_id="implicit-resume-child",
         input_kind="resume",
     )
-    snapshot = await store.snapshot("thread-lineage")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage")
+    )
     events = await store.read_events(
         snapshot.key,
         after_seq=0,
@@ -1768,7 +1831,9 @@ async def test_implicit_resume_matches_full_fold_for_every_incremental_batch() -
         assert projected.has_older == baseline.has_older
 
     store.read_calls.clear()
-    cached = await tracer.get("thread-lineage")
+    cached = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage")
+    )
 
     assert store.read_calls == []
     assert cached.completeness == baseline.completeness
@@ -1779,13 +1844,15 @@ async def test_history_cursor_expands_one_fixed_prefix_after_new_commits() -> No
     tracer = Tracer()
     for index in range(5):
         await _record_run(tracer, run_id=f"history-{index}")
-    first = await tracer.get("thread-lineage", limit=2)
+    first = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"), limit=2
+    )
     cursor = first.history_cursor
     assert cursor is not None
 
     await _record_run(tracer, run_id="history-newer")
     older = await tracer.get(
-        "thread-lineage",
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"),
         history_cursor=cursor,
         limit=2,
     )
@@ -1798,7 +1865,9 @@ async def test_history_cursor_expands_one_fixed_prefix_after_new_commits() -> No
 async def test_event_pages_are_fixed_as_of_and_follow_returns_semantic_deltas() -> None:
     tracer = Tracer()
     await _record_run(tracer, run_id="first")
-    thread = await tracer.get("thread-lineage")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage")
+    )
     first_page = await thread.events(limit=2)
     assert first_page.next_cursor is not None
 
@@ -1877,7 +1946,7 @@ async def test_custom_projection_checkpoint_reuses_state_and_derives_child_runs(
     await _record_run(tracer, run_id="projection-root")
 
     first = await tracer.get(
-        "thread-lineage",
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"),
         projections=(projection.name,),
     )
     first_calls = projection.apply_calls
@@ -1885,13 +1954,21 @@ async def test_custom_projection_checkpoint_reuses_state_and_derives_child_runs(
     assert first.projections[projection.name] == _ProjectionResult(count=first_calls)
 
     projection.apply_calls = 0
-    await tracer.get("thread-lineage", projections=(projection.name,))
+    await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"),
+        projections=(projection.name,),
+    )
     assert projection.apply_calls == 0
 
     await _record_run(tracer, run_id="projection-child")
     projection.apply_calls = 0
-    child = await tracer.get("thread-lineage", projections=(projection.name,))
-    snapshot = await tracer.store.snapshot("thread-lineage")
+    child = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage"),
+        projections=(projection.name,),
+    )
+    snapshot = await tracer.store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage")
+    )
     assert 0 < projection.apply_calls < snapshot.as_of_seq
     result = child.projections[projection.name]
     assert isinstance(result, _ProjectionResult)
@@ -1903,8 +1980,13 @@ async def test_optional_projection_failure_does_not_change_the_ledger() -> None:
     await _record_run(tracer, run_id="only")
 
     with pytest.raises(TraceProjectionFailed):
-        await tracer.get("thread-lineage", projections=("failing",))
-    healthy = await tracer.get("thread-lineage")
+        await tracer.get(
+            ThreadIdentity(namespace="test", thread_id="thread-lineage"),
+            projections=("failing",),
+        )
+    healthy = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-lineage")
+    )
     assert healthy.status.execution == "succeeded"
     assert (await healthy.events(limit=100)).items
 
@@ -1915,7 +1997,7 @@ async def test_requested_projection_names_must_be_unique() -> None:
 
     with pytest.raises(ValueError, match="names must be unique"):
         await tracer.get(
-            "thread-lineage",
+            ThreadIdentity(namespace="test", thread_id="thread-lineage"),
             projections=("fact_counts", "fact_counts"),
         )
 
@@ -1983,23 +2065,28 @@ async def test_live_runtime_objects_strip_private_state_reasoning_and_credential
     )
     tracer = Tracer()
     definition = _definition(monkeypatch, _Graph(parts), tracer=tracer)
-    runtime = definition.new(
-        identity=RunIdentity(threadId="thread-private", runId="run-private")
-    )
+    runtime = definition
 
     assert [
         part
-        async for part in runtime.astream(
-            InputAgentState(
+        async for part in runtime.open_run(
+            thread_id=RunIdentity(
+                namespace="test", thread_id="thread-private", run_id="run-private"
+            ).thread_id,
+            run_id=RunIdentity(
+                namespace="test", thread_id="thread-private", run_id="run-private"
+            ).run_id,
+            input=InputAgentState(
                 messages=[HumanMessage(id="user-private", content="question")]
             ),
             config=cast(
-                RunnableConfig,
-                {"configurable": {"thread_id": "thread-private"}},
+                RunnableConfig, {"configurable": {"thread_id": "thread-private"}}
             ),
         )
     ] == list(parts)
-    thread = await tracer.get("thread-private")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-private")
+    )
     page = await thread.events(limit=100)
     encoded = page.model_dump_json(by_alias=True)
 
@@ -2065,21 +2152,26 @@ async def test_runtime_driver_and_tracer_require_both_reasoning_opt_ins(
             reasoning_extractors=(_ProviderReasoningExtractor(),)
         ),
     )
-    runtime = definition.new(
-        identity=RunIdentity(threadId="thread-reasoning", runId="run-reasoning")
-    )
+    runtime = definition
 
     assert [
         part
-        async for part in runtime.astream(
-            InputAgentState(messages=[]),
+        async for part in runtime.open_run(
+            thread_id=RunIdentity(
+                namespace="test", thread_id="thread-reasoning", run_id="run-reasoning"
+            ).thread_id,
+            run_id=RunIdentity(
+                namespace="test", thread_id="thread-reasoning", run_id="run-reasoning"
+            ).run_id,
+            input=InputAgentState(messages=[]),
             config=cast(
-                RunnableConfig,
-                {"configurable": {"thread_id": "thread-reasoning"}},
+                RunnableConfig, {"configurable": {"thread_id": "thread-reasoning"}}
             ),
         )
     ] == list(parts)
-    thread = await tracer.get("thread-reasoning")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-reasoning")
+    )
     reasoning_facts = [
         item.fact
         for item in (await thread.events(limit=100)).items
@@ -2137,20 +2229,23 @@ async def test_host_reasoning_opt_in_rejects_another_provider(
             reasoning_extractors=(_ProviderReasoningExtractor(),)
         ),
     )
-    runtime = definition.new(
-        identity=RunIdentity(threadId="thread-openai", runId="run-openai")
-    )
+    runtime = definition
 
-    async for _part in runtime.astream(
-        InputAgentState(messages=[]),
-        config=cast(
-            RunnableConfig,
-            {"configurable": {"thread_id": "thread-openai"}},
-        ),
+    async for _part in runtime.open_run(
+        thread_id=RunIdentity(
+            namespace="test", thread_id="thread-openai", run_id="run-openai"
+        ).thread_id,
+        run_id=RunIdentity(
+            namespace="test", thread_id="thread-openai", run_id="run-openai"
+        ).run_id,
+        input=InputAgentState(messages=[]),
+        config=cast(RunnableConfig, {"configurable": {"thread_id": "thread-openai"}}),
     ):
         pass
 
-    thread = await tracer.get("thread-openai")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-openai")
+    )
     assert not any(
         isinstance(item.fact, ReasoningFact)
         for item in (await thread.events(limit=100)).items
@@ -2182,20 +2277,26 @@ async def test_trace_quota_failure_terminates_the_agent_run_fail_closed(
         for index in range(20)
     )
     definition = _definition(monkeypatch, _Graph(parts), tracer=tracer)
-    runtime = definition.new(
-        identity=RunIdentity(threadId="thread-quota", runId="run-quota")
-    )
+    runtime = definition
 
     with pytest.raises(RunObservationError):
         _ = [
             part
-            async for part in runtime.astream(
-                InputAgentState(
+            async for part in runtime.open_run(
+                thread_id=RunIdentity(
+                    namespace="test", thread_id="thread-quota", run_id="run-quota"
+                ).thread_id,
+                run_id=RunIdentity(
+                    namespace="test", thread_id="thread-quota", run_id="run-quota"
+                ).run_id,
+                input=InputAgentState(
                     messages=[HumanMessage(id="user-quota", content="question")]
-                )
+                ),
             )
         ]
 
-    thread = await tracer.get("thread-quota")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-quota")
+    )
     assert thread.status.execution == "unknown"
     assert thread.completeness.missing_tail is True

@@ -18,7 +18,7 @@ from tinkerfin_native_stream import NativeRuntimeInterrupt
 
 
 def _identity(*, run_id: str = "run-resume") -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
 
 
 def _interrupts() -> tuple[Interrupt, ...]:
@@ -137,7 +137,7 @@ def test_resume_request_builds_binding_from_native_checkpoint_evidence() -> None
                 },
             ),
         ),
-        messages_by_namespace={(): (message,)},
+        messages_by_graph_namespace={(): (message,)},
     )
 
     assert binding.native_interrupt_ids == ("interrupt-1",)

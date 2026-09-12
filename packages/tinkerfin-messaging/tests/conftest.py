@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable
+from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
@@ -10,8 +11,10 @@ import pytest
 from backend_harness import MessagingBackendHarness
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sql_messaging_support import messaging_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tinkerfin_messaging import MemoryBackend, RedisBackend
+from tinkerfin_messaging import MemoryBackend, RedisBackend, SqlAlchemyBackend
 
 
 async def _delete_prefix(client: Redis, prefix: str) -> None:
@@ -31,6 +34,11 @@ async def _delete_prefix(client: Redis, prefix: str) -> None:
 @pytest.fixture(
     params=(
         pytest.param("memory", id="memory"),
+        pytest.param("sqlite", id="sqlite"),
+        pytest.param("mysql", marks=pytest.mark.docker_integration, id="mysql"),
+        pytest.param(
+            "postgresql", marks=pytest.mark.docker_integration, id="postgresql"
+        ),
         pytest.param(
             "redis",
             marks=(pytest.mark.docker_integration, pytest.mark.redis_e2e),
@@ -40,11 +48,16 @@ async def _delete_prefix(client: Redis, prefix: str) -> None:
 )
 async def messaging_backend(
     request: pytest.FixtureRequest,
+    tmp_path: Path,
 ) -> AsyncGenerator[MessagingBackendHarness, None]:
     """Yield an isolated backend implementation for the shared runtime contract."""
 
     if request.param == "memory":
         yield MessagingBackendHarness(MemoryBackend())
+        return
+    if request.param in {"sqlite", "mysql", "postgresql"}:
+        async with messaging_engine(request.param, request, tmp_path) as engine:
+            yield MessagingBackendHarness(SqlAlchemyBackend(engine))
         return
 
     redis_url = request.getfixturevalue("redis_url")
@@ -75,3 +88,17 @@ async def messaging_backend(
     finally:
         await _delete_prefix(client, prefix)
         await client.aclose()
+
+
+@pytest.fixture(
+    params=[
+        "sqlite",
+        pytest.param("mysql", marks=pytest.mark.docker_integration),
+        pytest.param("postgresql", marks=pytest.mark.docker_integration),
+    ]
+)
+async def messaging_sql_engine(
+    request: pytest.FixtureRequest, tmp_path: Path
+) -> AsyncGenerator[AsyncEngine, None]:
+    async with messaging_engine(request.param, request, tmp_path) as engine:
+        yield engine

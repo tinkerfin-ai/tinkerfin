@@ -14,15 +14,16 @@ Python 3.11 or newer is required.
 | Shared run and observation contracts | `pip install tinkerfin-contracts` |
 | Shared Native stream contract | `pip install tinkerfin-native-stream` |
 | In-memory semantic tracing | `pip install tinkerfin-tracing` |
-| SQLite Trace persistence | `pip install "tinkerfin-tracing[sqlite]"` |
-| MySQL Trace persistence | `pip install "tinkerfin-tracing[mysql]"` |
-| Asyncmy LangGraph MySQL Store | `pip install tinkerfin-langgraph-mysql` |
+| SQL Trace persistence | `pip install "tinkerfin-tracing[sqlalchemy]"` + your async database driver |
+| LangGraph memory with SQLAlchemy | `pip install "tinkerfin-langgraph-store[sqlalchemy]"` plus an async database driver |
 | Protocol-neutral in-memory messaging | `pip install tinkerfin-messaging` |
 | AG-UI messaging codec | `pip install "tinkerfin-messaging[agui]"` |
 | Native messaging codec | `pip install "tinkerfin-messaging[native]"` |
+| SQL message storage | `pip install "tinkerfin-messaging[sqlalchemy]"` plus an async database driver |
 | Redis AG-UI message storage | `pip install "tinkerfin-messaging[agui,redis]"` |
 | OpenSandbox | `pip install tinkerfin-sandbox` |
-| SQLite Sandbox state | `pip install "tinkerfin-sandbox[sqlite]"` |
-| MySQL Sandbox state | `pip install "tinkerfin-sandbox[mysql]"` |
+| SQL Sandbox state | `pip install "tinkerfin-sandbox[sqlalchemy]"` plus an async database driver |
+| Immediate execution and task scheduling with in-memory defaults | `pip install tinkerfin-automation` |
+| SQL task persistence | `pip install "tinkerfin-automation[sqlalchemy]"`; install an async driver separately |
 
 You do not need every package at once. Start with the capability you need now.

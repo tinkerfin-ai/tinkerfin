@@ -90,7 +90,7 @@ async def _get_detail(
 
 def _context(thread_id: str, run_id: str) -> RunSourceContext:
     return RunSourceContext(
-        identity=RunIdentity(threadId=thread_id, runId=run_id),
+        identity=RunIdentity(namespace="ns_1", thread_id=thread_id, run_id=run_id),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={
@@ -208,7 +208,7 @@ async def test_history_reads_fixed_trace_view_without_agui_event_tail(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-history",
@@ -468,7 +468,7 @@ async def test_history_keeps_pending_interactions_outside_the_visible_turn(
     await first_session.observe(
         NativeStateObservation(
             identity=first_context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             interrupts=(
                 NativeInterruptRecord(
@@ -566,7 +566,7 @@ async def test_trace_follow_sends_snapshot_then_semantic_update_and_closes(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-follow",
@@ -651,7 +651,7 @@ async def test_trace_follow_replaces_task_trace_only_after_authoritative_state(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant_chunk",
                 id="assistant-todos",
@@ -674,7 +674,7 @@ async def test_trace_follow_replaces_task_trace_only_after_authoritative_state(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="tool",
                 id="tool-message-todos",
@@ -690,7 +690,7 @@ async def test_trace_follow_replaces_task_trace_only_after_authoritative_state(
     await trace_session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"todos": [{"content": "实现投影", "status": "in_progress"}]},
             interrupts=(),
             observed_at=datetime.now(UTC),
@@ -714,7 +714,7 @@ async def test_trace_follow_replaces_task_trace_only_after_authoritative_state(
     await trace_session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"todos": [{"content": "实现投影", "status": "completed"}]},
             interrupts=(),
             observed_at=datetime.now(UTC),
@@ -766,7 +766,7 @@ async def test_detached_follow_can_skip_task_trace_without_losing_base_updates(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-without-todos",
@@ -807,7 +807,7 @@ async def test_history_follow_publishes_ownership_without_fabricating_graph_even
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant_chunk",
                 id="assistant-owner",
@@ -828,7 +828,7 @@ async def test_history_follow_publishes_ownership_without_fabricating_graph_even
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="tool",
                 id="todos-result-owner",
@@ -844,7 +844,7 @@ async def test_history_follow_publishes_ownership_without_fabricating_graph_even
     await trace_session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"todos": [{"content": "等待任务", "status": "in_progress"}]},
             interrupts=(),
             observed_at=datetime.now(UTC),

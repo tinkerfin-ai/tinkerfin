@@ -1,6 +1,7 @@
 """Protocol-neutral identities and Runtime observation contracts."""
 
 from .identity import RunIdentity as RunIdentity
+from .identity import ThreadIdentity as ThreadIdentity
 from .observations import RUNTIME_OBSERVATION_ADAPTER as RUNTIME_OBSERVATION_ADAPTER
 from .observations import (
     ContextContributionObservation as ContextContributionObservation,
@@ -37,9 +38,13 @@ from .observations import RuntimeObservation as RuntimeObservation
 from .observations import ToolExecutionObservation as ToolExecutionObservation
 from .protocols import RunObservationSession as RunObservationSession
 from .protocols import RuntimeObserver as RuntimeObserver
+from .workspace import AgentRunPreparation as AgentRunPreparation
+from .workspace import PreparedWorkspace as PreparedWorkspace
+from .workspace import Workspace as Workspace
 
 __all__ = [
     "RUNTIME_OBSERVATION_ADAPTER",
+    "AgentRunPreparation",
     "ContextContributionObservation",
     "ContextKind",
     "ModelCallObservation",
@@ -56,6 +61,7 @@ __all__ = [
     "NativeToolCall",
     "NativeToolCallChunk",
     "ObservationBoundary",
+    "PreparedWorkspace",
     "RunClosedObservation",
     "RunIdentity",
     "RunInputKind",
@@ -71,5 +77,7 @@ __all__ = [
     "RunTerminalOutcome",
     "RuntimeObservation",
     "RuntimeObserver",
+    "ThreadIdentity",
     "ToolExecutionObservation",
+    "Workspace",
 ]

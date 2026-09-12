@@ -21,7 +21,7 @@ _MESSAGE_ID = "lc_run--019fcd68-f466-4abc-9def-0123456789ab"
 
 def _adapter(*, expose_reasoning_events: bool = False) -> DeepAgentAgUiAdapter:
     return DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId="run-1"),
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1"),
         expose_reasoning_events=expose_reasoning_events,
     )
 

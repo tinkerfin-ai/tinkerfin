@@ -15,7 +15,7 @@ pip install tinkerfin-messaging
 Install the codecs and backend used by the host. The example below needs AG-UI:
 
 ```bash
-pip install tinkerfin "tinkerfin-messaging[agui]"
+pip install "tinkerfin[agui]" "tinkerfin-messaging[agui]"
 pip install "tinkerfin-messaging[native]"
 pip install "tinkerfin-messaging[agui,redis]"
 ```
@@ -23,57 +23,36 @@ pip install "tinkerfin-messaging[agui,redis]"
 ## Turn a TinkerFin stream into resumable SSE
 
 ```python
-from tinkerfin import RunIdentity, TinkerFin
-from tinkerfin_messaging import Messaging, create_agui_run_source
+from contextlib import aclosing
 
+from tinkerfin import TinkerFin
+from tinkerfin_messaging import Messaging
 
-tinkerfin = TinkerFin()
-agent = tinkerfin.create_deep_agent(model=model, tools=tools)
-identity = RunIdentity(threadId="thread-42", runId="run-7")
-source = create_agui_run_source(
-    identity,
-    open_events=lambda run_identity: tinkerfin.open_agui_run(
-        run_identity,
-        agent=agent,
-        input=graph_input,
-    ),
+runtime = TinkerFin().with_namespace("customer-1").build(model=model, tools=tools)
+source = runtime.open_agui_run(
+    thread_id="thread-42", run_id="run-7", input=graph_input,
 )
 
 async with Messaging() as messaging:
     channel = messaging.channel(name="agent-events")
-    body = await channel.sse(
-        source,
-        after=0,
-        on_source_ready=activate_business_run,
-        on_delivery_not_started=cleanup_business_run,
-    )
-
-    async for chunk in body:
-        await send_to_client(chunk)
+    body = await channel.open_sse(source, after=0)
+    async with aclosing(body):
+        async for chunk in body:
+            await send_to_client(chunk)
 ```
 
-`create_agui_run_source()` keeps model, Sandbox, and Graph setup behind the owner
-decision. Attachments never open the Agent. A name-only channel needs no duplicate codec,
-thread, or run parameters, including for an empty source. Its optional transform may add
-product metadata or change content, but cannot change an event type or any Run, message,
-Tool, snapshot, or interrupt correlation identity. It cannot change any field of an
-optional `RUN_STARTED.input`. Protocol-changing transformations belong to the advanced
-unprofiled `map_source()` boundary.
+Runtime supplies the namespace, identity and codec. Messaging selects the producer
+before opening the Agent or Sandbox; an attachment reuses the existing run. Each source
+is single-use, including an unused attachment candidate. The caller closes the returned
+SSE body on early return or failed HTTP setup. Pass Runtime object streams directly to
+Messaging; do not encode them as SSE first.
 
-`on_source_ready` activates host delivery for a new owner only after the request-owned
-source is ready. If readiness is never reached and no attachment is established,
-`on_delivery_not_started` performs host cleanup. An attachment invokes neither callback.
+Use `on_source_ready` and `on_delivery_not_started` on the channel only when application
+delivery state needs activation or cleanup. Attachments invoke neither callback.
+`model`, `tools`, `graph_input` and the HTTP sender belong to the application.
 
-An attachment never opens its unused candidate source, but Messaging closes that
-single-use candidate before returning. Do not reuse it after `wrap()` or `sse()`.
-
-`AgUiCodec` requires `[agui]`; `NativeStreamPartCodec` requires `[native]`; and
-`RedisBackend` requires `[redis]`. Missing extras fail at the relevant lazy import with
-the exact installation command instead of loading the Agent Runtime into Messaging Core.
-
-The returned body already contains SSE bytes and is caller-owned; close it if HTTP setup
-fails before consumption. Do not call Runtime `to_sse()` first or pass a pre-encoded
-`SseBody` into Messaging.
+Use `[agui]` for `AgUiCodec`, `[native]` for `NativeStreamPartCodec`, `[redis]` for
+`RedisBackend`, or `[sqlalchemy]` plus an async driver for `SqlAlchemyBackend`.
 
 ## Custom sources
 
@@ -91,11 +70,12 @@ If a source has a RunIdentity profile and an explicit different RunIdentity is s
 | Name | Purpose |
 | --- | --- |
 | channel name | Stable payload format, such as AG-UI |
-| `RunIdentity.threadId` | Ordered log, generation, and replay cursor scope |
-| `RunIdentity.runId` | Semantic producer and caller idempotency key |
+| `RunIdentity.namespace` | Application-defined isolation scope |
+| `RunIdentity.thread_id` | Ordered log, generation, and replay cursor scope |
+| `RunIdentity.run_id` | Semantic producer and caller idempotency key |
 | `seq` | One-based committed position in the thread log |
 
-The same RunIdentity always means the same semantic run. Reuse it for retries and attachment; use a new runId for new input. Messaging does not compare request bodies—authorization and business idempotency belong to the caller.
+The same RunIdentity always means the same semantic run. Reuse it for retries and attachment; use a new run_id for new input. Messaging does not compare request bodies—authorization and business idempotency belong to the caller.
 
 ## `after`
 
@@ -122,5 +102,5 @@ for owned producer settlement and cleanup.
 
 - [Delivery, replay, and SSE](delivery-and-replay.md)
 - [Cancellation, deferred sources, and recovery](cancellation-and-recovery.md)
-- [Redis, codecs, and custom backends](backends-and-codecs.md)
+- [Storage, codecs, and custom backends](backends-and-codecs.md)
 - [Messaging usage reference](api-reference.md)

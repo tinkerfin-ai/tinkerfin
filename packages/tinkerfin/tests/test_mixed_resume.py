@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 from ag_ui.core import (
     BaseEvent,
+    RunErrorEvent,
     RunFinishedEvent,
     RunFinishedInterruptOutcome,
     RunFinishedSuccessOutcome,
@@ -25,12 +26,13 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 
 from tinkerfin import (
     AgUiResumeBinding,
+    AgUiResumeRequest,
     RunIdentity,
     TinkerFin,
     TinkerFinLifecycleError,
 )
 from tinkerfin._hitl import HITL_CONTRACT_ID
-from tinkerfin_agui_adapter import ResumeMapper, ResumeTranslation, ScopedIdCodec
+from tinkerfin_agui_adapter import ResumeMapper, ScopedIdCodec
 
 
 class _ToolBindingModel(FakeMessagesListChatModel):
@@ -107,20 +109,27 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
         ]
     )
     saver = InMemorySaver()
-    definition = TinkerFin().create_deep_agent(
-        model=model,
-        tools=[approved_tool, cancelled_tool],
-        interrupt_on={"approved_tool": True, "cancelled_tool": True},
-        checkpointer=saver,
+    definition = (
+        TinkerFin()
+        .with_namespace("test")
+        .build(
+            model=model,
+            tools=[approved_tool, cancelled_tool],
+            subagents=cast(Any, [_external_subagent(declared=False)]),
+            interrupt_on={"approved_tool": True, "cancelled_tool": True},
+            checkpointer=saver,
+        )
     )
-    first_identity = RunIdentity(threadId="thread-mixed", runId="run-review")
-    first_runtime = definition.new_agui(
-        identity=first_identity,
+    first_identity = RunIdentity(
+        namespace="test", thread_id="thread-mixed", run_id="run-review"
     )
+    first_runtime = definition
     first_events = [
         event
-        async for event in first_runtime.astream(
-            {"messages": [HumanMessage(content="Run both tools")]}
+        async for event in first_runtime.open_agui_run(
+            thread_id=first_identity.thread_id,
+            run_id=first_identity.run_id,
+            input={"messages": [HumanMessage(content="Run both tools")]},
         )
     ]
     interrupts = tuple(_interrupt_outcome(first_events).interrupts)
@@ -148,7 +157,9 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
     assert translation.mode == "custom"
     assert translation.kind == "tool"
 
-    resume_identity = RunIdentity(threadId="thread-mixed", runId="run-resume")
+    resume_identity = RunIdentity(
+        namespace="test", thread_id="thread-mixed", run_id="run-resume"
+    )
     binding = AgUiResumeBinding.from_agui(
         entries=entries,
         interrupts=interrupts,
@@ -160,12 +171,16 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
     async def observe(part: Mapping[str, object]) -> None:
         native_parts.append(part)
 
-    resume_runtime = definition.new_agui(
-        identity=resume_identity,
-        resume=binding,
-        on_part=observe,
-    )
-    resumed_events = [event async for event in resume_runtime.astream()]
+    resume_runtime = definition
+    resumed_events = [
+        event
+        async for event in resume_runtime.open_agui_run(
+            thread_id=resume_identity.thread_id,
+            run_id=resume_identity.run_id,
+            resume=AgUiResumeRequest(entries=entries),
+            on_native_part=observe,
+        )
+    ]
 
     _assert_success(resumed_events)
     assert approved_calls == ["A"]
@@ -193,11 +208,15 @@ async def test_mixed_resume_executes_resolved_tool_and_settles_cancelled_tool_on
         "executed": False,
     }
 
-    retry_runtime = definition.new_agui(
-        identity=resume_identity,
-        resume=binding,
-    )
-    retry_events = [event async for event in retry_runtime.astream()]
+    retry_runtime = definition
+    retry_events = [
+        event
+        async for event in retry_runtime.open_agui_run(
+            thread_id=resume_identity.thread_id,
+            run_id=resume_identity.run_id,
+            resume=AgUiResumeRequest(entries=entries),
+        )
+    ]
     _assert_success(retry_events)
     assert approved_calls == ["A"]
     assert cancelled_calls == []
@@ -270,24 +289,31 @@ async def test_mixed_resume_is_injected_into_supported_subagents(
             }
         ]
     )
-    definition = TinkerFin().create_deep_agent(
-        model=model,
-        tools=[child_approved, child_cancelled],
-        subagents=cast(Any, subagents),
-        interrupt_on={"child_approved": True, "child_cancelled": True},
-        checkpointer=InMemorySaver(),
+    definition = (
+        TinkerFin()
+        .with_namespace("test")
+        .build(
+            model=model,
+            tools=[child_approved, child_cancelled],
+            subagents=cast(
+                Any, [*(subagents or []), _external_subagent(declared=False)]
+            ),
+            interrupt_on={"child_approved": True, "child_cancelled": True},
+            checkpointer=InMemorySaver(),
+        )
     )
     review_identity = RunIdentity(
-        threadId=f"thread-{subagent_type}",
-        runId="run-review",
+        namespace="test",
+        thread_id=f"thread-{subagent_type}",
+        run_id="run-review",
     )
-    review_runtime = definition.new_agui(
-        identity=review_identity,
-    )
+    review_runtime = definition
     review_events = [
         event
-        async for event in review_runtime.astream(
-            {"messages": [HumanMessage(content="Delegate the work")]}
+        async for event in review_runtime.open_agui_run(
+            thread_id=review_identity.thread_id,
+            run_id=review_identity.run_id,
+            input={"messages": [HumanMessage(content="Delegate the work")]},
         )
     ]
     interrupts = tuple(_interrupt_outcome(review_events).interrupts)
@@ -309,19 +335,24 @@ async def test_mixed_resume_is_injected_into_supported_subagents(
         ),
     )
     resume_identity = RunIdentity(
-        threadId=f"thread-{subagent_type}",
-        runId="run-resume",
+        namespace="test",
+        thread_id=f"thread-{subagent_type}",
+        run_id="run-resume",
     )
     binding = AgUiResumeBinding.from_agui(
         entries=entries,
         interrupts=interrupts,
     )
     assert binding.source_agent_names == (subagent_type,)
-    resume_runtime = definition.new_agui(
-        identity=resume_identity,
-        resume=binding,
-    )
-    resumed = [event async for event in resume_runtime.astream()]
+    resume_runtime = definition
+    resumed = [
+        event
+        async for event in resume_runtime.open_agui_run(
+            thread_id=resume_identity.thread_id,
+            run_id=resume_identity.run_id,
+            resume=AgUiResumeRequest(entries=entries),
+        )
+    ]
 
     _assert_success(resumed)
     assert approved_calls == ["A"]
@@ -364,27 +395,31 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
             AIMessage(content="done"),
         ]
     )
-    definition = TinkerFin().create_deep_agent(
-        model=model,
-        tools=[permission_peer],
-        permissions=[
-            FilesystemPermission(
-                operations=["write"],
-                paths=["/protected/**"],
-                mode="interrupt",
-            )
-        ],
-        interrupt_on={"permission_peer": True},
-        checkpointer=InMemorySaver(),
+    definition = (
+        TinkerFin()
+        .with_namespace("test")
+        .build(
+            model=model,
+            tools=[permission_peer],
+            permissions=[
+                FilesystemPermission(
+                    operations=["write"], paths=["/protected/**"], mode="interrupt"
+                )
+            ],
+            interrupt_on={"permission_peer": True},
+            checkpointer=InMemorySaver(),
+        )
     )
-    review_identity = RunIdentity(threadId="thread-permission", runId="run-review")
-    review_runtime = definition.new_agui(
-        identity=review_identity,
+    review_identity = RunIdentity(
+        namespace="test", thread_id="thread-permission", run_id="run-review"
     )
+    review_runtime = definition
     review_events = [
         event
-        async for event in review_runtime.astream(
-            {"messages": [HumanMessage(content="Write and run peer")]}
+        async for event in review_runtime.open_agui_run(
+            thread_id=review_identity.thread_id,
+            run_id=review_identity.run_id,
+            input={"messages": [HumanMessage(content="Write and run peer")]},
         )
     ]
     interrupts = tuple(_interrupt_outcome(review_events).interrupts)
@@ -412,22 +447,24 @@ async def test_permission_interrupt_uses_the_same_mixed_cancellation_contract() 
             }
         ),
     )
-    resume_identity = RunIdentity(threadId="thread-permission", runId="run-resume")
-    binding = AgUiResumeBinding.from_agui(
-        entries=entries,
-        interrupts=interrupts,
+    resume_identity = RunIdentity(
+        namespace="test", thread_id="thread-permission", run_id="run-resume"
     )
     native_parts: list[Mapping[str, object]] = []
 
     async def observe(part: Mapping[str, object]) -> None:
         native_parts.append(part)
 
-    resume_runtime = definition.new_agui(
-        identity=resume_identity,
-        resume=binding,
-        on_part=observe,
-    )
-    resumed = [event async for event in resume_runtime.astream()]
+    resume_runtime = definition
+    resumed = [
+        event
+        async for event in resume_runtime.open_agui_run(
+            thread_id=resume_identity.thread_id,
+            run_id=resume_identity.run_id,
+            resume=AgUiResumeRequest(entries=entries),
+            on_native_part=observe,
+        )
+    ]
 
     _assert_success(resumed)
     assert approved_calls == ["approved"]
@@ -461,57 +498,162 @@ def _external_subagent(*, declared: bool) -> dict[str, object]:
     return spec
 
 
-def _external_mixed_binding(
-    *,
-    unidentified: bool = False,
-) -> tuple[RunIdentity, AgUiResumeBinding]:
-    translation = ResumeTranslation(
-        mode="custom",
-        kind="tool",
-        resume_data=None,
-        cancelled_interrupt_ids=("external#1",),
-        source_agent_names=("external",),
-        unidentified_external_source=unidentified,
-        decisions_by_interrupt={
-            "native-external": ({"type": "approve"}, None),
-        },
-    )
-    identity = RunIdentity(threadId="thread-mixed", runId="run-external-resume")
-    binding = AgUiResumeBinding._from_translation(translation)
-    return identity, binding
-
-
-@pytest.mark.parametrize("unidentified", [False, True])
-def test_external_subagent_without_contract_rejects_mixed_resume_before_build(
-    unidentified: bool,
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named_source", [True, False])
+async def test_external_subagent_without_contract_rejects_mixed_resume_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    named_source: bool,
 ) -> None:
-    definition = TinkerFin().create_deep_agent(
-        model=_ToolBindingModel(responses=[AIMessage(content="unused")]),
-        tools=[],
-        subagents=cast(Any, [_external_subagent(declared=False)]),
-        checkpointer=InMemorySaver(),
-    )
-    identity, binding = _external_mixed_binding(unidentified=unidentified)
+    from deepagents import DeepAgentState, create_deep_agent
 
-    with pytest.raises(TinkerFinLifecycleError, match="external subagent"):
-        definition.new_agui(
-            identity=identity,
-            resume=binding,
+    executed: list[str] = []
+
+    @tool
+    async def external_one() -> str:
+        """Execute the first external action."""
+        executed.append("one")
+        return "one"
+
+    @tool
+    async def external_two() -> str:
+        """Execute the second external action."""
+        executed.append("two")
+        return "two"
+
+    class ExternalState(DeepAgentState, total=False):
+        _tinkerfin_lineage: dict[str, object]
+        _tinkerfin_resume: dict[str, object]
+
+    child_model = _ToolBindingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "external_one",
+                        "args": {},
+                        "id": "external-call-one",
+                        "type": "tool_call",
+                    },
+                    {
+                        "name": "external_two",
+                        "args": {},
+                        "id": "external-call-two",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        ]
+    )
+    child = create_deep_agent(
+        model=child_model,
+        tools=[external_one, external_two],
+        interrupt_on={"external_one": True, "external_two": True},
+        state_schema=ExternalState,
+    )
+    model = _ToolBindingModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "subagent_type": "external",
+                            "description": "Run the external actions",
+                        },
+                        "id": "delegate-external",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    saver = InMemorySaver()
+    runtime = (
+        TinkerFin()
+        .with_namespace("test")
+        .build(
+            model=model,
+            subagents=[
+                {
+                    "name": "external",
+                    "description": "External actions",
+                    "runnable": child,
+                }
+            ],
+            checkpointer=saver,
         )
-
-
-def test_external_subagent_can_declare_the_tinkerfin_hitl_contract() -> None:
-    definition = TinkerFin().create_deep_agent(
-        model=_ToolBindingModel(responses=[AIMessage(content="unused")]),
-        tools=[],
-        subagents=cast(Any, [_external_subagent(declared=True)]),
-        checkpointer=InMemorySaver(),
     )
-    identity, binding = _external_mixed_binding()
+    events = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id="external-thread",
+            run_id="review",
+            input={"messages": [HumanMessage(content="Delegate", id="user")]},
+        )
+    ]
+    if not named_source:
+        read = saver.aget_tuple
 
-    runtime = definition.new_agui(
-        identity=identity,
-        resume=binding,
+        async def untagged(config):
+            checkpoint = await read(config)
+            if checkpoint is not None and checkpoint.config.get("configurable", {}).get(
+                "checkpoint_ns"
+            ):
+                metadata = dict(checkpoint.metadata)
+                metadata.pop("lc_agent_name", None)
+                metadata.pop("ls_agent_type", None)
+                return checkpoint._replace(metadata=metadata)
+            return checkpoint
+
+        monkeypatch.setattr(saver, "aget_tuple", untagged)
+    pending = _interrupt_outcome(events).interrupts
+    assert len(pending) == 2
+    request = AgUiResumeRequest.model_validate(
+        {
+            "entries": [
+                {
+                    "interruptId": pending[0].id,
+                    "status": "resolved",
+                    "payload": {"type": "approve"},
+                },
+                {"interruptId": pending[1].id, "status": "cancelled"},
+            ]
+        }
     )
+    resumed = runtime.open_agui_run(
+        thread_id="external-thread", run_id="resume", resume=request
+    )
+    result = [event async for event in resumed]
+    assert result[-1].type.value == "RUN_ERROR"
+    assert isinstance(resumed.error, TinkerFinLifecycleError)
+    assert "tool review support" in str(resumed.error)
+    assert executed == []
+    abandon = AgUiResumeRequest.model_validate(
+        {
+            "entries": [
+                {"interruptId": item.id, "status": "cancelled"} for item in pending
+            ]
+        }
+    )
+    cancelled = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id="external-thread", run_id="abandon", resume=abandon
+        )
+    ]
+    terminal = cancelled[-1]
+    assert isinstance(terminal, RunErrorEvent)
+    assert terminal.code == "resume_cancelled"
+    assert executed == []
 
-    assert runtime is not None
+
+def test_subagent_declaration_cannot_grant_tool_cancellation_support() -> None:
+    with pytest.raises(ValueError, match="a subagent declaration cannot grant support"):
+        TinkerFin().with_namespace("test").build(
+            model=_ToolBindingModel(responses=[AIMessage(content="unused")]),
+            tools=[],
+            subagents=cast(Any, [_external_subagent(declared=True)]),
+            checkpointer=InMemorySaver(),
+        )

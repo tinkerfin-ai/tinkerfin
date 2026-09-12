@@ -134,24 +134,51 @@ async def summarize_conversation_title(
             "会话标题总结失败 thread=%s reason=%s", thread_pk, type(error).__name__
         )
     finally:
-        # 响应取消仍等待有界认领完成；只有确认提交成功的认领才能结算
+
+        async def settle_title() -> BaseException | None:
+            nonlocal claimed
+            # 认领和失败写回属于同一次标题尝试；先确认认领提交，才能结算该记录
+            try:
+                if claim_task is not None:
+                    try:
+                        claimed = await claim_task
+                    except Exception:  # noqa: BLE001 - 提交不明时不修改可能属于其他请求的记录
+                        pass
+                if claimed and not saved:
+                    try:
+                        async with asyncio.timeout(_TITLE_CLEANUP_SECONDS):
+                            async with database.session() as session:
+                                repository = ConversationRepository(session)
+                                await repository.finish_title(thread_pk, None)
+                                await repository.commit()
+                    except Exception as error:  # noqa: BLE001 - 辅助失败不覆盖主回复，不输出敏感正文
+                        logger.warning(
+                            "会话标题结算失败 thread=%s reason=%s",
+                            thread_pk,
+                            type(error).__name__,
+                        )
+            except BaseException as error:  # noqa: BLE001 - 交回调用方，避免清理任务泄漏控制异常
+                return error
+            return None
+
+        settlement = asyncio.create_task(
+            settle_title(), name="conversation-title-settlement"
+        )
+        cancellation: asyncio.CancelledError | None = None
         with anyio.CancelScope(shield=True):
-            if claim_task is not None:
+            while not settlement.done():
                 try:
-                    claimed = await asyncio.shield(claim_task)
-                except Exception:  # noqa: BLE001 - 提交结果不明时不修改可能属于其他请求的记录
-                    pass
-            if claimed and not saved:
+                    await asyncio.shield(settlement)
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+        failure = settlement.result()
+        if failure is not None:
+            if cancellation is not None and isinstance(failure, Exception):
                 try:
-                    async with asyncio.timeout(_TITLE_CLEANUP_SECONDS):
-                        async with database.session() as session:
-                            repository = ConversationRepository(session)
-                            await repository.finish_title(thread_pk, None)
-                            await repository.commit()
-                except Exception as error:  # noqa: BLE001 - 辅助任务清理失败不覆盖主回复或取消结果
-                    logger.warning(
-                        "会话标题结算失败 thread=%s reason=%s",
-                        thread_pk,
-                        type(error).__name__,
-                    )
+                    raise failure
+                except BaseException:  # noqa: BLE001 - 保留调用者取消与清理失败
+                    raise cancellation
+            raise failure
+        if cancellation is not None:
+            raise cancellation
     return None

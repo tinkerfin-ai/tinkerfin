@@ -1,265 +1,112 @@
-"""Generated type stubs remain aligned with the locked upstream APIs."""
+"""Generated signatures and packaged exports match the current public API."""
 
 from __future__ import annotations
 
 import ast
-import copy
+import inspect
 import json
+import shutil
 import subprocess
 import sys
-import textwrap
 import zipfile
-from collections.abc import Callable
 from pathlib import Path
+from typing import get_origin, get_type_hints
 
+import pytest
 from deepagents.graph import create_deep_agent
-from langgraph.graph.state import CompiledStateGraph
 
-from tinkerfin import DeepAgentDefinition
+from tinkerfin import AgentRuntime, TinkerFin
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _REPOSITORY_ROOT = _PACKAGE_ROOT.parents[1]
-_GENERATOR = _PACKAGE_ROOT / "scripts/generate_stubs.py"
-_PACKAGE = _PACKAGE_ROOT / "src/tinkerfin"
-_DEEP_AGENT_STUB = _PACKAGE / "deep_agent.pyi"
-_INIT_STUB = _PACKAGE / "__init__.pyi"
+_INIT_STUB = _PACKAGE_ROOT / "src/tinkerfin/__init__.pyi"
 
 
-def _stub_method(
-    path: Path,
-    class_name: str,
-    method_name: str,
-) -> ast.FunctionDef:
-    module = ast.parse(path.read_text(encoding="utf-8"))
-    class_node = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == class_name
-    )
-    return next(
-        node
-        for node in class_node.body
-        if isinstance(node, ast.FunctionDef) and node.name == method_name
-    )
-
-
-def _stub_methods(
-    path: Path,
-    class_name: str,
-    method_name: str,
-) -> list[ast.FunctionDef]:
-    """Return every overload for one generated class method."""
-
-    module = ast.parse(path.read_text(encoding="utf-8"))
-    class_node = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == class_name
-    )
-    return [
-        node
-        for node in class_node.body
-        if isinstance(node, ast.FunctionDef) and node.name == method_name
-    ]
-
-
-def _upstream_function(
-    function: Callable[..., object],
-) -> ast.FunctionDef | ast.AsyncFunctionDef:
-    module = ast.parse(textwrap.dedent(inspect_source(function)))
-    return next(
-        node
-        for node in module.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    )
-
-
-def _return_type(method: ast.FunctionDef) -> str:
-    returns = method.returns
-    assert returns is not None
-    return ast.unparse(returns)
-
-
-def inspect_source(function: Callable[..., object]) -> str:
-    import inspect
-
-    return inspect.getsource(function)
-
-
-class _RenameAstreamTypes(ast.NodeTransformer):
-    def visit_Name(self, node: ast.Name) -> ast.Name:
-        return ast.copy_location(
-            ast.Name(
-                id="InputAgentState" if node.id == "InputT" else node.id,
-                ctx=node.ctx,
-            ),
-            node,
-        )
-
-
-def test_generated_stubs_exist_and_the_generator_reports_no_drift() -> None:
-    assert _GENERATOR.is_file()
-    assert _DEEP_AGENT_STUB.is_file()
-    assert _INIT_STUB.is_file()
-
-    completed = subprocess.run(
-        [sys.executable, str(_GENERATOR), "--check"],
+def test_generated_stubs_have_no_drift() -> None:
+    subprocess.run(
+        [sys.executable, str(_PACKAGE_ROOT / "scripts/generate_stubs.py"), "--check"],
         cwd=_REPOSITORY_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
+        check=True,
     )
 
-    assert completed.returncode == 0, completed.stdout + completed.stderr
 
-
-def test_generated_stubs_preserve_upstream_options_with_explicit_agui_inputs() -> None:
-    create_arguments = copy.deepcopy(
-        _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent").args
-    )
-    create_arguments.args = create_arguments.args[1:]
-    expected_create = copy.deepcopy(_upstream_function(create_deep_agent).args)
-    assert ast.dump(create_arguments, include_attributes=False) == ast.dump(
-        expected_create,
-        include_attributes=False,
-    )
-
-    expected_astream = copy.deepcopy(
-        _upstream_function(CompiledStateGraph.astream).args
-    )
-    _RenameAstreamTypes().visit(expected_astream)
-    for index, argument in enumerate(expected_astream.kwonlyargs):
-        if argument.arg == "output_keys":
-            argument.annotation = ast.parse("None", mode="eval").body
-            expected_astream.kw_defaults[index] = ast.Constant(value=None)
-        elif argument.arg == "subgraphs":
-            argument.annotation = ast.parse("Literal[True]", mode="eval").body
-            expected_astream.kw_defaults[index] = ast.Constant(value=True)
-        elif argument.arg == "version":
-            argument.annotation = ast.parse('Literal["v2"]', mode="eval").body
-            expected_astream.kw_defaults[index] = ast.Constant(value="v2")
-    native = _stub_method(_DEEP_AGENT_STUB, "DeepAgentRuntime", "astream")
-    assert ast.dump(native.args, include_attributes=False) == ast.dump(
-        expected_astream,
-        include_attributes=False,
-    )
-
-    ordinary = _stub_method(_DEEP_AGENT_STUB, "DeepAgentAgUiRuntime", "astream")
-    expected_ordinary = copy.deepcopy(expected_astream)
-    expected_ordinary.args[1].annotation = ast.Name(
-        id="InputAgentState",
-        ctx=ast.Load(),
-    )
-    assert ast.dump(ordinary.args, include_attributes=False) == ast.dump(
-        expected_ordinary,
-        include_attributes=False,
-    )
-
-    resumed = _stub_method(
-        _DEEP_AGENT_STUB,
-        "DeepAgentAgUiResumeRuntime",
-        "astream",
-    )
-    assert [argument.arg for argument in resumed.args.args] == ["self"]
-    assert [argument.arg for argument in resumed.args.kwonlyargs] == [
-        "config",
-        "context",
-        "stream_mode",
-        "print_mode",
-        "output_keys",
-        "interrupt_before",
-        "interrupt_after",
-        "durability",
-        "control",
-        "subgraphs",
-        "debug",
-        "version",
-    ]
-
-
-def test_generated_stub_declares_precise_facade_return_types() -> None:
-    observe = _stub_method(_INIT_STUB, "TinkerFin", "observe")
-    plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
-    create = _stub_method(_INIT_STUB, "TinkerFin", "create_deep_agent")
-    native_new = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", "new")
-    agui_new, resume_new = _stub_methods(
-        _DEEP_AGENT_STUB,
-        "DeepAgentDefinition",
-        "new_agui",
-    )
-    native_astream = _stub_method(
-        _DEEP_AGENT_STUB,
-        "DeepAgentRuntime",
-        "astream",
-    )
-    agui_astream = _stub_method(
-        _DEEP_AGENT_STUB,
-        "DeepAgentAgUiRuntime",
-        "astream",
-    )
-    resume_astream = _stub_method(
-        _DEEP_AGENT_STUB,
-        "DeepAgentAgUiResumeRuntime",
-        "astream",
-    )
-
-    assert _return_type(observe) == "TinkerFin"
-    assert _return_type(plan) == "TinkerFin"
-    assert _return_type(create) == "DeepAgentDefinition[ContextT]"
-    assert _return_type(native_new) == "DeepAgentRuntime[ContextT]"
-    assert _return_type(agui_new) == "DeepAgentAgUiRuntime[ContextT]"
-    assert _return_type(resume_new) == "DeepAgentAgUiResumeRuntime[ContextT]"
-    assert _return_type(native_astream) == "NativeGraphRunStream"
-    assert _return_type(agui_astream) == "AgUiEventStream"
-    assert _return_type(resume_astream) == "AgUiEventStream"
-    assert "ParamSpec" not in _INIT_STUB.read_text(encoding="utf-8")
-    assert "ParamSpec" not in _DEEP_AGENT_STUB.read_text(encoding="utf-8")
-
-
-def test_root_stub_does_not_export_low_level_source_contracts() -> None:
+def test_build_retains_factory_parameters_and_context_inference() -> None:
     module = ast.parse(_INIT_STUB.read_text(encoding="utf-8"))
-    imported = {
-        alias.asname or alias.name
+    builder = next(
+        node
         for node in module.body
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
-    }
+        if isinstance(node, ast.ClassDef) and node.name == "TinkerFin"
+    )
+    overloads = [
+        node
+        for node in builder.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build"
+    ]
+    assert len(overloads) == 4
+    expected = set(inspect.signature(create_deep_agent).parameters) | {"prepare_tools"}
+    for overload in overloads:
+        assert {arg.arg for arg in [*overload.args.args, *overload.args.kwonlyargs]} - {
+            "self"
+        } == expected
+    assert overloads[0].returns is not None
+    assert overloads[1].returns is not None
+    assert ast.unparse(overloads[0].returns) == "AgentRuntime[ContextT]"
+    assert ast.unparse(overloads[1].returns) == "AgentRuntime[None]"
+    actual = TinkerFin().with_namespace("chosen").build
+    assert set(inspect.signature(actual).parameters) == expected
+    assert all(
+        inspect.signature(actual)
+        .parameters[name]
+        .replace(annotation=parameter.annotation)
+        == parameter
+        for name, parameter in inspect.signature(create_deep_agent).parameters.items()
+    )
+    assert all(
+        inspect.signature(actual).parameters[name].annotation == parameter.annotation
+        for name, parameter in inspect.signature(create_deep_agent).parameters.items()
+        if name not in {"backend", "subagents", "tools", "checkpointer", "cache"}
+    )
+    assert actual.__name__ == "build"
+    assert get_origin(get_type_hints(actual)["return"]) is AgentRuntime
+    assert get_origin(inspect.signature(actual).return_annotation) is AgentRuntime
 
-    assert {
-        "AgUiNativeStreamConfig",
-        "AgUiNativeStreamInvocation",
-        "GraphRunStream",
-        "NativeTinkerFinRun",
-        "TinkerFinRun",
-    }.isdisjoint(imported)
+
+def test_runtime_is_reexported_as_the_actual_execution_type() -> None:
+    import tinkerfin.runtime as implementation
+
+    assert AgentRuntime is implementation.AgentRuntime
+    assert not issubclass(AgentRuntime, TinkerFin)
+    assert not issubclass(TinkerFin, AgentRuntime)
+    module = ast.parse(_INIT_STUB.read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "runtime"
+        and any(alias.name == alias.asname == "AgentRuntime" for alias in node.names)
+        for node in module.body
+    )
 
 
-def test_generated_stubs_reject_third_party_ghost_exports(tmp_path: Path) -> None:
+def test_removed_and_third_party_exports_are_not_advertised(tmp_path: Path) -> None:
     import tinkerfin
-    import tinkerfin.deep_agent as deep_agent_module
+    import tinkerfin.deep_agent as graph_module
 
-    assert not hasattr(tinkerfin, "DeepAgentState")
-    assert not hasattr(tinkerfin, "create_deep_agent")
-    assert not hasattr(deep_agent_module, "create_deep_agent")
-    for stub in (_INIT_STUB, _DEEP_AGENT_STUB):
-        module = ast.parse(stub.read_text(encoding="utf-8"))
-        assert all(
-            alias.name != "*"
-            for node in module.body
-            if isinstance(node, ast.ImportFrom)
-            for alias in node.names
-        )
-
-    fixture = tmp_path / "ghost_exports.py"
+    for name in (
+        "DeepAgentState",
+        "create_deep_agent",
+        "DeepAgentDefinition",
+        "DeepAgentRuntime",
+    ):
+        assert not hasattr(tinkerfin, name)
+    assert not hasattr(graph_module, "create_deep_agent")
+    fixture = tmp_path / "removed_exports.py"
     fixture.write_text(
-        "from tinkerfin import DeepAgentState, create_deep_agent\n"
+        "from tinkerfin import DeepAgentState, create_deep_agent, DeepAgentDefinition\n"
         "from tinkerfin.deep_agent import create_deep_agent as module_factory\n",
         encoding="utf-8",
     )
-    pyright = Path(sys.executable).with_name("pyright")
     completed = subprocess.run(
         [
-            str(pyright),
+            str(Path(sys.executable).with_name("pyright")),
             "--pythonpath",
             sys.executable,
             "--outputjson",
@@ -271,14 +118,11 @@ def test_generated_stubs_reject_third_party_ghost_exports(tmp_path: Path) -> Non
         text=True,
     )
     report = json.loads(completed.stdout)
-    diagnostics = report["generalDiagnostics"]
-
     assert completed.returncode == 1
-    assert report["summary"]["errorCount"] == 3
+    assert report["summary"]["errorCount"] == 4
     assert all(
-        diagnostic["rule"] == "reportAttributeAccessIssue"
-        and "unknown import symbol" in diagnostic["message"]
-        for diagnostic in diagnostics
+        item["rule"] == "reportAttributeAccessIssue"
+        for item in report["generalDiagnostics"]
     )
 
 
@@ -291,7 +135,6 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
         for alias in node.names
         if alias.name != "AgentMode"
     }
-
     assert aliases == {
         "ClarificationFormBase": "_ClarificationFormBase",
         "ClarificationType": "_ClarificationType",
@@ -300,50 +143,16 @@ def test_root_stub_keeps_plan_annotation_dependencies_private() -> None:
         "PlanReviewAction": "_PlanReviewAction",
         "StructuredPlanContent": "_StructuredPlanContent",
     }
-    plan = _stub_method(_INIT_STUB, "TinkerFin", "plan")
-    index = next(
-        index
-        for index, argument in enumerate(plan.args.kwonlyargs)
-        if argument.arg == "clarification_schema"
-    )
-    annotation = plan.args.kwonlyargs[index].annotation
-    assert annotation is not None
-    assert ast.unparse(annotation) == "type[_ClarificationFormBase]"
-    default = plan.args.kw_defaults[index]
-    assert isinstance(default, ast.Name)
-    assert default.id == "_DefaultClarificationForm"
-    content_schema_index = next(
-        index
-        for index, argument in enumerate(plan.args.kwonlyargs)
-        if argument.arg == "content_schema"
-    )
-    content_schema_annotation = plan.args.kwonlyargs[content_schema_index].annotation
-    assert content_schema_annotation is not None
-    assert ast.unparse(content_schema_annotation) == "type[_PlanContentModel]"
-    content_schema_default = plan.args.kw_defaults[content_schema_index]
-    assert isinstance(content_schema_default, ast.Name)
-    assert content_schema_default.id == "_StructuredPlanContent"
-    allowed_review_actions_index = next(
-        index
-        for index, argument in enumerate(plan.args.kwonlyargs)
-        if argument.arg == "allowed_review_actions"
-    )
-    allowed_review_actions_annotation = plan.args.kwonlyargs[
-        allowed_review_actions_index
-    ].annotation
-    assert allowed_review_actions_annotation is not None
-    assert ast.unparse(allowed_review_actions_annotation) == (
-        "Sequence[_PlanReviewAction]"
-    )
-    allowed_review_actions_default = plan.args.kw_defaults[allowed_review_actions_index]
-    assert isinstance(allowed_review_actions_default, ast.Name)
-    assert allowed_review_actions_default.id == "_DEFAULT_ALLOWED_REVIEW_ACTIONS"
 
 
-def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
+def test_built_wheel_contains_the_public_types(tmp_path: Path) -> None:
     output = tmp_path / "dist"
-    # Wheel contents are the contract under test. Offline resolution keeps this check
-    # from becoming an unrelated package-index availability probe.
+    source = tmp_path / "source"
+    shutil.copytree(
+        _PACKAGE_ROOT,
+        source,
+        ignore=shutil.ignore_patterns("build", "dist", "*.egg-info", "__pycache__"),
+    )
     subprocess.run(
         [
             "uv",
@@ -354,63 +163,100 @@ def test_built_wheel_contains_the_generated_stubs(tmp_path: Path) -> None:
             "--out-dir",
             str(output),
             "--no-create-gitignore",
-            str(_PACKAGE_ROOT),
+            str(source),
         ],
         cwd=_REPOSITORY_ROOT,
         check=True,
     )
-    wheel = next(output.glob("tinkerfin-*.whl"))
-
-    with zipfile.ZipFile(wheel) as archive:
+    with zipfile.ZipFile(next(output.glob("tinkerfin-*.whl"))) as archive:
         names = set(archive.namelist())
+    assert {
+        "tinkerfin/py.typed",
+        "tinkerfin/__init__.pyi",
+        "tinkerfin/runtime.py",
+        "tinkerfin/deep_agent.py",
+        "tinkerfin/_lazy_run.py",
+        "tinkerfin/_build_api.py",
+    } <= names
+    assert "tinkerfin/deep_agent.pyi" not in names
 
-    assert "tinkerfin/py.typed" in names
-    assert "tinkerfin/agui_resume.py" in names
-    assert "tinkerfin/plan/__init__.py" in names
-    assert "tinkerfin/plan/clarification.py" in names
-    assert "tinkerfin/__init__.pyi" in names
-    assert "tinkerfin/deep_agent.pyi" in names
-    assert "tinkerfin/agui_native.py" not in names
-    assert not any("-v1" in name for name in names)
 
-
-def test_definition_stub_methods_follow_the_runtime_implementation() -> None:
-    stub = _stub_method(_DEEP_AGENT_STUB, "DeepAgentDefinition", "new")
-    expected = _upstream_function(DeepAgentDefinition.new)
-    assert ast.dump(stub.args, include_attributes=False) == ast.dump(
-        expected.args,
-        include_attributes=False,
+@pytest.mark.parametrize("source", ["tinkerfin", "tinkerfin.runtime"])
+@pytest.mark.parametrize("invalid", ["main", "child", "absent"])
+def test_workspace_tool_types_reject_mismatched_capabilities(
+    tmp_path: Path, source: str, invalid: str
+) -> None:
+    fixture = tmp_path / "workspace_contract.py"
+    positive = (_PACKAGE_ROOT / "tests/typecheck_runtime_workspace.py").read_text()
+    bad_arguments = {
+        "main": "backend=workspace, prepare_tools=prepare_text",
+        "child": "backend=workspace, subagents=[reader]",
+        "absent": "prepare_tools=prepare_files",
+    }[invalid]
+    fixture.write_text(
+        positive
+        + f"\nfrom {source} import TinkerFin as Builder\n"
+        + "\ndef invalid(workspace: Workspace[Path, BackendProtocol]) -> None:\n"
+        + "    reader: SubAgent[str] = {\n"
+        + '        "name": "reader", "description": "Read", "system_prompt": "Read",\n'
+        + '        "prepare_tools": prepare_text,\n'
+        + "    }\n"
+        + f'    Builder().with_namespace("company").build(model="provider:model", {bad_arguments})\n',
+        encoding="utf-8",
     )
-
-    runtime = _upstream_function(DeepAgentDefinition.new_agui)
-    runtime_names = [argument.arg for argument in runtime.args.kwonlyargs]
-    overloads = _stub_methods(
-        _DEEP_AGENT_STUB,
-        "DeepAgentDefinition",
-        "new_agui",
+    completed = subprocess.run(
+        [
+            str(Path(sys.executable).with_name("pyright")),
+            "--pythonpath",
+            sys.executable,
+            "--outputjson",
+            str(fixture),
+        ],
+        cwd=_REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
     )
-    assert len(overloads) == 2
+    report = json.loads(completed.stdout)
+    assert report["summary"]["filesAnalyzed"] == 1
+    assert completed.returncode == 1 and report["summary"]["errorCount"] > 0
+    failing_line = len(fixture.read_text().splitlines()) - 1
     assert all(
-        [argument.arg for argument in overload.args.kwonlyargs] == runtime_names
-        for overload in overloads
-    )
-    assert "run_input" not in runtime_names
-    assert "parent_run_id" in runtime_names
-    assert "on_resume_checkpointed" in runtime_names
-
-
-def test_resume_preparation_remains_async_in_generated_stub() -> None:
-    module = ast.parse(_DEEP_AGENT_STUB.read_text(encoding="utf-8"))
-    definition = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "DeepAgentDefinition"
-    )
-    resume = next(
-        node
-        for node in definition.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "prepare_agui_resume"
+        diagnostic["range"]["start"]["line"] == failing_line
+        and diagnostic["rule"] in {"reportCallIssue", "reportArgumentType"}
+        for diagnostic in report["generalDiagnostics"]
     )
 
-    assert isinstance(resume, ast.AsyncFunctionDef)
+
+def test_workspace_build_types_are_complete_for_strict_callers(tmp_path: Path) -> None:
+    fixture = tmp_path / "workspace_contract.py"
+    shutil.copy2(_PACKAGE_ROOT / "tests/typecheck_runtime_workspace.py", fixture)
+    config = tmp_path / "pyrightconfig.json"
+    config.write_text(
+        json.dumps(
+            {
+                "include": [fixture.name],
+                "pythonVersion": "3.11",
+                "typeCheckingMode": "strict",
+                "reportMissingTypeStubs": "none",
+            }
+        ),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        [
+            str(Path(sys.executable).with_name("pyright")),
+            "--pythonpath",
+            sys.executable,
+            "--project",
+            str(config),
+            "--outputjson",
+        ],
+        cwd=_REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(completed.stdout)
+    assert report["summary"]["filesAnalyzed"] == 1
+    assert completed.returncode == 0 and report["summary"]["errorCount"] == 0, report

@@ -24,7 +24,6 @@ from ag_ui.core import (
     TextMessageContentEvent,
 )
 from ag_ui.core.types import ResumeEntry
-from deepagents import create_deep_agent
 from deepagents.backends import StoreBackend
 from deepagents.backends.utils import create_file_data
 from deepagents.graph import DeepAgentState
@@ -67,7 +66,6 @@ from redis.exceptions import ResponseError
 import tinkerfin.plan as plan_api
 import tinkerfin.plan._runtime as plan_runtime_module
 from tinkerfin import (
-    AgUiResumeBinding,
     AgUiResumeCheckpoint,
     AgUiResumeRequest,
     RunIdentity,
@@ -76,8 +74,8 @@ from tinkerfin import (
 )
 from tinkerfin._agui_lineage import (
     RUN_ID_METADATA_KEY,
-    RUNTIME_PROFILE_METADATA_KEY,
 )
+from tinkerfin.deep_agent import create_graph
 from tinkerfin.plan import (
     ClarificationForm,
     ClarificationFormBase,
@@ -106,7 +104,6 @@ from tinkerfin.plan._clarification import (
     create_clarification_binding,
     validate_and_normalize_response,
 )
-from tinkerfin.plan._state import plan_state_update
 from tinkerfin.plan._workflow import PlanningWorkflowGraph
 from tinkerfin_agui_adapter import (
     ResumeMapper,
@@ -389,7 +386,7 @@ class _MarkdownImpostor(PlanContentModel):
 
 
 def _identity(run_id: str, *, thread_id: str = "plan-thread") -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 def _structured_plan_state(value: object) -> PlanState[StructuredPlanContent]:
@@ -667,18 +664,25 @@ async def _parts(
     durability: str | None = None,
     context: object | None = None,
 ) -> list[Mapping[str, object]]:
-    runtime = cast(Any, definition).new(identity=_identity(run_id), mode=mode)
+    runtime = cast(Any, definition)
     options: dict[str, object] = {
         "config": config,
         "stream_mode": ["messages", "tasks", "values"],
-        "version": "v2",
-        "subgraphs": True,
     }
     if durability is not None:
         options["durability"] = durability
     if context is not None:
         options["context"] = context
-    return [part async for part in runtime.astream(graph_input, **options)]
+    return [
+        part
+        async for part in runtime.open_run(
+            thread_id=_identity(run_id).thread_id,
+            run_id=_identity(run_id).run_id,
+            mode=mode,
+            input=graph_input,
+            **options,
+        )
+    ]
 
 
 async def _agui_events(
@@ -689,20 +693,30 @@ async def _agui_events(
     config: Mapping[str, object],
     thread_id: str = "plan-thread",
     mode: str | None = None,
-    resume: AgUiResumeBinding | None = None,
+    resume: AgUiResumeRequest | None = None,
     parent_run_id: str | None = None,
 ) -> list[BaseEvent]:
     identity = _identity(run_id, thread_id=thread_id)
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
-        parent_run_id=parent_run_id,
-        mode=mode,
-        resume=resume,
-    )
+    runtime = cast(Any, definition)
     stream = (
-        runtime.astream(config=config)
+        runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id=parent_run_id,
+            mode=mode,
+            resume=resume,
+            config=config,
+        )
         if resume is not None
-        else runtime.astream(graph_input, config=config)
+        else runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id=parent_run_id,
+            mode=mode,
+            resume=resume,
+            input=graph_input,
+            config=config,
+        )
     )
     return [event async for event in stream]
 
@@ -756,27 +770,23 @@ def _plan_binding(
     terminal: RunFinishedEvent,
     *,
     payload: Mapping[str, object],
-) -> AgUiResumeBinding:
+) -> AgUiResumeRequest:
     assert terminal.outcome is not None and terminal.outcome.type == "interrupt"
     interrupt = terminal.outcome.interrupts[0]
-    return AgUiResumeBinding.from_agui(
-        entries=(_resume_entry(interrupt.id, payload),),
-        interrupts=terminal.outcome.interrupts,
-    )
+    return AgUiResumeRequest(entries=(_resume_entry(interrupt.id, payload),))
 
 
-def test_plan_configuration_is_immutable_and_preserves_upstream_signature() -> None:
-    base = TinkerFin()
-    planned = base.plan(enabled=True, default_mode="plan")
+def test_plan_configuration_is_immutable_and_preserves_build_signature() -> None:
+    base = TinkerFin().with_namespace("test")
+    planned = base.with_plan(enabled=True, default_mode="plan")
 
     assert planned is not base
-    assert inspect.signature(planned.create_deep_agent) == inspect.signature(
-        create_deep_agent
+    assert (
+        inspect.signature(planned.build).parameters
+        == inspect.signature(base.build).parameters
     )
-    base.create_deep_agent(model=_FakeModel(responses=[AIMessage(content="ok")]))
-    planned.create_deep_agent(
-        model=_FakeModel(responses=[AIMessage(content="default only")])
-    )
+    base.build(model=_FakeModel(responses=[AIMessage(content="ok")]))
+    planned.build(model=_FakeModel(responses=[AIMessage(content="default only")]))
 
 
 def test_plan_package_exports_only_the_current_contract() -> None:
@@ -917,14 +927,16 @@ def test_time_clarification_validates_zone_precision_range_and_response() -> Non
 @pytest.mark.parametrize("value", [1, "true", None, object()])
 def test_plan_configuration_requires_a_strict_bool(value: object) -> None:
     with pytest.raises(TypeError, match="enabled must be a bool"):
-        TinkerFin().plan(enabled=cast(Any, value))
+        TinkerFin().with_namespace("test").with_plan(enabled=cast(Any, value))
 
 
 def test_plan_configuration_rejects_disabled_options_and_invalid_modes() -> None:
     with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
-        TinkerFin().plan(enabled=False, default_mode="plan")
+        TinkerFin().with_namespace("test").with_plan(enabled=False, default_mode="plan")
     with pytest.raises(PlanModeConfigurationError, match="default_mode"):
-        TinkerFin().plan(default_mode=cast(Any, "automatic"))
+        TinkerFin().with_namespace("test").with_plan(
+            default_mode=cast(Any, "automatic")
+        )
 
 
 @pytest.mark.parametrize(
@@ -935,15 +947,23 @@ def test_plan_configuration_rejects_invalid_clarification_schemas(
     schema: object,
 ) -> None:
     with pytest.raises(PlanModeConfigurationError):
-        TinkerFin().plan(clarification_schema=cast(Any, schema))
+        TinkerFin().with_namespace("test").with_plan(
+            clarification_schema=cast(Any, schema)
+        )
 
 
 def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() -> None:
-    default_options = TinkerFin().plan()._plan_options
-    custom_options = TinkerFin().plan(content_schema=_CustomPlanContent)._plan_options
+    default_options = TinkerFin().with_namespace("test").with_plan()._plan_options
+    custom_options = (
+        TinkerFin()
+        .with_namespace("test")
+        .with_plan(content_schema=_CustomPlanContent)
+        ._plan_options
+    )
     editable_options = (
         TinkerFin()
-        .plan(
+        .with_namespace("test")
+        .with_plan(
             content_schema=_CustomPlanContent,
             allowed_review_actions=(
                 PlanReviewAction.APPROVE,
@@ -1059,7 +1079,9 @@ def test_plan_configuration_defaults_to_structured_and_freezes_custom_content() 
 )
 def test_plan_configuration_requires_fixed_review_action_values(value: object) -> None:
     with pytest.raises(TypeError, match="PlanReviewAction"):
-        TinkerFin().plan(allowed_review_actions=cast(Any, value))
+        TinkerFin().with_namespace("test").with_plan(
+            allowed_review_actions=cast(Any, value)
+        )
 
 
 @pytest.mark.parametrize(
@@ -1070,12 +1092,17 @@ def test_plan_configuration_rejects_empty_or_duplicate_allowed_review_actions(
     value: tuple[PlanReviewAction, ...],
 ) -> None:
     with pytest.raises(PlanModeConfigurationError, match="allowed_review_actions"):
-        TinkerFin().plan(allowed_review_actions=value)
+        TinkerFin().with_namespace("test").with_plan(allowed_review_actions=value)
 
 
 def test_plan_configuration_freezes_a_single_review_action() -> None:
     configured_actions = [PlanReviewAction.APPROVE]
-    options = TinkerFin().plan(allowed_review_actions=configured_actions)._plan_options
+    options = (
+        TinkerFin()
+        .with_namespace("test")
+        .with_plan(allowed_review_actions=configured_actions)
+        ._plan_options
+    )
     configured_actions.append(PlanReviewAction.EDIT)
 
     assert options is not None
@@ -1094,11 +1121,11 @@ def test_plan_configuration_freezes_a_single_review_action() -> None:
 )
 def test_plan_configuration_rejects_invalid_content_schemas(schema: object) -> None:
     with pytest.raises(PlanModeConfigurationError):
-        TinkerFin().plan(content_schema=cast(Any, schema))
+        TinkerFin().with_namespace("test").with_plan(content_schema=cast(Any, schema))
 
 
 def test_plan_configuration_does_not_accept_removed_parameter_names() -> None:
-    parameters = inspect.signature(TinkerFin.plan).parameters
+    parameters = inspect.signature(TinkerFin.with_plan).parameters
     assert "content_schema" in parameters
     assert "allowed_review_actions" in parameters
     assert "plan_schema" not in parameters
@@ -1107,11 +1134,12 @@ def test_plan_configuration_does_not_accept_removed_parameter_names() -> None:
 
 def test_disabled_plan_rejects_a_non_default_content_schema() -> None:
     with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
-        TinkerFin().plan(enabled=False, content_schema=MarkdownPlanContent)
+        TinkerFin().with_namespace("test").with_plan(
+            enabled=False, content_schema=MarkdownPlanContent
+        )
     with pytest.raises(PlanModeConfigurationError, match="disabled Plan capability"):
-        TinkerFin().plan(
-            enabled=False,
-            allowed_review_actions=(PlanReviewAction.APPROVE,),
+        TinkerFin().with_namespace("test").with_plan(
+            enabled=False, allowed_review_actions=(PlanReviewAction.APPROVE,)
         )
 
 
@@ -1129,7 +1157,7 @@ def test_plan_configuration_rejects_unsafe_question_count_schemas(
     message: str,
 ) -> None:
     with pytest.raises(PlanModeConfigurationError, match=message):
-        TinkerFin().plan(clarification_schema=schema)
+        TinkerFin().with_namespace("test").with_plan(clarification_schema=schema)
 
 
 def test_plan_contracts_are_frozen_and_reject_duplicate_steps() -> None:
@@ -1213,7 +1241,7 @@ def test_host_schema_owns_question_count_bounds() -> None:
     ]
     assert bounded_schema["minItems"] == 2
     assert bounded_schema["maxItems"] == 5
-    TinkerFin().plan(clarification_schema=_BoundedForm)
+    TinkerFin().with_namespace("test").with_plan(clarification_schema=_BoundedForm)
 
     def payload(count: int) -> dict[str, list[dict[str, object]]]:
         return {
@@ -1242,7 +1270,7 @@ def test_host_schema_owns_question_count_bounds() -> None:
     with pytest.raises(ValidationError, match="at most 5 items"):
         _BoundedForm.model_validate(payload(6))
 
-    TinkerFin().plan(clarification_schema=_ExactFourForm)
+    TinkerFin().with_namespace("test").with_plan(clarification_schema=_ExactFourForm)
     assert len(_ExactFourForm.model_validate(payload(4)).questions) == 4
     with pytest.raises(ValidationError):
         _ExactFourForm.model_validate(payload(3))
@@ -1269,12 +1297,9 @@ async def test_planner_prompt_derives_question_count_from_the_bound_schema(
     model = _FakeModel(responses=[_planner()])
     definition = (
         TinkerFin()
-        .plan(enabled=True, clarification_schema=schema)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True, clarification_schema=schema)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     await _parts(
         definition,
@@ -1297,12 +1322,9 @@ async def test_planner_prompt_lists_only_reachable_answer_types() -> None:
     model = _FakeModel(responses=[_planner()])
     definition = (
         TinkerFin()
-        .plan(enabled=True, clarification_schema=_TextOnlyForm)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True, clarification_schema=_TextOnlyForm)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     await _parts(
         definition,
@@ -1325,18 +1347,29 @@ async def test_planner_prompt_lists_only_reachable_answer_types() -> None:
 
 
 def test_plain_definition_rejects_plan_runs() -> None:
-    definition = TinkerFin().create_deep_agent(
-        model=_FakeModel(responses=[AIMessage(content="done")]),
-        tools=[],
+    definition = (
+        TinkerFin()
+        .with_namespace("test")
+        .build(model=_FakeModel(responses=[AIMessage(content="done")]), tools=[])
     )
     with pytest.raises(PlanModeConfigurationError, match="Plan-capable"):
-        definition.new(identity=_identity("plain-plan"), mode="plan")
+        definition.open_run(
+            thread_id="plan-thread",
+            run_id="plain-plan",
+            mode="plan",
+            input={"messages": []},
+        )
 
 
 @pytest.mark.asyncio
 async def test_plan_capable_default_is_native_and_needs_no_checkpointer() -> None:
     model = _FakeModel(responses=[AIMessage(content="done", id="native-result")])
-    definition = TinkerFin().plan(enabled=True).create_deep_agent(model=model, tools=[])
+    definition = (
+        TinkerFin()
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[])
+    )
 
     parts = await _parts(
         definition,
@@ -1371,8 +1404,9 @@ async def test_new_default_run_with_a_saver_does_not_build_the_planning_graph(
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[AIMessage(content="done")]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -1396,11 +1430,9 @@ async def test_plan_run_requires_the_definition_checkpointer_only_when_selected(
 ):
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=_FakeModel(responses=[_planner()]),
-            tools=[],
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=_FakeModel(responses=[_planner()]), tools=[])
     )
     with pytest.raises(PlanModeConfigurationError, match="BaseCheckpointSaver"):
         await _parts(
@@ -1416,12 +1448,9 @@ async def test_plan_run_requires_the_definition_checkpointer_only_when_selected(
 async def test_plan_run_requires_a_planner_or_agent_model() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=None,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=None, tools=[], checkpointer=InMemorySaver())
     )
 
     with pytest.raises(PlanModeConfigurationError, match="model"):
@@ -1444,12 +1473,10 @@ async def test_default_preserves_coordinator_and_composed_state() -> None:
         yield
 
     definition = (
-        TinkerFin(
-            run_coordinator=coordinate,
-            state_schema=_GlobalState,
-        )
-        .plan(enabled=True)
-        .create_deep_agent(
+        TinkerFin(run_coordinator=coordinate, state_schema=_GlobalState)
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[AIMessage(content="done")]),
             tools=[],
             state_schema=_DefinitionState,
@@ -1479,8 +1506,9 @@ async def test_default_todos_use_the_native_root_without_correlation_extensions(
     model = _FakeModel(responses=[_todo_call(), AIMessage(content="done")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[],
             middleware=(TodoListMiddleware(),),
@@ -1515,12 +1543,9 @@ async def test_planner_creates_review_without_a_deep_agent_parent_graph() -> Non
     saver = InMemorySaver()
     definition = (
         TinkerFin()
-        .plan(enabled=True, default_mode="plan")
-        .create_deep_agent(
-            model=_FakeModel(responses=[_planner()]),
-            tools=[],
-            checkpointer=saver,
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True, default_mode="plan")
+        .build(model=_FakeModel(responses=[_planner()]), tools=[], checkpointer=saver)
     )
     parts = await _parts(
         definition,
@@ -1567,7 +1592,8 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
     )
     definition = (
         TinkerFin()
-        .plan(
+        .with_namespace("test")
+        .with_plan(
             enabled=True,
             content_schema=MarkdownPlanContent,
             allowed_review_actions=(
@@ -1577,11 +1603,7 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
                 PlanReviewAction.REJECT,
             ),
         )
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     first = await _parts(
@@ -1653,8 +1675,9 @@ async def test_markdown_plan_review_edit_and_handoff_preserve_exact_text() -> No
 async def test_custom_plan_schema_round_trips_through_review_state() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True, content_schema=_CustomPlanContent)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True, content_schema=_CustomPlanContent)
+        .build(
             model=_FakeModel(responses=[_custom_plan_planner()]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -1685,12 +1708,9 @@ async def test_planner_retries_one_provider_invalid_json_tool_call() -> None:
     model = _FakeModel(responses=[_invalid_planner_json(), _planner()])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     parts = await _parts(
         definition,
@@ -1716,8 +1736,12 @@ async def test_plan_approval_hands_off_to_native_with_the_same_message_id(
     model = _InvocationModel(responses=[_planner(), AIMessage(content="native done")])
     observer = _PlanObserver()
     callbacks = _HostModelCallbacks()
-    factory = TinkerFin().observe(observer) if observed else TinkerFin()
-    definition = factory.plan(enabled=True).create_deep_agent(
+    factory = (
+        TinkerFin().with_namespace("test").with_observer(observer)
+        if observed
+        else TinkerFin().with_namespace("test")
+    )
+    definition = factory.with_plan(enabled=True).build(
         model=model,
         tools=[],
         checkpointer=InMemorySaver(
@@ -1839,14 +1863,12 @@ async def test_runtime_settles_native_work_after_interruption(
     )
     observer = _PlanObserver()
     healthy_observer = _PlanObserver()
-    factory = TinkerFin()
+    factory = TinkerFin().with_namespace("test")
     if observed:
-        factory = factory.observe(observer).observe(healthy_observer)
+        factory = factory.with_observer(observer).with_observer(healthy_observer)
     if planned:
-        factory = factory.plan(enabled=True)
-    definition = factory.create_deep_agent(
-        model=model, tools=[], checkpointer=InMemorySaver()
-    )
+        factory = factory.with_plan(enabled=True)
+    definition = factory.build(model=model, tools=[], checkpointer=InMemorySaver())
     config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
     graph_input: InputAgentState | Command[object] = {
         "messages": [HumanMessage(content="Implement", id="request")]
@@ -1860,12 +1882,12 @@ async def test_runtime_settles_native_work_after_interruption(
             mode="plan",
         )
         graph_input = Command(resume={"type": "approve", "baseRevision": 1})
-    stream = definition.new(identity=_identity("interruption-execution")).astream(
-        graph_input,
+    stream = definition.open_run(
+        thread_id=_identity("interruption-execution").thread_id,
+        run_id=_identity("interruption-execution").run_id,
+        input=graph_input,
         config=config,
         stream_mode=["messages", "tasks", "values"],
-        version="v2",
-        subgraphs=True,
     )
 
     async def consume() -> None:
@@ -1928,8 +1950,12 @@ async def test_plan_handoff_close_between_parts_is_scoped_and_idempotent(
 ) -> None:
     model = _FakeModel(responses=[_planner(), AIMessage(content="native response")])
     observer = _PlanObserver()
-    factory = TinkerFin().observe(observer) if observed else TinkerFin()
-    definition = factory.plan(enabled=True).create_deep_agent(
+    factory = (
+        TinkerFin().with_namespace("test").with_observer(observer)
+        if observed
+        else TinkerFin().with_namespace("test")
+    )
+    definition = factory.with_plan(enabled=True).build(
         model=model, tools=[], checkpointer=InMemorySaver()
     )
     config: RunnableConfig = {"configurable": {"thread_id": "plan-thread"}}
@@ -1940,19 +1966,22 @@ async def test_plan_handoff_close_between_parts_is_scoped_and_idempotent(
         config=config,
         mode="plan",
     )
-    unopened = definition.new(identity=_identity("unopened-execution")).astream(
-        Command(resume={"type": "approve", "baseRevision": 1}), config=config
+    unopened = definition.open_run(
+        thread_id=_identity("unopened-execution").thread_id,
+        run_id=_identity("unopened-execution").run_id,
+        input=Command(resume={"type": "approve", "baseRevision": 1}),
+        config=config,
     )
     await unopened.aclose()
     await unopened.aclose()
     assert len(model.model_inputs) == 1
     assert "unopened-execution" not in observer.sessions
-    stream = definition.new(identity=_identity("closing-execution")).astream(
-        Command(resume={"type": "approve", "baseRevision": 1}),
+    stream = definition.open_run(
+        thread_id=_identity("closing-execution").thread_id,
+        run_id=_identity("closing-execution").run_id,
+        input=Command(resume={"type": "approve", "baseRevision": 1}),
         config=config,
         stream_mode=["messages", "tasks", "values"],
-        version="v2",
-        subgraphs=True,
     )
     try:
         async for part in stream:
@@ -1961,15 +1990,16 @@ async def test_plan_handoff_close_between_parts_is_scoped_and_idempotent(
             unrelated = _FakeModel(responses=[AIMessage(content="ordinary response")])
             ordinary = (
                 TinkerFin()
-                .plan(enabled=True)
-                .create_deep_agent(
-                    model=unrelated, tools=[], checkpointer=InMemorySaver()
-                )
+                .with_namespace("test")
+                .with_plan(enabled=True)
+                .build(model=unrelated, tools=[], checkpointer=InMemorySaver())
             )
-            ordinary_stream = ordinary.new(
-                identity=_identity("unrelated-run", thread_id="unrelated-thread")
-            ).astream(
-                {"messages": [HumanMessage(content="Ordinary", id="unrelated")]},
+            ordinary_stream = ordinary.open_run(
+                thread_id=_identity(
+                    "unrelated-run", thread_id="unrelated-thread"
+                ).thread_id,
+                run_id=_identity("unrelated-run", thread_id="unrelated-thread").run_id,
+                input={"messages": [HumanMessage(content="Ordinary", id="unrelated")]},
                 config={"configurable": {"thread_id": "unrelated-thread"}},
             )
             async for _ordinary_part in ordinary_stream:
@@ -1999,12 +2029,9 @@ async def test_plan_handoff_preserves_user_content_blocks_exactly() -> None:
     model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     content: list[str | dict[Any, Any]] = [
         {"type": "text", "text": "Implement from blocks"},
@@ -2072,8 +2099,12 @@ async def test_real_redis_plan_approval_executes_native_handoff(
             responses=[_planner(), AIMessage(content="native done")]
         )
         observer = _PlanObserver()
-        factory = TinkerFin().observe(observer) if observed else TinkerFin()
-        definition = factory.plan(enabled=True).create_deep_agent(
+        factory = (
+            TinkerFin().with_namespace("test").with_observer(observer)
+            if observed
+            else TinkerFin().with_namespace("test")
+        )
+        definition = factory.with_plan(enabled=True).build(
             model=model, tools=[], checkpointer=saver
         )
         config = {"configurable": {"thread_id": thread_id}}
@@ -2165,12 +2196,9 @@ async def test_duplicate_plan_approval_does_not_execute_native_twice() -> None:
     model = _FakeModel(responses=[_planner(), AIMessage(content="done")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     await _parts(
@@ -2213,12 +2241,9 @@ async def test_plan_handoff_recovers_after_native_checkpoint_precedes_plan_marke
     model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     await _parts(
@@ -2287,12 +2312,9 @@ async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecut
     model = _FakeModel(responses=[_planner(), AIMessage(content="native done")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     review = await _agui_events(
@@ -2314,15 +2336,15 @@ async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecut
     async def checkpointed(value: AgUiResumeCheckpoint) -> None:
         checkpoints.append(value)
 
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
-        mode="default",
-        resume=binding,
-        on_resume_checkpointed=checkpointed,
-    )
+    runtime = cast(Any, definition)
     events = [
         event
-        async for event in runtime.astream(
+        async for event in runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            mode="default",
+            resume=binding,
+            on_resume_saved=checkpointed,
             config=config,
         )
     ]
@@ -2350,15 +2372,15 @@ async def test_agui_plan_resume_checkpoints_durably_and_retries_without_reexecut
         if isinstance(event, StateSnapshotEvent)
     )
 
-    retry = cast(Any, definition).new_agui(
-        identity=identity,
-        mode="default",
-        resume=binding,
-        on_resume_checkpointed=checkpointed,
-    )
+    retry = cast(Any, definition)
     retried = [
         event
-        async for event in retry.astream(
+        async for event in retry.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            mode="default",
+            resume=binding,
+            on_resume_saved=checkpointed,
             config=config,
         )
     ]
@@ -2410,8 +2432,9 @@ async def test_plan_capable_runtime_routes_plan_shaped_generic_resume_to_native(
 
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[AIMessage(content="native done")]),
             tools=[],
             middleware=(_GenericNativeInterrupt(),),
@@ -2436,18 +2459,15 @@ async def test_plan_capable_runtime_routes_plan_shaped_generic_resume_to_native(
     )
     assert translation.kind == "runtime"
     identity = _identity("generic-resume")
-    binding = AgUiResumeBinding.from_agui(
-        entries=(entry,),
-        interrupts=(public_interrupt,),
-    )
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
-        mode="plan",
-        resume=binding,
-    )
+    binding = AgUiResumeRequest(entries=(entry,))
+    runtime = cast(Any, definition)
     resumed = [
         event
-        async for event in runtime.astream(
+        async for event in runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            mode="plan",
+            resume=binding,
             config=config,
         )
     ]
@@ -2468,12 +2488,9 @@ async def test_parent_run_id_branches_from_completed_plan_lineage() -> None:
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     review = await _agui_events(
@@ -2531,12 +2548,9 @@ async def test_native_conversation_continues_after_plan_handoff() -> None:
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     await _parts(
@@ -2586,13 +2600,15 @@ async def test_concurrent_plan_handoffs_isolate_transient_system_context(
             AIMessage(content="beta done"),
         ]
     )
-    factory = TinkerFin().observe(_PlanObserver()) if managed else TinkerFin()
-    definition = factory.plan(enabled=True).create_deep_agent(
-        model=model,
-        tools=[],
-        checkpointer=InMemorySaver(),
+    factory = (
+        TinkerFin().with_namespace("test").with_observer(_PlanObserver())
+        if managed
+        else TinkerFin().with_namespace("test")
     )
-    graph = None if managed else await definition.create_graph(mode="plan")
+    definition = factory.with_plan(enabled=True).build(
+        model=model, tools=[], checkpointer=InMemorySaver()
+    )
+    graph = None if managed else await create_graph(definition, mode="plan")
 
     async def collect(
         graph_input: InputAgentState | Command[object] | None,
@@ -2600,23 +2616,17 @@ async def test_concurrent_plan_handoffs_isolate_transient_system_context(
         thread_id: str,
     ) -> list[Mapping[str, object]]:
         if managed:
-            stream = definition.new(
-                identity=_identity(uuid4().hex, thread_id=thread_id),
-                mode="plan",
-            ).astream
+            source = definition.open_run(
+                thread_id=thread_id, run_id=uuid4().hex, mode="plan", input=graph_input
+            )
         else:
             assert graph is not None
-            stream = graph.astream
-        return [
-            part
-            async for part in stream(
+            source = graph.astream(
                 graph_input,
                 config={"configurable": {"thread_id": thread_id}},
                 stream_mode=["messages", "tasks", "values"],
-                version="v2",
-                subgraphs=True,
             )
-        ]
+        return [part async for part in source]
 
     await collect(
         {"messages": [HumanMessage(content="Alpha request", id="alpha-user")]},
@@ -2682,8 +2692,9 @@ async def test_plan_default_plan_with_todos_regresses_historical_correlation_fai
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[],
             middleware=(TodoListMiddleware(),),
@@ -2748,12 +2759,9 @@ async def test_multiple_clarification_rounds_do_not_increment_revision() -> None
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     first = await _parts(
@@ -2824,12 +2832,9 @@ async def test_agui_clarification_resume_uses_the_exact_planning_snapshot() -> N
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     first = await _agui_events(
@@ -2867,19 +2872,14 @@ async def test_agui_clarification_resume_uses_the_exact_planning_snapshot() -> N
 
 
 @pytest.mark.asyncio
-async def test_completed_resume_uses_the_exact_planning_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_completed_resume_uses_the_exact_planning_snapshot() -> None:
+    model = _FakeModel(responses=[_planner(), AIMessage(content="Draft rejected")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=_FakeModel(
-                responses=[
-                    _planner(),
-                    AIMessage(content="The rejected draft will not be executed."),
-                ]
-            ),
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
+            model=model,
             tools=[],
             checkpointer=InMemorySaver(),
         )
@@ -2906,40 +2906,21 @@ async def test_completed_resume_uses_the_exact_planning_snapshot(
     )
     _assert_success(resolved)
 
-    async def stale_checkpoint_state(
-        _checkpointer: object,
-        _config: RunnableConfig,
-    ) -> dict[str, object]:
-        return plan_state_update(PlanState[StructuredPlanContent]())
-
-    monkeypatch.setattr(
-        plan_runtime_module,
-        "_plan_checkpoint_channels",
-        stale_checkpoint_state,
+    calls = len(model.model_inputs)
+    replayed = await _agui_events(
+        definition,
+        None,
+        run_id="agui-reject-2",
+        config=config,
+        mode="default",
+        resume=binding,
     )
-
-    graph = await definition.create_graph(mode="plan")
-    replayed = [
-        part
-        async for part in graph.astream(
-            Command(resume={"type": "reject", "baseRevision": 1}),
-            config={
-                "configurable": {
-                    "thread_id": "plan-thread",
-                    RUN_ID_METADATA_KEY: "agui-reject-3",
-                    RUNTIME_PROFILE_METADATA_KEY: "deepagents-v2",
-                }
-            },
-            stream_mode=["messages", "tasks", "values"],
-            version="v2",
-            subgraphs=True,
-        )
-    ]
-
-    assert (
-        _structured_plan_state(_root_values(replayed)[-1]["tinkerfin_plan"]).status
-        is PlanStatus.AWAITING_INPUT
-    )
+    _assert_success(replayed)
+    snapshots = [event for event in replayed if isinstance(event, StateSnapshotEvent)]
+    assert snapshots
+    restored = _structured_plan_state(snapshots[-1].snapshot["tinkerfin_plan"])
+    assert restored.status is PlanStatus.AWAITING_INPUT
+    assert len(model.model_inputs) == calls
 
 
 @pytest.mark.asyncio
@@ -2947,8 +2928,9 @@ async def test_four_question_clarification_round_trips_in_one_batch() -> None:
     model = _FakeModel(responses=[_planner_clarification_batch(), _planner()])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[],
             checkpointer=InMemorySaver(serde=JsonPlusSerializer(pickle_fallback=False)),
@@ -3042,8 +3024,9 @@ async def test_four_question_clarification_round_trips_in_one_batch() -> None:
 async def test_agui_preserves_every_question_in_a_large_clarification_form() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[_planner_clarification_batch()]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -3105,12 +3088,9 @@ async def test_all_optional_clarification_questions_can_be_explicitly_skipped() 
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
 
@@ -3165,8 +3145,9 @@ async def test_all_optional_clarification_questions_can_be_explicitly_skipped() 
 async def test_required_clarification_question_cannot_be_skipped() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(
                 responses=[_planner_clarification(required=True), _planner()]
             ),
@@ -3230,11 +3211,9 @@ async def test_custom_clarification_preserves_attributes_and_trusted_option_labe
     model = _FakeModel(responses=[_custom_planner_clarification(), _planner()])
     definition = (
         TinkerFin()
-        .plan(
-            enabled=True,
-            clarification_schema=_CustomForm,
-        )
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True, clarification_schema=_CustomForm)
+        .build(
             model=model,
             tools=[],
             checkpointer=InMemorySaver(serde=JsonPlusSerializer(pickle_fallback=False)),
@@ -3284,13 +3263,13 @@ async def test_custom_clarification_preserves_attributes_and_trusted_option_labe
 async def test_clarification_rejects_incomplete_and_unknown_answers() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(
                 responses=[
                     _planner_clarification(
-                        question_id="target",
-                        options=[{"id": "a", "label": "A"}],
+                        question_id="target", options=[{"id": "a", "label": "A"}]
                     ),
                     _planner(),
                 ]
@@ -3357,11 +3336,9 @@ async def test_clarification_rejects_incomplete_and_unknown_answers() -> None:
 async def test_clarification_fails_before_checkpoint_for_non_json_attributes() -> None:
     definition = (
         TinkerFin()
-        .plan(
-            enabled=True,
-            clarification_schema=_OpaqueForm,
-        )
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True, clarification_schema=_OpaqueForm)
+        .build(
             model=_FakeModel(responses=[_opaque_planner_clarification()]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -3383,8 +3360,9 @@ async def test_pending_clarification_rejects_schema_drift() -> None:
     config = {"configurable": {"thread_id": "plan-thread"}}
     original = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[_planner_clarification()]),
             tools=[],
             checkpointer=saver,
@@ -3399,11 +3377,9 @@ async def test_pending_clarification_rejects_schema_drift() -> None:
     )
     changed = (
         TinkerFin()
-        .plan(
-            enabled=True,
-            clarification_schema=_CustomForm,
-        )
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True, clarification_schema=_CustomForm)
+        .build(
             model=_FakeModel(responses=[AIMessage(content="unused")]),
             tools=[],
             checkpointer=saver,
@@ -3435,18 +3411,12 @@ async def test_edit_is_authoritative_and_reenters_sufficiency_checks() -> None:
     model = _FakeModel(responses=[_planner(), _planner_clarification(), _accept_edit()])
     definition = (
         TinkerFin()
-        .plan(
+        .with_namespace("test")
+        .with_plan(
             enabled=True,
-            allowed_review_actions=(
-                PlanReviewAction.EDIT,
-                PlanReviewAction.RESPOND,
-            ),
+            allowed_review_actions=(PlanReviewAction.EDIT, PlanReviewAction.RESPOND),
         )
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     await _parts(
@@ -3517,12 +3487,9 @@ async def test_natural_language_feedback_creates_one_revised_draft() -> None:
     model = _FakeModel(responses=[_planner(), _planner(suffix=" revised")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     await _parts(
@@ -3556,8 +3523,9 @@ async def test_review_rejects_stale_revision_and_reject_waits_for_plan_input() -
     config = {"configurable": {"thread_id": "plan-thread"}}
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[_planner()]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -3581,8 +3549,9 @@ async def test_review_rejects_stale_revision_and_reject_waits_for_plan_input() -
 
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(
                 responses=[
                     _planner(),
@@ -3653,7 +3622,8 @@ async def test_review_cancel_keeps_plan_mode_and_replies_once() -> None:
     )
     definition = (
         TinkerFin()
-        .plan(
+        .with_namespace("test")
+        .with_plan(
             enabled=True,
             allowed_review_actions=(
                 PlanReviewAction.APPROVE,
@@ -3661,11 +3631,7 @@ async def test_review_cancel_keeps_plan_mode_and_replies_once() -> None:
                 PlanReviewAction.CANCEL,
             ),
         )
-        .create_deep_agent(
-            model=model,
-            tools=[],
-            checkpointer=InMemorySaver(),
-        )
+        .build(model=model, tools=[], checkpointer=InMemorySaver())
     )
     config = {"configurable": {"thread_id": "plan-thread"}}
     review = await _parts(
@@ -3715,7 +3681,8 @@ async def test_agui_plan_cancel_resolves_the_card_and_streams_one_reply() -> Non
     reply = "The draft is cancelled, and Planning remains active."
     definition = (
         TinkerFin()
-        .plan(
+        .with_namespace("test")
+        .with_plan(
             enabled=True,
             allowed_review_actions=(
                 PlanReviewAction.APPROVE,
@@ -3723,7 +3690,7 @@ async def test_agui_plan_cancel_resolves_the_card_and_streams_one_reply() -> Non
                 PlanReviewAction.CANCEL,
             ),
         )
-        .create_deep_agent(
+        .build(
             model=_FakeModel(responses=[_planner(), AIMessage(content=reply)]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -3784,8 +3751,9 @@ async def test_agui_plan_cancel_resolves_the_card_and_streams_one_reply() -> Non
 async def test_plan_rejects_non_sync_durability() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[_planner()]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -3832,8 +3800,12 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default(
         ]
     )
     observer = _PlanObserver()
-    factory = TinkerFin().observe(observer) if observed else TinkerFin()
-    definition = factory.plan(enabled=True).create_deep_agent(
+    factory = (
+        TinkerFin().with_namespace("test").with_observer(observer)
+        if observed
+        else TinkerFin().with_namespace("test")
+    )
+    definition = factory.with_plan(enabled=True).build(
         model=model,
         tools=[approved_tool],
         interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
@@ -3867,9 +3839,8 @@ async def test_plan_handoff_tool_interrupt_resumes_as_native_default(
     assert tool_interrupt.tool_call_id is not None
     kind, namespace, raw_id = ScopedIdCodec().decode(tool_interrupt.tool_call_id)
     assert (kind, namespace, raw_id) == ("tool", (), "approved-call")
-    resume_binding = AgUiResumeBinding.from_agui(
-        entries=(_resume_entry(tool_interrupt.id, {"type": "approve"}),),
-        interrupts=tool_outcome.interrupts,
+    resume_binding = AgUiResumeRequest(
+        entries=(_resume_entry(tool_interrupt.id, {"type": "approve"}),)
     )
     completed = await _agui_events(
         definition,
@@ -3966,8 +3937,9 @@ async def test_plan_enabled_default_subagent_resume_uses_only_the_native_head(
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[approved_tool],
             interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
@@ -3992,12 +3964,7 @@ async def test_plan_enabled_default_subagent_resume_uses_only_the_native_head(
     request = AgUiResumeRequest(
         entries=(_resume_entry(interrupt.id, {"type": "approve"}),),
     )
-    binding = await definition.prepare_agui_resume(
-        identity=RunIdentity(threadId=thread_id, runId="subagent-resume"),
-        request=request,
-        mode="default",
-    )
-    assert binding.prior_tool_call_ids == (interrupt.tool_call_id,)
+    binding = request
 
     caplog.clear()
     caplog.set_level(logging.WARNING, logger="langgraph")
@@ -4070,11 +4037,15 @@ async def test_real_redis_public_subagent_resume_recovers_dynamic_messages(
                 AIMessage(content="root done"),
             ]
         )
-        definition = TinkerFin().create_deep_agent(
-            model=model,
-            tools=[approved_tool],
-            interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
-            checkpointer=saver,
+        definition = (
+            TinkerFin()
+            .with_namespace("test")
+            .build(
+                model=model,
+                tools=[approved_tool],
+                interrupt_on={"approved_tool": {"allowed_decisions": ["approve"]}},
+                checkpointer=saver,
+            )
         )
         config = {"configurable": {"thread_id": thread_id}}
         review = await _agui_events(
@@ -4090,15 +4061,8 @@ async def test_real_redis_public_subagent_resume_recovers_dynamic_messages(
         request = AgUiResumeRequest(
             entries=(_resume_entry(interrupt.id, {"type": "approve"}),),
         )
-        binding = await definition.prepare_agui_resume(
-            identity=RunIdentity(
-                threadId=thread_id,
-                runId="redis-subagent-resume",
-            ),
-            request=request,
-        )
+        binding = request
 
-        assert binding.prior_tool_call_ids == (interrupt.tool_call_id,)
         completed = await _agui_events(
             definition,
             None,
@@ -4140,8 +4104,9 @@ async def test_real_redis_public_subagent_resume_recovers_dynamic_messages(
 async def test_agui_interrupt_snapshots_precede_the_terminal() -> None:
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_FakeModel(responses=[_planner()]),
             tools=[],
             checkpointer=InMemorySaver(),
@@ -4185,15 +4150,21 @@ async def test_read_only_planner_inherits_store_and_has_no_write_tools() -> None
         ]
     )
     store = InMemoryStore()
-    store.put(
+    await store.aput(
         ("planner-files",),
+        "/context.txt",
+        dict(create_file_data("unscoped data must not be visible")),
+    )
+    await store.aput(
+        ("dGVzdA", "planner-files"),
         "/context.txt",
         dict(create_file_data("planning context")),
     )
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[],
             backend=StoreBackend(namespace=lambda _runtime: ("planner-files",)),
@@ -4247,11 +4218,10 @@ async def test_read_only_planner_has_a_bounded_model_call_budget() -> None:
     ]
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
-            model=_FakeModel(responses=repeated),
-            tools=[],
-            checkpointer=InMemorySaver(),
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
+            model=_FakeModel(responses=repeated), tools=[], checkpointer=InMemorySaver()
         )
     )
     with pytest.raises(ModelCallLimitExceededError, match=r"run limit \(6/6\)"):
@@ -4269,8 +4239,9 @@ async def test_planner_and_native_preserve_runtime_context() -> None:
     model = _ContextAwareModel(responses=[_planner(), AIMessage(content="done")])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[],
             context_schema=_RuntimeContext,
@@ -4316,8 +4287,9 @@ async def test_planner_receives_only_explicit_read_only_host_tools() -> None:
     model = _FakeModel(responses=[_planner()])
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[inspect_report, publish_report],
             checkpointer=InMemorySaver(),
@@ -4368,11 +4340,10 @@ async def test_attachment_capabilities_follow_planner_and_review_model(planner_i
 
     definition = (
         TinkerFin()
-        .attachments(AttachmentSupport(read_image=read_image))
-        .plan(
-            planner_model=planner,
-        )
-        .create_deep_agent(model=root, checkpointer=InMemorySaver())
+        .with_namespace("test")
+        .with_attachments(AttachmentSupport(read_image=read_image))
+        .with_plan(planner_model=planner)
+        .build(model=root, checkpointer=InMemorySaver())
     )
     message = HumanMessage(
         content=[attachment.content_block()], id="attachment-message"
@@ -4461,13 +4432,14 @@ async def test_root_and_subagents_resolve_tool_images_with_host_capabilities(
     )
     definition = (
         TinkerFin()
-        .attachments(
+        .with_namespace("test")
+        .with_attachments(
             AttachmentSupport(
                 read_image=read_image,
                 supports_images=lambda candidate: candidate is model,
             )
         )
-        .create_deep_agent(
+        .build(
             model=model,
             tools=[picture],
             subagents=[]
@@ -4483,7 +4455,7 @@ async def test_root_and_subagents_resolve_tool_images_with_host_capabilities(
         )
     )
     message = HumanMessage(content=[attachment.content_block()], id="root-image")
-    graph = await definition.create_graph()
+    graph = await create_graph(definition)
     result = await graph.ainvoke(
         {"messages": [message]},
         config={
@@ -4541,16 +4513,16 @@ async def test_attachment_projection_preserves_filesystem_eviction_and_custom_ho
     async def read_image(item):
         return AttachmentImage(data=b"test", mime_type="image/png")
 
-    graph = (
-        await TinkerFin()
-        .attachments(AttachmentSupport(read_image=read_image))
-        .create_deep_agent(
+    graph = await create_graph(
+        TinkerFin()
+        .with_namespace("test")
+        .with_attachments(AttachmentSupport(read_image=read_image))
+        .build(
             model=model,
             backend=backend,
             middleware=[filesystem],
             checkpointer=InMemorySaver(),
         )
-        .create_graph()
     )
     original = HumanMessage(
         content=[
@@ -4630,11 +4602,11 @@ async def test_attachment_support_preserves_native_general_purpose_profile(
     async def read_image(item):
         pytest.fail("text-only run must not resolve attachments")
 
-    graph = (
-        await TinkerFin()
-        .attachments(AttachmentSupport(read_image=read_image))
-        .create_deep_agent(model=model)
-        .create_graph()
+    graph = await create_graph(
+        TinkerFin()
+        .with_namespace("test")
+        .with_attachments(AttachmentSupport(read_image=read_image))
+        .build(model=model)
     )
     await graph.ainvoke({"messages": [HumanMessage(content="hello")]})
     assert ("task" in model.bound_tool_names[0]) == enabled
@@ -4717,11 +4689,11 @@ async def test_attachment_capability_uses_final_model_after_profile_routing(
         """Return a chart reference."""
         return [attachment.content_block()]
 
-    graph = (
-        await TinkerFin()
-        .attachments(AttachmentSupport(read_image=read_image))
-        .create_deep_agent(model=initial, tools=[picture])
-        .create_graph()
+    graph = await create_graph(
+        TinkerFin()
+        .with_namespace("test")
+        .with_attachments(AttachmentSupport(read_image=read_image))
+        .build(model=initial, tools=[picture])
     )
     result = await graph.ainvoke(
         {"messages": [HumanMessage(content=[attachment.content_block()])]}
@@ -4774,14 +4746,14 @@ async def test_attachment_support_rejects_instrumented_factory_without_side_effe
         pytest.fail("rejected build must not read images")
 
     model = _FakeModel(responses=[AIMessage(content="done")])
-    await TinkerFin().create_deep_agent(model=model).create_graph()
+    await create_graph(TinkerFin().with_namespace("test").build(model=model))
     assert calls == ["build"]
     with pytest.raises(TinkerFinLifecycleError, match="unmodified native"):
-        await (
+        await create_graph(
             TinkerFin()
-            .attachments(AttachmentSupport(read_image=read_image))
-            .create_deep_agent(model=model)
-            .create_graph()
+            .with_namespace("test")
+            .with_attachments(AttachmentSupport(read_image=read_image))
+            .build(model=model)
         )
     assert calls == ["build"]
     assert native_graph.create_deep_agent is instrumented
@@ -4813,16 +4785,16 @@ async def test_native_summarization_history_preserves_attachment_discovery():
     async def read_image(item):
         pytest.fail("compacted image must remain a reference")
 
-    graph = (
-        await TinkerFin()
-        .attachments(AttachmentSupport(read_image=read_image))
-        .create_deep_agent(
+    graph = await create_graph(
+        TinkerFin()
+        .with_namespace("test")
+        .with_attachments(AttachmentSupport(read_image=read_image))
+        .build(
             model=model,
             backend=backend,
             middleware=[summary],
             checkpointer=InMemorySaver(),
         )
-        .create_graph()
     )
     original = HumanMessage(content=[attachment.content_block()], id="old-image")
     result = await graph.ainvoke(
@@ -4861,11 +4833,11 @@ async def test_automatic_attachments_do_not_construct_extra_model_clients(monkey
     async def read_image(item):
         pytest.fail("text run must not resolve images")
 
-    graph = (
-        await TinkerFin()
-        .attachments(AttachmentSupport(read_image=read_image))
-        .create_deep_agent(model="test:attachment-model")
-        .create_graph()
+    graph = await create_graph(
+        TinkerFin()
+        .with_namespace("test")
+        .with_attachments(AttachmentSupport(read_image=read_image))
+        .build(model="test:attachment-model")
     )
     await graph.ainvoke({"messages": [HumanMessage(content="hello")]})
     assert resolutions == ["test:attachment-model"]

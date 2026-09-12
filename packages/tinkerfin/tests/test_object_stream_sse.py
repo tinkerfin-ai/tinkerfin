@@ -9,11 +9,11 @@ from langchain.agents.middleware.types import InputAgentState
 from langchain_core.messages import AIMessageChunk
 from langgraph.graph.state import CompiledStateGraph
 
-from tinkerfin import DeepAgentDefinition, RunIdentity
+from tinkerfin import AgentRuntime, RunIdentity
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 def _graph_input() -> InputAgentState:
@@ -41,7 +41,7 @@ setattr(
 
 @pytest.mark.asyncio
 async def test_native_object_stream_encodes_the_current_sse_contract(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         yield {
@@ -53,11 +53,14 @@ async def test_native_object_stream_encodes_the_current_sse_contract(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse()
     )
-    frames = [frame async for frame in body]
+    frames = [frame.decode("utf-8") async for frame in body]
 
     assert len(frames) == 1
     assert frames[0].startswith("event: stream-part\n")
@@ -89,7 +92,7 @@ async def test_native_object_stream_encodes_the_current_sse_contract(
 @pytest.mark.asyncio
 async def test_native_object_stream_encodes_every_canonical_mode(
     mode: str,
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     payloads: dict[str, object] = {
         "messages": (
@@ -114,11 +117,14 @@ async def test_native_object_stream_encodes_every_canonical_mode(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse()
     )
-    frames = [frame async for frame in body]
+    frames = [frame.decode("utf-8") async for frame in body]
 
     assert len(frames) == 1
     payload = json.loads(frames[0].split("data: ", maxsplit=1)[1])
@@ -130,7 +136,7 @@ async def test_native_object_stream_encodes_every_canonical_mode(
 
 @pytest.mark.asyncio
 async def test_agui_object_stream_encodes_protocol_json_without_event_name(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         if False:  # pragma: no cover - produces only lifecycle events
@@ -138,11 +144,14 @@ async def test_agui_object_stream_encodes_protocol_json_without_event_name(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new_agui(identity=_identity())
-        .astream(_graph_input())
+        .open_agui_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse()
     )
-    frames = [frame async for frame in body]
+    frames = [frame.decode("utf-8") async for frame in body]
 
     assert [json.loads(frame.removeprefix("data: "))["type"] for frame in frames] == [
         "RUN_STARTED",
@@ -153,7 +162,7 @@ async def test_agui_object_stream_encodes_protocol_json_without_event_name(
 
 @pytest.mark.asyncio
 async def test_sse_prepare_runs_preflight_without_opening_the_source(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     factory_calls = 0
     preflights = 0
@@ -170,8 +179,11 @@ async def test_sse_prepare_runs_preflight_without_opening_the_source(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse()
     )
 
@@ -179,5 +191,5 @@ async def test_sse_prepare_runs_preflight_without_opening_the_source(
 
     assert preflights == 1
     assert factory_calls == 0
-    assert [frame async for frame in body] == []
+    assert [frame.decode("utf-8") async for frame in body] == []
     assert factory_calls == 1

@@ -6,6 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "deepagents==0.7.5",
@@ -14,23 +23,20 @@ dependencies = [
     "langchain-core==1.5.3",
     "opensandbox==0.1.16",
     "pydantic>=2,<3",
+    "tinkerfin-contracts==0.1.0",
     "typing-extensions>=4.12.2,<5",
 ]
 
 [project.optional-dependencies]
-sqlite = [
-    "aiosqlite>=0.22,<0.23",
+sqlalchemy = [
     "sqlalchemy[asyncio]==2.0.52",
-]
-mysql = [
-    "asyncmy==0.2.14",
-    "sqlalchemy[asyncio]==2.0.52",
+    "tinkerfin-sqlalchemy==0.1.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
-Repository = "https://github.com/tinkerfin-ai/tinkerfin"
-Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin-harness/issues"
 
 [build-system]
 requires = ["setuptools>=77"]

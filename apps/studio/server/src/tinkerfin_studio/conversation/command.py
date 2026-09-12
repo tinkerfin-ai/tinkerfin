@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tinkerfin import RunIdentity
+from tinkerfin.checkpoints import delete_thread
 from tinkerfin_messaging.errors import (
     MessagingError,
     RunNotFound,
@@ -63,7 +64,9 @@ class ConversationCommandService:
         if thread.last_run_id is None:
             raise SystemException(ConversationErrorCode.TRACE_UNAVAILABLE)
         thread_pk = thread.id
-        identity = conversation_identity(thread.thread_id, thread.last_run_id)
+        identity = conversation_identity(
+            thread.thread_id, thread.last_run_id, user_id=self._user_id
+        )
         retrying = thread.status == "deleting"
         await self._repository.commit()
         previous_status = await self._mark_deleting(thread_pk)
@@ -73,7 +76,7 @@ class ConversationCommandService:
             trace = None
             try:
                 trace = await self._resources.tracer.get(
-                    identity.thread_id,
+                    identity.thread,
                     head_run_id=identity.run_id,
                 )
             except TraceThreadNotFound:
@@ -82,8 +85,8 @@ class ConversationCommandService:
             if trace is not None:
                 await trace.delete()
             destruction_started = True
-            await self._resources.agent_persistence.checkpointer.adelete_thread(
-                identity.thread_id
+            await delete_thread(
+                self._resources.agent_persistence.checkpointer, thread=identity.thread
             )
             await self._resources.conversation_channel.delete_stream(identity=identity)
             locked = await self._repository.lock_thread(thread_pk)

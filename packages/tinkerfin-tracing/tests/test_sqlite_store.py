@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import sqlite3
-import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event as ThreadEvent
@@ -21,7 +19,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import AdaptedConnection
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
-from sqlalchemy.sql import Executable
+from tests.support.sql_faults import after_sql_command, after_sql_commit
 
 from tinkerfin_contracts import (
     RunClosedObservation,
@@ -71,7 +69,6 @@ from tinkerfin_tracing.limits import TraceLimits
 from tinkerfin_tracing.sql_schema import TRACE_TABLE_NAMES
 from tinkerfin_tracing.sql_store import (
     SqlAlchemyTraceStore,
-    _complete_connection_cleanup,
     _SqlAlchemyTraceLedgerBackend,
 )
 from tinkerfin_tracing.store import TraceProjectionCheckpoint
@@ -166,7 +163,7 @@ class _EncryptedTraceCodec(CanonicalTracePayloadCodec):
 
 
 def _identity(run_id: str = "run-sql") -> RunIdentity:
-    return RunIdentity(threadId="thread-sql", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-sql", run_id=run_id)
 
 
 def _captured(value: JsonValue) -> CapturedValue:
@@ -251,7 +248,7 @@ async def test_sql_batch_admission_estimates_before_store_encoding(
 
     monkeypatch.setattr(CanonicalTracePayloadCodec, "encode_fact", count_encoding)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'encoding.db'}")
-    store = SqlAlchemyTraceStore(engine, namespace="encoding-test")
+    store = SqlAlchemyTraceStore(engine)
     try:
         writer = TraceBatchWriter(
             await store.open_writer(_identity()),
@@ -276,7 +273,6 @@ async def test_sql_batch_commits_through_the_store_codec(tmp_path: Path) -> None
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'batch-codec.db'}")
     store = SqlAlchemyTraceStore(
         engine,
-        namespace="batch-codec",
         codec=_EncryptedTraceCodec(),
     )
     writer = TraceBatchWriter(
@@ -288,7 +284,7 @@ async def test_sql_batch_commits_through_the_store_codec(tmp_path: Path) -> None
         facts = (_fact("started"), _fact("input"))
         await writer.submit(facts, mandatory=False)
         await writer.force()
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         events = await store.read_events(
             snapshot.key,
             after_seq=0,
@@ -317,12 +313,10 @@ async def test_sql_batch_commits_through_the_store_codec(tmp_path: Path) -> None
 
 
 async def test_tracer_uses_the_protected_codec_for_capture_search_and_rebuild(
-    tmp_path: Path,
+    trace_sql_engine: AsyncEngine,
 ) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'tracer-codec.db'}")
-    store = SqlAlchemyTraceStore(
-        engine, namespace="tracer-codec", codec=_EncryptedTraceCodec()
-    )
+    engine = trace_sql_engine
+    store = SqlAlchemyTraceStore(engine, codec=_EncryptedTraceCodec())
     tracer = Tracer(store=store)
     marker = "protected-task-marker"
     source = RunSourceContext(
@@ -363,17 +357,15 @@ async def test_tracer_uses_the_protected_codec_for_capture_search_and_rebuild(
         )
         await session.aclose()
         page = await tracer.query(
-            source.identity.thread_id, where=TraceGraphFilter(search=marker)
+            source.identity.thread, where=TraceGraphFilter(search=marker)
         )
         assert [node.content for node in page.nodes] == [marker]
-        assert await tracer.rebuild_graph(source.identity.thread_id) == 1
+        assert await tracer.rebuild_graph(source.identity.thread) == 1
         rebuilt = await tracer.query(
-            source.identity.thread_id, where=TraceGraphFilter(search=marker)
+            source.identity.thread, where=TraceGraphFilter(search=marker)
         )
         assert rebuilt.nodes == page.nodes
-        assert (await tracer.get(source.identity.thread_id)).messages[
-            0
-        ].content == marker
+        assert (await tracer.get(source.identity.thread)).messages[0].content == marker
         async with engine.connect() as connection:
             payloads = (
                 (
@@ -399,7 +391,7 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'graph.db'}")
-    store = SqlAlchemyTraceStore(engine, namespace="graph-query")
+    store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity())
     marker = "unique-final-request-marker"
     now = datetime.now(UTC)
@@ -444,7 +436,7 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
             (_fact("terminal"), _fact("closed")),
             mandatory=True,
         )
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         page = await store.query_trace_graph(
             snapshot.key,
             run_ids=(_identity().run_id,),
@@ -452,7 +444,7 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
             limit=10,
         )
 
-        graph = await Tracer(store=store).query(_identity().thread_id)
+        graph = await Tracer(store=store).query(_identity().thread)
         assert graph.completeness.call_tracking_missing is False
         assert len(page.nodes) == 1
         node = project_trace_graph_node(
@@ -523,13 +515,11 @@ async def test_sqlite_graph_index_filters_without_repeating_fact_payloads(
         await engine.dispose()
 
 
-async def test_sqlite_graph_query_merges_only_selected_run_revisions(
-    tmp_path: Path,
+async def test_sql_graph_query_merges_only_selected_run_revisions(
+    trace_sql_engine: AsyncEngine,
 ) -> None:
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{tmp_path / 'graph-branches.db'}"
-    )
-    store = SqlAlchemyTraceStore(engine, namespace="graph-branches")
+    engine = trace_sql_engine
+    store = SqlAlchemyTraceStore(engine)
     root = await store.open_writer(_identity("graph-root"))
     branch_a = await store.open_writer(_identity("graph-branch-a"))
     branch_b = await store.open_writer(_identity("graph-branch-b"))
@@ -587,7 +577,7 @@ async def test_sqlite_graph_query_merges_only_selected_run_revisions(
                 ),
             )
         )
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         only_root = await store.query_trace_graph(
             snapshot.key,
             run_ids=("graph-root",),
@@ -626,14 +616,12 @@ async def test_sqlite_graph_query_merges_only_selected_run_revisions(
         await engine.dispose()
 
 
-async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
-    tmp_path: Path,
+async def test_sql_graph_query_keeps_latest_non_null_lineage_values(
+    trace_sql_engine: AsyncEngine,
 ) -> None:
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{tmp_path / 'graph-lineage-values.db'}"
-    )
-    memory = InMemoryTraceStore(namespace="graph-lineage-values")
-    sql = SqlAlchemyTraceStore(engine, namespace="graph-lineage-values")
+    engine = trace_sql_engine
+    memory = InMemoryTraceStore()
+    sql = SqlAlchemyTraceStore(engine)
     stores = (memory, sql)
     origin_started_at = datetime(2026, 1, 1, 0, 0, 10, tzinfo=UTC)
     later_revision_at = origin_started_at + timedelta(seconds=5)
@@ -649,7 +637,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                     SubagentFact(
                         source_observation_id="graph-parent-subagent",
                         identity=_identity("graph-parent"),
-                        namespace=subagent_namespace,
+                        graph_namespace=subagent_namespace,
                         occurred_at=origin_started_at,
                         monotonic_ns=2,
                         phase="started",
@@ -667,7 +655,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                     SubagentFact(
                         source_observation_id="graph-child-subagent",
                         identity=_identity("graph-child"),
-                        namespace=subagent_namespace,
+                        graph_namespace=subagent_namespace,
                         occurred_at=later_revision_at,
                         monotonic_ns=3,
                         phase="completed",
@@ -682,7 +670,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
 
         observed = []
         for store in stores:
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             page = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=("graph-parent", "graph-child"),
@@ -705,7 +693,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
         assert observed[0][3:] == (TraceGraphNodeStatus.SUCCEEDED, "graph-child")
 
         for store in stores:
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             exact_unicode = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=("graph-parent", "graph-child"),
@@ -776,7 +764,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                     SubagentFact(
                         source_observation_id="graph-conflicting-subagent",
                         identity=_identity("graph-conflict"),
-                        namespace=subagent_namespace,
+                        graph_namespace=subagent_namespace,
                         occurred_at=later_revision_at + timedelta(seconds=1),
                         monotonic_ns=4,
                         phase="completed",
@@ -787,7 +775,7 @@ async def test_sqlite_graph_query_keeps_latest_non_null_lineage_values(
                 )
             )
             await conflicting.aclose()
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             page = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=("graph-parent", "graph-child", "graph-conflict"),
@@ -806,8 +794,8 @@ async def test_graph_store_accepts_64_subagent_levels_and_rejects_level_65(
         f"sqlite+aiosqlite:///{tmp_path / 'graph-scope-depth.db'}"
     )
     stores = (
-        InMemoryTraceStore(namespace="graph-scope-depth-memory"),
-        SqlAlchemyTraceStore(engine, namespace="graph-scope-depth-sql"),
+        InMemoryTraceStore(),
+        SqlAlchemyTraceStore(engine),
     )
     run_id = "graph-scope-depth"
     namespaces = tuple(
@@ -823,7 +811,7 @@ async def test_graph_store_accepts_64_subagent_levels_and_rejects_level_65(
                         SubagentFact(
                             source_observation_id=f"subagent-depth-{depth}",
                             identity=_identity(run_id),
-                            namespace=namespace,
+                            graph_namespace=namespace,
                             occurred_at=datetime(2026, 1, 1, tzinfo=UTC)
                             + timedelta(milliseconds=depth),
                             monotonic_ns=depth + 1,
@@ -845,13 +833,13 @@ async def test_graph_store_accepts_64_subagent_levels_and_rejects_level_65(
             await writer.aclose()
 
         for store in stores:
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             legal = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=(run_id,),
                 where=TraceGraphFilter(
                     kinds={TraceGraphNodeKind.SUBAGENT},
-                    namespaces={namespaces[63]},
+                    graph_namespaces={namespaces[63]},
                 ),
                 limit=1,
                 max_nodes=65,
@@ -880,7 +868,7 @@ async def test_sql_append_reuses_locked_state_and_one_graph_prefetch(
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'graph-prefetch.db'}"
     )
-    store = SqlAlchemyTraceStore(engine, namespace="graph-prefetch")
+    store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity("graph-prefetch"))
     identity = _identity("graph-prefetch")
     now = datetime.now(UTC)
@@ -965,12 +953,12 @@ async def test_sqlite_graph_lineage_limit_stays_below_the_bind_boundary(
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'graph-lineage-limit.db'}"
     )
-    store = SqlAlchemyTraceStore(engine, namespace="graph-lineage-limit")
+    store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity("lineage-00000"))
     try:
         await writer.append((_fact("started", run_id="lineage-00000"),))
         await writer.aclose()
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         run_ids = tuple(f"lineage-{index:05d}" for index in range(10_000))
 
         page = await store.query_trace_graph(
@@ -1003,8 +991,8 @@ async def test_tool_lineage_uses_execution_time_and_clears_stale_completion(
         f"sqlite+aiosqlite:///{tmp_path / 'tool-lineage-time.db'}"
     )
     stores = (
-        InMemoryTraceStore(namespace="tool-lineage-time-memory"),
-        SqlAlchemyTraceStore(engine, namespace="tool-lineage-time-sql"),
+        InMemoryTraceStore(),
+        SqlAlchemyTraceStore(engine),
     )
     proposal_at = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)
     execution_at = proposal_at + timedelta(seconds=1)
@@ -1064,7 +1052,7 @@ async def test_tool_lineage_uses_execution_time_and_clears_stale_completion(
             )
             await execution.aclose()
 
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             completed = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=selected_runs[:2],
@@ -1095,7 +1083,7 @@ async def test_tool_lineage_uses_execution_time_and_clears_stale_completion(
             )
             await resumed.aclose()
 
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             running = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=selected_runs,
@@ -1134,8 +1122,8 @@ async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
         f"sqlite+aiosqlite:///{tmp_path / f'subagent-{terminal_status}.db'}"
     )
     stores = (
-        InMemoryTraceStore(namespace=f"subagent-{terminal_status}-memory"),
-        SqlAlchemyTraceStore(engine, namespace=f"subagent-{terminal_status}-sql"),
+        InMemoryTraceStore(),
+        SqlAlchemyTraceStore(engine),
     )
     namespace = ("tools:shared-subagent",)
     subagent_id = scope_id("subagent", namespace, namespace[-1])
@@ -1157,7 +1145,7 @@ async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
                     SubagentFact(
                         source_observation_id=f"{run_id}-start",
                         identity=_identity(run_id),
-                        namespace=namespace,
+                        graph_namespace=namespace,
                         occurred_at=started_at,
                         monotonic_ns=2,
                         phase="started",
@@ -1174,7 +1162,7 @@ async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
                         SubagentFact(
                             source_observation_id=f"{run_id}-waiting",
                             identity=_identity(run_id),
-                            namespace=namespace,
+                            graph_namespace=namespace,
                             occurred_at=started_at + timedelta(seconds=1),
                             monotonic_ns=3,
                             phase="updated",
@@ -1188,7 +1176,7 @@ async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
                         SubagentFact(
                             source_observation_id=f"{run_id}-terminal",
                             identity=_identity(run_id),
-                            namespace=namespace,
+                            graph_namespace=namespace,
                             occurred_at=terminal_at,
                             monotonic_ns=3,
                             phase="completed",
@@ -1201,7 +1189,7 @@ async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
                 await writer.aclose()
 
                 if run_id == "subagent-second":
-                    interrupted_snapshot = await store.snapshot(_identity().thread_id)
+                    interrupted_snapshot = await store.snapshot(_identity().thread)
                     interrupted = await store.query_trace_graph(
                         interrupted_snapshot.key,
                         run_ids=run_ids[:2],
@@ -1212,7 +1200,7 @@ async def test_subagent_lineage_survives_two_interrupts_and_rebuild(
                     assert interrupted.nodes[0].completed_at is None
                     assert interrupted.nodes[0].status is TraceGraphNodeStatus.WAITING
 
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             page = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=run_ids,
@@ -1248,8 +1236,8 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
 ) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'graph-remove.db'}")
     stores = (
-        InMemoryTraceStore(namespace="graph-remove"),
-        SqlAlchemyTraceStore(engine, namespace="graph-remove"),
+        InMemoryTraceStore(),
+        SqlAlchemyTraceStore(engine),
     )
     try:
         for store in stores:
@@ -1268,7 +1256,7 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
                     ),
                 )
             )
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
             root_page = await store.query_trace_graph(
                 snapshot.key,
                 run_ids=("remove-root",),
@@ -1298,7 +1286,7 @@ async def test_memory_and_sql_graph_removal_isolated_to_one_sibling_lineage(
             )
             sibling = await store.open_writer(_identity("keep-branch"))
             await sibling.append((_fact("started", run_id="keep-branch"),))
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
 
             removed_page = await store.query_trace_graph(
                 snapshot.key,
@@ -1344,7 +1332,7 @@ async def test_sqlite_graph_clears_a_tool_parent_gap_after_model_completion(
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'resolved-tool-parent.db'}"
     )
-    store = SqlAlchemyTraceStore(engine, namespace="resolved-tool-parent")
+    store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity())
     now = datetime.now(UTC)
     model_id = "model-call"
@@ -1391,7 +1379,7 @@ async def test_sqlite_graph_clears_a_tool_parent_gap_after_model_completion(
                 ),
             )
         )
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         page = await store.query_trace_graph(
             snapshot.key,
             run_ids=(_identity().run_id,),
@@ -1408,9 +1396,9 @@ async def test_sqlite_graph_clears_a_tool_parent_gap_after_model_completion(
         await writer.aclose()
         async with engine.begin() as connection:
             await connection.execute(text("DELETE FROM tinkerfin_trace_graph_nodes"))
-        assert await Tracer(store=store).rebuild_graph(_identity().thread_id) == 3
+        assert await Tracer(store=store).rebuild_graph(_identity().thread) == 3
         rebuilt = await store.query_trace_graph(
-            (await store.snapshot(_identity().thread_id)).key,
+            (await store.snapshot(_identity().thread)).key,
             run_ids=(_identity().run_id,),
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.TOOL},
@@ -1432,7 +1420,6 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
     )
     store = SqlAlchemyTraceStore(
         engine,
-        namespace="encrypted-graph-query",
         codec=_EncryptedTraceCodec(),
     )
     writer = await store.open_writer(_identity())
@@ -1468,10 +1455,10 @@ async def test_sqlite_graph_query_reads_details_through_a_custom_encrypted_codec
                 ),
             )
         )
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         async with engine.begin() as connection:
             await connection.execute(text("DELETE FROM tinkerfin_trace_graph_nodes"))
-        assert await Tracer(store=store).rebuild_graph(_identity().thread_id) == 2
+        assert await Tracer(store=store).rebuild_graph(_identity().thread) == 2
         page = await store.query_trace_graph(
             snapshot.key,
             run_ids=(_identity().run_id,),
@@ -1541,8 +1528,8 @@ async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
         f"sqlite+aiosqlite:///{tmp_path / 'content-search.db'}"
     )
     stores = (
-        InMemoryTraceStore(namespace="graph-content-search"),
-        SqlAlchemyTraceStore(engine, namespace="graph-content-search"),
+        InMemoryTraceStore(),
+        SqlAlchemyTraceStore(engine),
     )
     now = datetime.now(UTC)
     try:
@@ -1603,7 +1590,7 @@ async def test_memory_and_sql_search_decoded_content_without_ancestor_pollution(
                     ),
                 )
             )
-            snapshot = await store.snapshot(_identity().thread_id)
+            snapshot = await store.snapshot(_identity().thread)
 
             page = await store.query_trace_graph(
                 snapshot.key,
@@ -1659,8 +1646,8 @@ async def test_memory_and_sql_graph_paging_share_the_digest_tie_breaker(
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'graph-order.db'}")
     stores = (
-        InMemoryTraceStore(namespace="graph-order"),
-        SqlAlchemyTraceStore(engine, namespace="graph-order"),
+        InMemoryTraceStore(),
+        SqlAlchemyTraceStore(engine),
     )
     occurred_at = datetime.now(UTC)
     call_specs = (
@@ -1736,7 +1723,7 @@ async def test_memory_and_sql_graph_paging_share_the_digest_tie_breaker(
 
         observed_orders: list[tuple[str, ...]] = []
         for store in stores:
-            key = (await store.snapshot(_identity().thread_id)).key
+            key = (await store.snapshot(_identity().thread)).key
             first = await store.query_trace_graph(
                 key,
                 run_ids=(_identity().run_id,),
@@ -1767,7 +1754,7 @@ async def test_memory_and_sql_graph_paging_share_the_digest_tie_breaker(
         )
         assert observed_orders == [expected, expected]
         for store in stores:
-            key = (await store.snapshot(_identity().thread_id)).key
+            key = (await store.snapshot(_identity().thread)).key
             literal = await store.query_trace_graph(
                 key,
                 run_ids=(_identity().run_id,),
@@ -1801,7 +1788,6 @@ async def test_sqlite_store_auto_setup_round_trip_and_generation_delete(
     borrowed_pool = engine.pool
     store = SqlAlchemyTraceStore(
         engine,
-        namespace="tests",
         options=TraceStoreOptions(
             writer_lease_seconds=2,
             writer_heartbeat_interval_seconds=0.5,
@@ -1817,7 +1803,7 @@ async def test_sqlite_store_auto_setup_round_trip_and_generation_delete(
         )
         await writer.aclose()
 
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         assert snapshot.as_of_seq == 4
         assert snapshot.active_writers == ()
         assert [event.trace_seq for event in ordinary + terminal] == [1, 2, 3, 4]
@@ -1874,10 +1860,10 @@ async def test_sqlite_store_auto_setup_round_trip_and_generation_delete(
 
 
 async def test_tracer_rebuilds_graph_without_rewriting_ledger(
-    tmp_path: Path,
+    trace_sql_engine: AsyncEngine,
 ) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'rebuild.db'}")
-    store = SqlAlchemyTraceStore(engine, namespace="graph-rebuild")
+    engine = trace_sql_engine
+    store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity())
     now = datetime.now(UTC)
     try:
@@ -1923,9 +1909,9 @@ async def test_tracer_rebuilds_graph_without_rewriting_ledger(
             )
             await connection.execute(text("DELETE FROM tinkerfin_trace_graph_nodes"))
 
-        rebuilt = await Tracer(store=store).rebuild_graph(_identity().thread_id)
+        rebuilt = await Tracer(store=store).rebuild_graph(_identity().thread)
         page = await store.query_trace_graph(
-            (await store.snapshot(_identity().thread_id)).key,
+            (await store.snapshot(_identity().thread)).key,
             run_ids=(_identity().run_id,),
             where=TraceGraphFilter(kinds={TraceGraphNodeKind.MODEL}),
             limit=10,
@@ -1952,14 +1938,11 @@ async def test_tracer_rebuilds_graph_without_rewriting_ledger(
 
 
 async def test_rebuild_merges_lifecycle_revisions_across_event_pages(
-    tmp_path: Path,
+    trace_sql_engine: AsyncEngine,
 ) -> None:
-    engine = create_async_engine(
-        f"sqlite+aiosqlite:///{tmp_path / 'rebuild-page-boundary.db'}"
-    )
+    engine = trace_sql_engine
     store = SqlAlchemyTraceStore(
         engine,
-        namespace="graph-rebuild-page-boundary",
         limits=TraceLimits(follow_batch_size=1),
     )
     writer = await store.open_writer(_identity())
@@ -2005,9 +1988,9 @@ async def test_rebuild_merges_lifecycle_revisions_across_event_pages(
         async with engine.begin() as connection:
             await connection.execute(text("DELETE FROM tinkerfin_trace_graph_nodes"))
 
-        assert await Tracer(store=store).rebuild_graph(_identity().thread_id) == 3
+        assert await Tracer(store=store).rebuild_graph(_identity().thread) == 3
         page = await store.query_trace_graph(
-            (await store.snapshot(_identity().thread_id)).key,
+            (await store.snapshot(_identity().thread)).key,
             run_ids=(_identity().run_id,),
             where=TraceGraphFilter(),
             limit=10,
@@ -2182,47 +2165,52 @@ async def test_sql_setup_retries_after_the_retained_task_cancels_itself(
         await engine.dispose()
 
 
-async def test_sqlite_unknown_commit_reuses_event_and_checkpoint_evidence(
-    tmp_path: Path,
+async def test_sql_unknown_commit_reuses_event_and_checkpoint_evidence(
+    trace_sql_engine: AsyncEngine,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'unknown.db'}")
+    engine = trace_sql_engine
     store = SqlAlchemyTraceStore(
         engine,
-        namespace="unknown-commit",
         options=TraceStoreOptions(
             commit_retry_attempts=2,
             commit_retry_delay_seconds=0.001,
         ),
     )
     writer = await store.open_writer(_identity())
-    original = _backend(store)._raw_write_connection
+    faults = ExitStack()
 
-    def busy_error() -> DBAPIError:
-        original_error = sqlite3.OperationalError("database is locked")
-        original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-        return DBAPIError(None, None, original_error, False)
+    def unknown_commit_error() -> DBAPIError:
+        if engine.dialect.name == "mysql":
+            from asyncmy.errors import OperationalError
+
+            cause = OperationalError(2013, "connection lost during COMMIT")
+        elif engine.dialect.name == "postgresql":
+            from asyncpg.exceptions import ConnectionFailureError
+
+            cause = ConnectionFailureError("connection lost during COMMIT")
+        else:
+            cause = sqlite3.OperationalError("disk I/O error")
+            cause.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        return DBAPIError(None, None, cause, connection_invalidated=True)
 
     def fail_once_after_commit() -> None:
         remaining = 1
 
-        @asynccontextmanager
-        async def transaction() -> AsyncIterator[AsyncConnection]:
+        async def transaction() -> None:
             nonlocal remaining
-            async with original() as connection:
-                yield connection
             if remaining:
                 remaining -= 1
-                raise busy_error()
+                raise unknown_commit_error()
 
-        monkeypatch.setattr(_backend(store), "_raw_write_connection", transaction)
+        faults.enter_context(after_sql_commit(engine, transaction))
 
     try:
         # The injected DBAPI failure happens after the real transaction committed.
         # Public append must prove the first commit by its retained event IDs.
         fail_once_after_commit()
         committed = await writer.append((_fact("started"),))
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         assert snapshot.as_of_seq == 1
         assert [
             event.event_id
@@ -2269,7 +2257,7 @@ async def test_sqlite_unknown_commit_reuses_event_and_checkpoint_evidence(
         with pytest.raises(TraceThreadNotFound):
             await store.snapshot_key(snapshot.key)
     finally:
-        monkeypatch.setattr(_backend(store), "_raw_write_connection", original)
+        faults.close()
         await writer.aclose()
         await engine.dispose()
 
@@ -2299,13 +2287,13 @@ async def test_sqlite_controlled_clock_is_shared_by_reads_writes_and_peers(
             for store in (first_store, peer_store):
                 state = await _backend(store).load_ledger_state(
                     TraceLedgerStateRequest(
-                        namespace=store.namespace,
+                        namespace=_identity().namespace,
                         thread_id=identity.thread_id,
                         run_id=identity.run_id,
                         include_active_writers=True,
                     )
                 )
-                snapshot = await store.snapshot(identity.thread_id)
+                snapshot = await store.snapshot(identity.thread)
                 page = await _backend(store).read_event_page(
                     TraceEventPageRequest(
                         key=writer.key,
@@ -2364,34 +2352,31 @@ async def test_sqlite_unknown_writer_open_commit_reuses_owner_token(
         ),
     )
     await store.setup()
-    original = _backend(store)._raw_write_connection
+    faults = ExitStack()
     remaining = 1
 
-    @asynccontextmanager
-    async def fail_after_commit() -> AsyncIterator[AsyncConnection]:
+    async def fail_after_commit() -> None:
         nonlocal remaining
-        async with original() as connection:
-            yield connection
         if remaining:
             remaining -= 1
             clock.advance(store.options.writer_lease_seconds + 1)
-            original_error = sqlite3.OperationalError("database is locked")
-            original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-            raise DBAPIError(None, None, original_error, False)
+            original_error = sqlite3.OperationalError("disk I/O error")
+            original_error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise DBAPIError(None, None, original_error, connection_invalidated=True)
 
     writer = None
     try:
-        monkeypatch.setattr(_backend(store), "_raw_write_connection", fail_after_commit)
+        faults.enter_context(after_sql_commit(engine, fail_after_commit))
         writer = await store.open_writer(_identity())
         committed = await writer.append((_fact("started"),))
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         assert snapshot.active_run_ids == (_identity().run_id,)
         assert snapshot.observed_at == clock.now
         assert snapshot.as_of_seq == 1
         assert committed[0].trace_seq == 1
         state = await _backend(store).load_ledger_state(
             TraceLedgerStateRequest(
-                namespace=store.namespace,
+                namespace=_identity().namespace,
                 thread_id=_identity().thread_id,
                 run_id=_identity().run_id,
             )
@@ -2402,7 +2387,7 @@ async def test_sqlite_unknown_writer_open_commit_reuses_owner_token(
             seconds=store.options.writer_lease_seconds
         )
     finally:
-        monkeypatch.setattr(_backend(store), "_raw_write_connection", original)
+        faults.close()
         try:
             if writer is not None:
                 await writer.aclose()
@@ -2427,29 +2412,25 @@ async def test_sqlite_unknown_append_commit_renews_expired_writer_lease(
         ),
     )
     writer = await store.open_writer(_identity())
-    backend = _backend(store)
-    original = backend._raw_write_connection
+    faults = ExitStack()
     remaining = 1
 
-    @asynccontextmanager
-    async def fail_after_commit() -> AsyncIterator[AsyncConnection]:
+    async def fail_after_commit() -> None:
         nonlocal remaining
-        async with original() as connection:
-            yield connection
         if remaining:
             remaining -= 1
             clock.advance(store.options.writer_lease_seconds + 1)
-            original_error = sqlite3.OperationalError("database is locked")
-            original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-            raise DBAPIError(None, None, original_error, False)
+            original_error = sqlite3.OperationalError("disk I/O error")
+            original_error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise DBAPIError(None, None, original_error, connection_invalidated=True)
 
     try:
-        monkeypatch.setattr(backend, "_raw_write_connection", fail_after_commit)
+        faults.enter_context(after_sql_commit(engine, fail_after_commit))
         first = await writer.append((_fact("started"),))
         second = await writer.append((_fact("input"),))
 
         assert [first[0].trace_seq, second[0].trace_seq] == [1, 2]
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         stored = await store.read_events(
             snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=10
         )
@@ -2461,7 +2442,7 @@ async def test_sqlite_unknown_append_commit_renews_expired_writer_lease(
             second[0].event_id,
         ]
     finally:
-        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        faults.close()
         try:
             await writer.aclose()
         finally:
@@ -2478,7 +2459,6 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     clock = _SqliteClock()
     clock.install(first_engine)
     clock.install(peer_engine)
-    namespace = "append-takeover"
     options = TraceStoreOptions(
         writer_lease_seconds=0.15,
         writer_heartbeat_interval_seconds=0.14,
@@ -2487,27 +2467,21 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
     )
     first_store = SqlAlchemyTraceStore(
         first_engine,
-        namespace=namespace,
         options=options,
     )
     peer_store = SqlAlchemyTraceStore(
         peer_engine,
-        namespace=namespace,
     )
     identity = _identity()
     writer = await first_store.open_writer(identity)
-    backend = _backend(first_store)
     peer_backend = _backend(peer_store)
-    original = backend._raw_write_connection
+    faults = ExitStack()
     first_commit_finished = asyncio.Event()
     release_retry = asyncio.Event()
     remaining = 1
 
-    @asynccontextmanager
-    async def fail_after_commit() -> AsyncIterator[AsyncConnection]:
+    async def fail_after_commit() -> None:
         nonlocal remaining
-        async with original() as connection:
-            yield connection
         if remaining:
             remaining -= 1
             first_commit_finished.set()
@@ -2515,11 +2489,11 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
             # so the peer can take ownership before the append retries.
             async with asyncio.timeout(3):
                 await release_retry.wait()
-            original_error = sqlite3.OperationalError("database is locked")
-            original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-            raise DBAPIError(None, None, original_error, False)
+            original_error = sqlite3.OperationalError("disk I/O error")
+            original_error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise DBAPIError(None, None, original_error, connection_invalidated=True)
 
-    monkeypatch.setattr(backend, "_raw_write_connection", fail_after_commit)
+    faults.enter_context(after_sql_commit(first_engine, fail_after_commit))
     append = asyncio.create_task(writer.append((_fact("started"),)))
     replacement = None
     try:
@@ -2527,7 +2501,7 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
         clock.advance(options.writer_lease_seconds + 1)
         state = await peer_backend.load_ledger_state(
             TraceLedgerStateRequest(
-                namespace=namespace,
+                namespace=identity.namespace,
                 thread_id=identity.thread_id,
                 generation=writer.key.generation,
                 run_id=identity.run_id,
@@ -2536,20 +2510,20 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
         assert state.observed_at == clock.now
         assert state.target_writer is not None
         assert state.target_writer.lease_expires_at < state.observed_at
-        assert (await peer_store.snapshot(identity.thread_id)).active_run_ids == ()
+        assert (await peer_store.snapshot(identity.thread)).active_run_ids == ()
         assert not append.done()
         replacement = await peer_store.open_writer(identity)
         release_retry.set()
         committed = await append
         state = await peer_backend.load_ledger_state(
             TraceLedgerStateRequest(
-                namespace=namespace,
+                namespace=identity.namespace,
                 thread_id=identity.thread_id,
                 generation=replacement.key.generation,
                 run_id=identity.run_id,
             )
         )
-        snapshot = await peer_store.snapshot(identity.thread_id)
+        snapshot = await peer_store.snapshot(identity.thread)
         stored = await peer_store.read_events(
             replacement.key,
             after_seq=0,
@@ -2566,7 +2540,7 @@ async def test_sqlite_proven_append_survives_peer_takeover_during_retry(
         assert state.target_writer.lease_expires_at > state.observed_at
     finally:
         release_retry.set()
-        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        faults.close()
         if not append.done():
             append.cancel()
         await asyncio.gather(append, return_exceptions=True)
@@ -2597,22 +2571,24 @@ async def test_sqlite_retry_exhaustion_uses_stable_store_timeout(
         ),
     )
     writer = await store.open_writer(_identity())
-    original = _backend(store)._raw_write_connection
+    original = AsyncConnection.exec_driver_sql
     original_error = sqlite3.OperationalError("database is locked")
     original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
 
-    @asynccontextmanager
-    async def unavailable() -> AsyncIterator[AsyncConnection]:
-        raise DBAPIError(None, None, original_error, False)
-        yield  # pragma: no cover - required only by the async context manager shape
+    async def unavailable(
+        connection: AsyncConnection, statement: str, *args: Any, **kwargs: Any
+    ) -> Any:
+        if connection.engine is engine and statement == "BEGIN IMMEDIATE":
+            raise DBAPIError(None, None, original_error, False)
+        return await original(connection, statement, *args, **kwargs)
 
     try:
-        monkeypatch.setattr(_backend(store), "_raw_write_connection", unavailable)
+        monkeypatch.setattr(AsyncConnection, "exec_driver_sql", unavailable)
         with pytest.raises(TraceStoreTimeout) as captured:
             await writer.append((_fact("started"),))
         assert isinstance(captured.value.cause, DBAPIError)
     finally:
-        monkeypatch.setattr(_backend(store), "_raw_write_connection", original)
+        monkeypatch.setattr(AsyncConnection, "exec_driver_sql", original)
         await writer.aclose()
         await engine.dispose()
 
@@ -2631,7 +2607,7 @@ async def test_sqlite_store_rejects_corrupt_opaque_payload(tmp_path: Path) -> No
                 ),
                 {"payload": b"{}", "event_id": committed[0].event_id},
             )
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         with pytest.raises(TraceStoreProtocolError, match="digest mismatch"):
             await store.read_events(
                 snapshot.key,
@@ -2642,123 +2618,6 @@ async def test_sqlite_store_rejects_corrupt_opaque_payload(tmp_path: Path) -> No
     finally:
         await writer.aclose()
         await engine.dispose()
-
-
-async def test_sqlite_fixed_event_read_does_not_cross_concurrent_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'fixed-read.db'}")
-    store = SqlAlchemyTraceStore(
-        engine,
-        options=TraceStoreOptions(
-            commit_retry_attempts=10,
-            commit_retry_delay_seconds=0.01,
-        ),
-    )
-    writer = await store.open_writer(_identity())
-    await writer.append((_fact("started"),))
-    snapshot = await store.snapshot(_identity().thread_id)
-    original = AsyncConnection.execute
-    head_observed = asyncio.Event()
-    continue_read = asyncio.Event()
-
-    async def pause_after_head(
-        connection: AsyncConnection, statement: Executable, *args: Any, **kwargs: Any
-    ):
-        result = await original(connection, statement, *args, **kwargs)
-        if not head_observed.is_set() and str(statement).startswith(
-            "SELECT tinkerfin_trace_threads."
-        ):
-            head_observed.set()
-            await continue_read.wait()
-        return result
-
-    monkeypatch.setattr(AsyncConnection, "execute", pause_after_head)
-    read = asyncio.create_task(
-        store.read_events(
-            snapshot.key,
-            after_seq=0,
-            as_of_seq=2,
-            limit=10,
-        )
-    )
-    append = None
-    try:
-        await asyncio.wait_for(head_observed.wait(), timeout=2)
-        append = asyncio.create_task(writer.append((_fact("input"),)))
-        await asyncio.sleep(0.05)
-        continue_read.set()
-        page = await read
-        await append
-
-        assert [event.trace_seq for event in page] == [1]
-    finally:
-        continue_read.set()
-        if not read.done():
-            read.cancel()
-            await asyncio.gather(read, return_exceptions=True)
-        if append is not None and not append.done():
-            append.cancel()
-            await asyncio.gather(append, return_exceptions=True)
-        monkeypatch.setattr(AsyncConnection, "execute", original)
-        await writer.aclose()
-        await engine.dispose()
-
-
-async def test_connection_cleanup_survives_repeated_caller_cancellation() -> None:
-    owner_started = asyncio.Event()
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-
-    async def cleanup() -> None:
-        cleanup_started.set()
-        await release_cleanup.wait()
-        cleanup_finished.set()
-
-    async def owner() -> None:
-        owner_started.set()
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError as error:
-            await _complete_connection_cleanup(
-                cleanup(),
-                task_name="test-trace-connection-cleanup",
-                primary_error=error,
-            )
-            raise
-
-    owner_task = asyncio.create_task(owner())
-    await owner_started.wait()
-    owner_task.cancel("first cancellation")
-    await cleanup_started.wait()
-    owner_task.cancel("repeated cancellation")
-    await asyncio.sleep(0)
-    try:
-        assert not owner_task.done()
-    finally:
-        release_cleanup.set()
-
-    with pytest.raises(asyncio.CancelledError) as captured:
-        await owner_task
-    assert captured.value.args == ("first cancellation",)
-    assert cleanup_finished.is_set()
-
-
-async def test_connection_cleanup_keeps_the_operation_failure_primary() -> None:
-    primary = RuntimeError("operation failed")
-
-    async def cleanup() -> None:
-        raise ValueError("close failed")
-
-    await _complete_connection_cleanup(
-        cleanup(),
-        task_name="test-trace-connection-cleanup-failure",
-        primary_error=primary,
-    )
-
-    assert any("builtins.ValueError" in note for note in primary.__notes__)
 
 
 async def test_sqlite_cancelled_lock_wait_releases_connection_for_retry(
@@ -2775,11 +2634,18 @@ async def test_sqlite_cancelled_lock_wait_releases_connection_for_retry(
     )
     store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity())
+    contended = asyncio.Event()
+
+    def observe_busy(context: Any) -> None:
+        if context.statement == "BEGIN IMMEDIATE":
+            contended.set()
+
+    sqlalchemy_event.listen(engine.sync_engine, "handle_error", observe_busy)
     blocker = await blocker_engine.connect()
     try:
         await blocker.exec_driver_sql("BEGIN IMMEDIATE")
         waiting = asyncio.create_task(writer.append((_fact("started"),)))
-        await asyncio.sleep(0.05)
+        await contended.wait()
         waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiting
@@ -2790,6 +2656,7 @@ async def test_sqlite_cancelled_lock_wait_releases_connection_for_retry(
         async with engine.connect() as borrowed_again:
             assert await borrowed_again.scalar(text("PRAGMA busy_timeout")) == 30_000
     finally:
+        sqlalchemy_event.remove(engine.sync_engine, "handle_error", observe_busy)
         await blocker.close()
         await writer.aclose()
         await engine.dispose()
@@ -2800,18 +2667,15 @@ async def test_sqlite_cancelled_transaction_releases_writer_lock_before_returnin
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    driver_closed = ThreadEvent()
-    close_delayed = False
+    driver_closed, release_close = ThreadEvent(), ThreadEvent()
+    close_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     class SlowClosingConnection(sqlite3.Connection):
         def close(self) -> None:
-            nonlocal close_delayed
-            if close_delayed:
-                super().close()
-                return
-            close_delayed = True
-            # Cancellation must await this worker's physical connection closure.
-            time.sleep(0.25)
+            loop.call_soon_threadsafe(close_started.set)
+            if not release_close.wait(5):
+                raise AssertionError("driver close was not released")
             super().close()
             driver_closed.set()
 
@@ -2825,41 +2689,41 @@ async def test_sqlite_cancelled_transaction_releases_writer_lock_before_returnin
     )
     store = SqlAlchemyTraceStore(engine)
     writer = await store.open_writer(_identity())
-    backend = _backend(store)
-    original = backend._raw_write_connection
+    faults = ExitStack()
     transaction_started = asyncio.Event()
     release_transaction = asyncio.Event()
 
-    @asynccontextmanager
-    async def held_transaction() -> AsyncIterator[AsyncConnection]:
-        async with original() as connection:
-            transaction_started.set()
-            await release_transaction.wait()
-            yield connection
+    async def held_transaction() -> None:
+        transaction_started.set()
+        await release_transaction.wait()
 
-    monkeypatch.setattr(backend, "_raw_write_connection", held_transaction)
+    faults.enter_context(after_sql_command(engine, "BEGIN IMMEDIATE", held_transaction))
     writing = asyncio.create_task(writer.append((_fact("started"),)))
     cancellation_requested = False
     try:
         await asyncio.wait_for(transaction_started.wait(), timeout=3)
         cancellation_requested = True
         writing.cancel()
+        await close_started.wait()
+        assert not writing.done()
+        release_close.set()
         with pytest.raises(asyncio.CancelledError):
             await writing
         assert driver_closed.is_set()
         async with peer_engine.connect() as peer:
             await peer.exec_driver_sql("BEGIN IMMEDIATE")
             await peer.rollback()
-        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        faults.close()
         committed = await writer.append((_fact("started"),))
         assert committed[0].trace_seq == 1
         await writer.aclose()
     finally:
+        release_close.set()
         release_transaction.set()
         if not writing.done():
             writing.cancel()
         await asyncio.gather(writing, return_exceptions=True)
-        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        faults.close()
         try:
             try:
                 if cancellation_requested:
@@ -2889,7 +2753,7 @@ async def test_sqlite_background_heartbeat_renews_across_initial_lease(
     writer = await store.open_writer(_identity())
     try:
         request = TraceLedgerStateRequest(
-            namespace=store.namespace,
+            namespace=_identity().namespace,
             thread_id=_identity().thread_id,
             run_id=_identity().run_id,
         )
@@ -2932,7 +2796,7 @@ async def test_sqlite_real_clock_observations_advance_with_millisecond_precision
         page_times: set[datetime] = set()
         async with asyncio.timeout(3):
             while True:
-                snapshot = await store.snapshot(_identity().thread_id)
+                snapshot = await store.snapshot(_identity().thread)
                 page = await _backend(store).read_event_page(
                     TraceEventPageRequest(
                         key=writer.key,
@@ -2980,34 +2844,30 @@ async def test_sqlite_unknown_heartbeat_commit_renews_expired_retry(
         ),
     )
     writer = await store.open_writer(_identity())
-    backend = _backend(store)
-    original = backend._raw_write_connection
+    faults = ExitStack()
     renewal_committed = asyncio.Event()
     remaining = 1
     # The first heartbeat must persist a later expiry than the writer's open,
     # so its retry can distinguish a committed renewal from an unchanged row.
     clock.advance(store.options.writer_heartbeat_interval_seconds)
 
-    @asynccontextmanager
-    async def fail_after_commit() -> AsyncIterator[AsyncConnection]:
+    async def fail_after_commit() -> None:
         nonlocal remaining
-        async with original() as connection:
-            yield connection
         if remaining:
             remaining -= 1
             clock.advance(store.options.writer_lease_seconds + 1)
-            original_error = sqlite3.OperationalError("database is locked")
-            original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-            raise DBAPIError(None, None, original_error, False)
+            original_error = sqlite3.OperationalError("disk I/O error")
+            original_error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise DBAPIError(None, None, original_error, connection_invalidated=True)
         renewal_committed.set()
 
-    monkeypatch.setattr(backend, "_raw_write_connection", fail_after_commit)
+    faults.enter_context(after_sql_commit(engine, fail_after_commit))
     try:
         async with asyncio.timeout(3):
             await renewal_committed.wait()
         committed = await writer.append((_fact("started"),))
         assert committed[0].trace_seq == 1
-        snapshot = await store.snapshot(_identity().thread_id)
+        snapshot = await store.snapshot(_identity().thread)
         assert snapshot.observed_at == clock.now
         assert snapshot.active_run_ids == (_identity().run_id,)
         assert snapshot.as_of_seq == 1
@@ -3016,7 +2876,7 @@ async def test_sqlite_unknown_heartbeat_commit_renews_expired_retry(
         )
         assert [event.event_id for event in stored] == [committed[0].event_id]
     finally:
-        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        faults.close()
         try:
             await writer.aclose()
         finally:
@@ -3062,35 +2922,29 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
     )
     first = SqlAlchemyTraceStore(
         first_engine,
-        namespace="checkpoint-advance",
         options=options,
     )
     peer = SqlAlchemyTraceStore(
         peer_engine,
-        namespace="checkpoint-advance",
         options=options,
     )
     writer = await first.open_writer(_identity())
     await writer.append((_fact("started"), _fact("input")))
-    backend = _backend(first)
-    original = backend._raw_write_connection
+    faults = ExitStack()
     first_commit_finished = asyncio.Event()
     release_retry = asyncio.Event()
     remaining = 1
 
-    @asynccontextmanager
-    async def fail_after_commit() -> AsyncIterator[AsyncConnection]:
+    async def fail_after_commit() -> None:
         nonlocal remaining
-        async with original() as connection:
-            yield connection
         if remaining:
             remaining -= 1
             first_commit_finished.set()
             async with asyncio.timeout(3):
                 await release_retry.wait()
-            original_error = sqlite3.OperationalError("database is locked")
-            original_error.sqlite_errorcode = sqlite3.SQLITE_BUSY
-            raise DBAPIError(None, None, original_error, False)
+            original_error = sqlite3.OperationalError("disk I/O error")
+            original_error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+            raise DBAPIError(None, None, original_error, connection_invalidated=True)
 
     first_checkpoint = TraceProjectionCheckpoint(
         key=writer.key,
@@ -3102,7 +2956,7 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
     second_checkpoint = first_checkpoint.model_copy(
         update={"as_of_seq": 2, "state": {"count": 2}}
     )
-    monkeypatch.setattr(backend, "_raw_write_connection", fail_after_commit)
+    faults.enter_context(after_sql_commit(first_engine, fail_after_commit))
     saving = asyncio.create_task(
         first.save_projection_checkpoint(
             first_checkpoint,
@@ -3131,7 +2985,7 @@ async def test_sqlite_unknown_checkpoint_survives_peer_advancement(
         )
     finally:
         release_retry.set()
-        monkeypatch.setattr(backend, "_raw_write_connection", original)
+        faults.close()
         if not saving.done():
             saving.cancel()
         await asyncio.gather(saving, return_exceptions=True)

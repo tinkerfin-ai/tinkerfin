@@ -779,19 +779,33 @@ def _resolve_begin_generation_cleanup(
                 cleanup_required=True,
             )
         )
+    lost: StoredMessagingRun | None = None
     if stream.active_run_id is not None:
+        owner = state.target_run
+        if owner is None or owner.identity.run_id != stream.active_run_id:
+            owner = state.active_run
         active_identity = (
-            state.active_run.identity
-            if state.active_run is not None
+            owner.identity
+            if owner is not None
             else RunIdentity(
-                threadId=transition.identity.thread_id,
-                runId=stream.active_run_id,
+                namespace=transition.identity.namespace,
+                thread_id=transition.identity.thread_id,
+                run_id=stream.active_run_id,
             )
         )
-        raise StreamDeleteConflict(
-            channel=transition.channel,
-            identity=transition.identity,
-            active_identity=active_identity,
+        if owner is None or owner.producer_lease_active:
+            raise StreamDeleteConflict(
+                channel=transition.channel,
+                identity=transition.identity,
+                active_identity=active_identity,
+            )
+        # Deletion fences expired producers even when their source is recoverable.
+        # No caller-side status read is required; owner loss and sealing commit
+        # together. See the real Redis expired-producer deletion contract.
+        lost = _owner_lost_run(
+            owner,
+            end_sequence=stream.latest_sequence,
+            message="producer lease expired",
         )
     if reason == "expired" and not stream.retention_expired:
         return MessagingStorageEffect(
@@ -811,8 +825,12 @@ def _resolve_begin_generation_cleanup(
         stream=replace(
             stream,
             disposition=disposition,
+            active_run_id=None,
             control_sequence=stream.control_sequence + 1,
         ),
+        runs=() if lost is None else (lost,),
+        lease_action="none" if lost is None else "release",
+        lease_run_id=None if lost is None else lost.identity.run_id,
         retention_action="clear",
     )
 

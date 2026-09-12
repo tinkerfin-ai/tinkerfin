@@ -7,7 +7,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, cast
 
 from deepagents.backends.protocol import BackendProtocol
-from deepagents.middleware.filesystem import FilesystemMiddleware, FsToolName
+from deepagents.middleware.filesystem import (
+    FilesystemMiddleware,
+    FilesystemPermission,
+    FsToolName,
+)
 from langchain.agents import create_agent  # pyright: ignore[reportUnknownVariableType]
 from langchain.agents.middleware import AgentMiddleware, ModelCallLimitMiddleware
 from langchain.agents.structured_output import ToolStrategy
@@ -186,13 +190,30 @@ def create_planner_agent(
     response_type: type[PlannerOutcomeBase],
     attachments: AttachmentSupport | None = None,
     read_only_tools: Sequence[BaseTool] = (),
+    filesystem_instructions: str | None = None,
+    permissions: Sequence[FilesystemPermission] = (),
     context_schema: type[ContextT] | None,
 ) -> _StructuredAgent:
-    """Build a Planner with an explicit read-only filesystem action space."""
+    """Build a Planner that reads only files allowed without human approval.
+
+    The Planner has no file approval step. Treat read-interrupt rules as denied
+    reads, preserving Deep Agents 0.7.5 first-match ordering. Execution agents
+    retain their own approval behavior; prepared main tools are never inherited.
+    """
 
     filesystem = FilesystemMiddleware[ContextT, object](
         backend=backend,
         tools=_READ_ONLY_TOOLS,
+        system_prompt=filesystem_instructions,
+        _permissions=[
+            FilesystemPermission(
+                operations=["read"],
+                paths=list(rule.paths),
+                mode="deny" if rule.mode == "interrupt" else rule.mode,
+            )
+            for rule in permissions
+            if "read" in rule.operations
+        ],
     )
     # LangChain composes heterogeneous middleware state schemas at runtime, but its
     # invariant generic cannot express their intersection.

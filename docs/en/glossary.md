@@ -7,13 +7,15 @@
 | --- | --- |
 | Agent | A program that uses a model and tools to complete a task |
 | Graph | The workflow that actually executes the agent |
-| Runtime | The control object for one Graph run |
-| Plan Mode | A standalone workflow that clarifies and reviews a Plan, then hands approval to native Deep Agent execution |
+| Runtime | A reusable object that executes a configured agent through calls or streams |
+| Plan Mode | A workflow for clarifying and approving a plan before execution |
 | stream | Data produced continuously while a run is active |
-| RunIdentity | Framework identity containing only a stable `threadId` and one `runId` |
-| thread | A continuing conversation identified by `RunIdentity.threadId` |
-| run | One semantic execution identified by `RunIdentity.runId` |
-| Trace | User-visible semantic history derived from Runtime lifecycle and validated Native facts |
+| namespace | Application-selected business isolation scope |
+| RunIdentity | Framework identity containing `namespace`, `thread_id`, and `run_id` |
+| thread | A continuing conversation identified inside one namespace |
+| run | One semantic execution identified inside a thread |
+| graph namespace | Position inside an execution Graph; separate from business namespace |
+| Trace | Recorded history of conversations, model calls, tools, and subagents |
 | AG-UI | A protocol for exchanging live agent events with a frontend |
 | SSE | An HTTP format for sending a continuing event stream to a browser |
 | Messaging | The component that persists and delivers streams |

@@ -19,21 +19,17 @@ from redis.exceptions import RedisError
 from redis.typing import KeyT, StreamIdT
 
 from tinkerfin import RunIdentity
+from tinkerfin_contracts import ThreadIdentity
 from tinkerfin_messaging import (
     BackendOwnershipLost,
     CodecMismatch,
-    CommittedMessageQuery,
     MessageSubscription,
     Messaging,
     MessagingBackendProtocolError,
     MessagingBackendTimeout,
-    MessagingChangeCursor,
-    MessagingChangeWait,
     MessagingLimits,
     MessagingQuotaExceeded,
     MessagingRetentionPolicy,
-    MessagingStateQuery,
-    MessagingTransition,
     RecoverableMessage,
     RecoveryCheckpoint,
     RunAlreadyActive,
@@ -41,7 +37,6 @@ from tinkerfin_messaging import (
     StreamDeleteConflict,
     StreamDeleted,
     StreamExpired,
-    StreamGenerationPurge,
     _redis_journal,
     _redis_scripts,
 )
@@ -49,6 +44,14 @@ from tinkerfin_messaging import (
     RedisBackend as RedisStorageBackend,
 )
 from tinkerfin_messaging._messaging_ledger import BackendRunHandle, PreparedRun
+from tinkerfin_messaging.backend_contract import (
+    CommittedMessageQuery,
+    MessagingChangeCursor,
+    MessagingChangeWait,
+    MessagingStateQuery,
+    MessagingTransition,
+    StreamGenerationPurge,
+)
 from tinkerfin_messaging.testing import verify_messaging_backend
 
 _RedisStreamEntry = tuple[bytes, dict[bytes, bytes]]
@@ -107,7 +110,7 @@ def test_redis_lua_scripts_remain_byte_stable() -> None:
 
 
 def test_redis_message_signature_uses_the_current_unversioned_domain() -> None:
-    identity = RunIdentity(threadId="conversation-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="conversation-1", run_id="run-1")
 
     assert (
         _redis_journal._message_signature(
@@ -137,7 +140,7 @@ def _identity(
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 def _redis_client(
@@ -842,7 +845,7 @@ async def test_real_redis_retention_expires_data_and_preserves_generation_tombst
     first_client = _redis_client(Redis, redis_url)
     second_client = _redis_client(Redis, redis_url)
     prefix = f"tfmsg:retention:{uuid4().hex}"
-    policy = MessagingRetentionPolicy.expire_after(0.12)
+    policy = MessagingRetentionPolicy.expire_after(3600)
     first_backend = RedisBackend(
         first_client,
         key_prefix=prefix,
@@ -873,7 +876,19 @@ async def test_real_redis_retention_expires_data_and_preserves_generation_tombst
             payload=b"retained",
         )
         await first_backend.finish(first.handle, status="completed")
-        await asyncio.sleep(0.2)
+        deployment_base = f"{prefix}:{{{hashlib.sha256(prefix.encode()).hexdigest()}}}"
+        channel_scope = hashlib.sha256(b"events").hexdigest()
+        stream_scope = hashlib.sha256(
+            first.handle.identity.thread.model_dump_json(by_alias=True).encode()
+        ).hexdigest()
+        stream_base = f"{deployment_base}:channel:{channel_scope}:stream:{stream_scope}"
+        control_key = f"{stream_base}:control"
+        assert await first_client.exists(control_key) == 1
+        # Expire the exact seeded generation without depending on wall-clock delays.
+        async with first_client.pipeline(transaction=True) as pipeline:
+            pipeline.hset(control_key, "retention_deadline_ms", "1")
+            pipeline.zadd(f"{deployment_base}:expirations", {control_key: 1})
+            await pipeline.execute()
 
         with pytest.raises(StreamExpired) as expired:
             await second_backend.read(
@@ -882,12 +897,7 @@ async def test_real_redis_retention_expires_data_and_preserves_generation_tombst
             )
         assert expired.value.generation == 1
 
-        channel_scope = hashlib.sha256(b"events").hexdigest()
-        stream_scope = hashlib.sha256(b"conversation-1").hexdigest()
-        generation_base = (
-            f"{prefix}:{{{hashlib.sha256(prefix.encode()).hexdigest()}}}:channel:{channel_scope}"
-            f":stream:{stream_scope}:generation:1"
-        )
+        generation_base = f"{stream_base}:generation:1"
         remaining = await second_client.keys(f"{generation_base}:*")
         assert remaining == [f"{generation_base}:tombstone".encode()]
         assert await second_client.get(f"{generation_base}:tombstone") == b"expired"
@@ -1080,7 +1090,9 @@ async def test_real_redis_rejects_invalid_append_before_lua_or_state_change(
         recoverable=True,
     )
     channel_scope = hashlib.sha256(b"events").hexdigest()
-    stream_digest = hashlib.sha256(b"conversation-1").hexdigest()
+    stream_digest = hashlib.sha256(
+        prepared.handle.identity.thread.model_dump_json(by_alias=True).encode()
+    ).hexdigest()
     run_digest = hashlib.sha256(b"run-1").hexdigest()
     message_digest = hashlib.sha256(message_id.encode()).hexdigest()
     generation_base = (
@@ -1112,6 +1124,10 @@ async def test_real_redis_rejects_invalid_append_before_lua_or_state_change(
         )
 
     before = await durable_state()
+    assert before[1] == b"0"
+    assert before[2][b"run"] == prepared.handle.identity.run_id.encode()
+    assert before[2][b"status"] == b"running"
+    assert before[4]
     client.command_counts.clear()
 
     with pytest.raises(ValueError):
@@ -1243,7 +1259,7 @@ async def test_real_redis_cancelled_consumer_closes_its_pinned_follow_client(
                 payload=b"first",
             )
             subscription = await channel.follow(identity=_identity(), after=0)
-            body = subscription.sse()
+            body = subscription.to_sse()
             delivered = asyncio.Event()
 
             async def consume() -> None:
@@ -2086,8 +2102,8 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         for key in control_keys
     ]
     assert {control[b"stream"] for control in controls} == {
-        b"stream-1",
-        b"stream-2",
+        _identity(thread_id=thread).thread.model_dump_json(by_alias=True).encode()
+        for thread in ("stream-1", "stream-2")
     }
     assert all(control[b"channel"] == b"events" for control in controls)
     assert all(control[b"generation"] == b"1" for control in controls)
@@ -2098,8 +2114,8 @@ async def test_real_redis_persists_channel_and_stream_metadata_separately(
         for key in stream_meta_keys
     ]
     assert {metadata[b"stream"] for metadata in stream_metadata} == {
-        b"stream-1",
-        b"stream-2",
+        _identity(thread_id=thread).thread.model_dump_json(by_alias=True).encode()
+        for thread in ("stream-1", "stream-2")
     }
     assert all(metadata[b"channel"] == b"events" for metadata in stream_metadata)
     assert all(metadata[b"generation"] == b"1" for metadata in stream_metadata)
@@ -2581,7 +2597,7 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
 
     controls = [key async for key in client.scan_iter(match="tfmsg:test:*:control")]
     control_by_stream = {
-        _redis_text(stream_value): _redis_text(key)
+        ThreadIdentity.model_validate_json(stream_value): _redis_text(key)
         for key in controls
         if (
             stream_value := await cast(
@@ -2590,8 +2606,12 @@ async def test_real_redis_delete_unlinks_only_the_target_generation(
         )
         is not None
     }
-    deleted_base = control_by_stream["stream-deleted"].removesuffix(":control")
-    retained_base = control_by_stream["stream-retained"].removesuffix(":control")
+    deleted_base = control_by_stream[
+        _identity(thread_id="stream-deleted").thread
+    ].removesuffix(":control")
+    retained_base = control_by_stream[
+        _identity(thread_id="stream-retained").thread
+    ].removesuffix(":control")
 
     await backend.delete_stream(
         channel="events",

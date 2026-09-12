@@ -52,7 +52,7 @@ _IDS = ScopedIdCodec()
 
 
 def _identity(*, run_id: str = "run-main") -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
 
 
 def _message_id(namespace: tuple[str, ...], raw_id: str) -> str:
@@ -234,12 +234,12 @@ def test_task_start_emits_sanitized_raw_with_subagent_correlation() -> None:
             "kind": "root",
             "agentType": "main",
             "agentName": "main",
-            "namespace": [],
+            "graphNamespace": [],
             "subagents": [
                 create_subagent_provenance(
                     identity=_identity(),
-                    namespace=("tools:graph-a",),
-                    parent_namespace=(),
+                    graph_namespace=("tools:graph-a",),
+                    parent_graph_namespace=(),
                     graph_task_id="graph-a",
                     agent_name="researcher",
                     parent_tool_call_id=_tool_id((), "call-parent-a"),
@@ -535,13 +535,13 @@ def test_nested_task_start_keeps_full_parent_and_child_namespace() -> None:
         "ns": ["tools:outer"],
     }
     provenance = raw.event["provenance"]
-    assert provenance["namespace"] == ["tools:outer"]
+    assert provenance["graphNamespace"] == ["tools:outer"]
     assert provenance["graphTaskId"] == "outer"
     assert provenance["subagents"] == [
         create_subagent_provenance(
             identity=_identity(),
-            namespace=("tools:outer", "tools:inner"),
-            parent_namespace=("tools:outer",),
+            graph_namespace=("tools:outer", "tools:inner"),
+            parent_graph_namespace=("tools:outer",),
             graph_task_id="inner",
             agent_name="analyst",
             parent_tool_call_id=_tool_id(("tools:outer",), "call-inner"),
@@ -578,8 +578,8 @@ def test_parallel_task_results_use_parent_tool_call_id_not_result_order() -> Non
         if isinstance(event, AttachmentToolCallResultEvent)
     )
 
-    assert _raw_event(result_b)["relatedNamespace"] == ["tools:graph-b"]
-    assert _raw_event(result_a)["relatedNamespace"] == ["tools:graph-a"]
+    assert _raw_event(result_b)["relatedGraphNamespace"] == ["tools:graph-b"]
+    assert _raw_event(result_a)["relatedGraphNamespace"] == ["tools:graph-a"]
     payload = result_b.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert "relatedRunId" not in payload
     AttachmentToolCallResultEvent.model_validate(payload)
@@ -622,7 +622,7 @@ def test_one_tool_node_correlates_multiple_parallel_subagent_invocations() -> No
 
     raw = next(event for event in events if isinstance(event, RawEvent))
     subagents = raw.event["provenance"]["subagents"]
-    assert {tuple(item["namespace"]) for item in subagents} == {
+    assert {tuple(item["graphNamespace"]) for item in subagents} == {
         ("tools:graph-group:0",),
         ("tools:graph-group:1",),
     }
@@ -1169,7 +1169,7 @@ def test_real_sample_shape_keeps_parallel_chunks_namespaces_and_results() -> Non
         _tool_id((), "call-parent-b"),
         _tool_id((), "call-parent-a"),
     ]
-    assert [_raw_event(event)["relatedNamespace"] for event in results] == [
+    assert [_raw_event(event)["relatedGraphNamespace"] for event in results] == [
         ["tools:graph-b"],
         ["tools:graph-a"],
     ]

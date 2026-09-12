@@ -36,4 +36,4 @@ package does not contain AG-UI event models or conversion lifecycle code.
 ## License
 
 Apache License 2.0. See
-[LICENSE](https://github.com/tinkerfin-ai/tinkerfin/blob/main/LICENSE).
+[LICENSE](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/LICENSE).

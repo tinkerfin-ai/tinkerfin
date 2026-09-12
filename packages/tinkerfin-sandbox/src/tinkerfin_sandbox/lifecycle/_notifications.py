@@ -240,6 +240,11 @@ class _LifecycleNotifications:
     ) -> None:
         if not self._deliveries:
             return
+        from ._identity import SandboxResourceIdentity
+
+        resource = (
+            None if owner_key is None else SandboxResourceIdentity.from_key(owner_key)
+        )
         diagnostic: dict[str, str] = {}
         if sandbox_id is not None:
             diagnostic["sandbox_id"] = sandbox_id
@@ -248,7 +253,8 @@ class _LifecycleNotifications:
         event = OpenSandboxLifecycleEvent(
             event_id=uuid4().hex,
             type=kind,
-            owner_key=owner_key,
+            owner_key=None if resource is None else resource.key,
+            namespace=None if resource is None else resource.namespace,
             occurred_at=datetime.now(UTC),
             reason=reason,
             workspace_may_have_changed=workspace_may_have_changed,

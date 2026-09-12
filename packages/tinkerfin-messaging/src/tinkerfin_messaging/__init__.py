@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Never
 
-from ._messaging_transition import (
-    resolve_messaging_transition as resolve_messaging_transition,
-)
 from .backend import ActiveRunStatus as ActiveRunStatus
 from .backend import FailedRunStatus as FailedRunStatus
 from .backend import FinalRunStatus as FinalRunStatus
@@ -15,31 +12,6 @@ from .backend import RunStatus as RunStatus
 from .backend import is_active_run_status as is_active_run_status
 from .backend import is_failed_run_status as is_failed_run_status
 from .backend import is_final_run_status as is_final_run_status
-from .backend_contract import CommittedMessagePage as CommittedMessagePage
-from .backend_contract import CommittedMessageQuery as CommittedMessageQuery
-from .backend_contract import MessagingBackend as MessagingBackend
-from .backend_contract import MessagingBackendSettings as MessagingBackendSettings
-from .backend_contract import MessagingChangeCursor as MessagingChangeCursor
-from .backend_contract import MessagingChangeWait as MessagingChangeWait
-from .backend_contract import MessagingCleanupReason as MessagingCleanupReason
-from .backend_contract import MessagingLeaseAction as MessagingLeaseAction
-from .backend_contract import MessagingRetentionAction as MessagingRetentionAction
-from .backend_contract import MessagingRunReference as MessagingRunReference
-from .backend_contract import MessagingStateQuery as MessagingStateQuery
-from .backend_contract import MessagingStateSnapshot as MessagingStateSnapshot
-from .backend_contract import MessagingStorageEffect as MessagingStorageEffect
-from .backend_contract import MessagingStreamDisposition as MessagingStreamDisposition
-from .backend_contract import MessagingTransition as MessagingTransition
-from .backend_contract import MessagingTransitionKind as MessagingTransitionKind
-from .backend_contract import MessagingTransitionResult as MessagingTransitionResult
-from .backend_contract import StoredMessageEvidence as StoredMessageEvidence
-from .backend_contract import StoredMessagingChannel as StoredMessagingChannel
-from .backend_contract import StoredMessagingRun as StoredMessagingRun
-from .backend_contract import StoredMessagingStream as StoredMessagingStream
-from .backend_contract import StreamGenerationPurge as StreamGenerationPurge
-from .backend_contract import (
-    StreamGenerationPurgeResult as StreamGenerationPurgeResult,
-)
 from .errors import BackendOwnershipLost as BackendOwnershipLost
 from .errors import CancellationUnsupported as CancellationUnsupported
 from .errors import CodecMismatch as CodecMismatch
@@ -99,6 +71,7 @@ if TYPE_CHECKING:
     from .native import NativeStreamPart as NativeStreamPart
     from .native import NativeStreamPartCodec as NativeStreamPartCodec
     from .redis import RedisBackend as RedisBackend
+    from .sqlalchemy import SqlAlchemyBackend as SqlAlchemyBackend
 
 __all__ = [
     "ActiveRunStatus",
@@ -110,8 +83,6 @@ __all__ = [
     "CancellationUnsupported",
     "CodecMismatch",
     "CommittedCallback",
-    "CommittedMessagePage",
-    "CommittedMessageQuery",
     "DecodedMessage",
     "DeferredMessageSource",
     "FailedRunStatus",
@@ -129,33 +100,18 @@ __all__ = [
     "MessageSourceBinding",
     "MessageSubscription",
     "Messaging",
-    "MessagingBackend",
     "MessagingBackendError",
     "MessagingBackendProtocolError",
-    "MessagingBackendSettings",
     "MessagingBackendTimeout",
     "MessagingBackendUnavailable",
-    "MessagingChangeCursor",
-    "MessagingChangeWait",
-    "MessagingCleanupReason",
     "MessagingClosed",
     "MessagingError",
     "MessagingErrorCode",
-    "MessagingLeaseAction",
     "MessagingLimits",
     "MessagingNotStarted",
     "MessagingQuotaExceeded",
-    "MessagingRetentionAction",
     "MessagingRetentionPolicy",
-    "MessagingRunReference",
     "MessagingSettlementTimeout",
-    "MessagingStateQuery",
-    "MessagingStateSnapshot",
-    "MessagingStorageEffect",
-    "MessagingStreamDisposition",
-    "MessagingTransition",
-    "MessagingTransitionKind",
-    "MessagingTransitionResult",
     "NativeStreamPart",
     "NativeStreamPartCodec",
     "ProfiledDeferredMessageSource",
@@ -171,17 +127,12 @@ __all__ = [
     "RunProducerFailed",
     "RunStatus",
     "SourceProfileMismatch",
+    "SqlAlchemyBackend",
     "SseRenderer",
     "SseRenderingUnsupported",
-    "StoredMessageEvidence",
-    "StoredMessagingChannel",
-    "StoredMessagingRun",
-    "StoredMessagingStream",
     "StreamDeleteConflict",
     "StreamDeleted",
     "StreamExpired",
-    "StreamGenerationPurge",
-    "StreamGenerationPurgeResult",
     "UnexpectedMessagingBackendError",
     "create_agui_run_source",
     "is_active_run_status",
@@ -189,7 +140,6 @@ __all__ = [
     "is_final_run_status",
     "map_source",
     "parse_sse_event_id",
-    "resolve_messaging_transition",
 ]
 
 
@@ -255,4 +205,16 @@ def __getattr__(name: str) -> object:
 
         globals()[name] = RedisBackend
         return RedisBackend
+    if name == "SqlAlchemyBackend":
+        try:
+            from .sqlalchemy import SqlAlchemyBackend
+        except ModuleNotFoundError as error:
+            _raise_missing_extra(
+                error,
+                symbol=name,
+                extra="sqlalchemy",
+                packages=("sqlalchemy", "tinkerfin_sqlalchemy"),
+            )
+        globals()[name] = SqlAlchemyBackend
+        return SqlAlchemyBackend
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

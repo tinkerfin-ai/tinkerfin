@@ -61,7 +61,7 @@ def _native(interrupt_id: str, value: object) -> AgentRuntimeInterrupt:
 
 def test_runtime_interrupt_maps_to_ag_ui_and_resumes_without_tool_ids() -> None:
     adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     )
     events = adapter.process(
         {
@@ -203,7 +203,7 @@ def test_unknown_runtime_interrupt_contract_fails_closed() -> None:
 
 def test_persisted_runtime_response_schema_cannot_change_before_resume() -> None:
     adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     )
     adapter.process(
         {

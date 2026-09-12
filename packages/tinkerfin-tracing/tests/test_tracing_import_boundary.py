@@ -49,16 +49,17 @@ def test_distribution_declares_only_contracts_and_pydantic() -> None:
     requirements = set(metadata.requires or ())
     assert {item for item in requirements if "extra ==" not in item} == {
         "pydantic<3,>=2.12",
-        "tinkerfin-contracts<0.9.0,>=0.1.0",
+        "tinkerfin-contracts==0.1.0",
     }
-    assert 'aiosqlite<0.23,>=0.22; extra == "sqlite"' in requirements
-    assert 'sqlalchemy[asyncio]==2.0.52; extra == "sqlite"' in requirements
-    assert 'asyncmy==0.2.14; extra == "mysql"' in requirements
-    assert 'sqlalchemy[asyncio]==2.0.52; extra == "mysql"' in requirements
+    assert 'sqlalchemy[asyncio]==2.0.52; extra == "sqlalchemy"' in requirements
+    assert 'tinkerfin-sqlalchemy==0.1.0; extra == "sqlalchemy"' in requirements
+    assert not any(
+        item.startswith(("aiosqlite", "asyncmy", "asyncpg")) for item in requirements
+    )
     assert files("tinkerfin_tracing").joinpath("py.typed").is_file()
 
 
-def test_missing_sql_extra_reports_both_supported_install_choices() -> None:
+def test_missing_sql_extra_reports_the_sqlalchemy_install_choice() -> None:
     repository = Path(__file__).resolve().parents[3]
     script = """
 import importlib.abc
@@ -87,5 +88,4 @@ else:
         text=True,
     )
 
-    assert "tinkerfin-tracing[sqlite]" in completed.stdout
-    assert "tinkerfin-tracing[mysql]" in completed.stdout
+    assert "tinkerfin-tracing[sqlalchemy]" in completed.stdout

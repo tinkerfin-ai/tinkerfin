@@ -14,30 +14,33 @@ subscription = await channel.wrap(
 
 Before returning, `wrap()` atomically decides whether this caller owns a new producer or attaches an existing run. A different active run in the same thread raises `RunAlreadyActive`; a different persisted format raises `CodecMismatch`.
 
-`runId` is the idempotency key. Messaging neither reads nor stores a business request digest.
+`run_id` identifies an idempotent run within its namespace and thread. Messaging neither reads nor stores a business request digest.
 
 ## Return SSE directly
 
 ```python
+from starlette.responses import StreamingResponse
 from tinkerfin_messaging import parse_sse_event_id
 
 
-body = await channel.sse(
+body = await channel.open_sse(
     source,
     identity=identity,
     after=lambda: parse_sse_event_id(request.headers.get("Last-Event-ID")),
-    on_source_ready=activate_business_run,
-    on_delivery_not_started=cleanup_business_run,
 )
+return StreamingResponse(body, media_type="text/event-stream")
 ```
 
 The resolver runs once before durable preparation. `parse_sse_event_id()` accepts only
 canonical non-negative ASCII decimal values. Committed sequence numbers become SSE IDs.
 
-`on_source_ready` runs once for a new owner after the request-owned source is ready and
+Optional `on_source_ready` runs once for a new owner after the request-owned source is ready and
 before producer creation. `on_delivery_not_started` runs only when readiness was not
 reached and no attachment was established. Attachments invoke neither callback. The
 returned body is caller-owned and must be closed when it will not be consumed.
+
+The same byte body can be sent with `EventSourceResponse(body)`. See
+[Streams and SSE](../runtime/streams-and-sse.md) for HTTP cleanup requirements.
 
 When a valid attachment is established, Messaging closes the unused single-use
 candidate source without opening it. The candidate cannot be reused.
@@ -78,7 +81,7 @@ status = await channel.get_run_status(identity=identity)
 | `follow()` | selected run | Replay, then wait for its terminal state |
 | `get_run_status()` | selected run | Current durable run status without ownership |
 
-Thread-level methods use `identity.threadId`, but still accept the complete RunIdentity so extensions never flatten thread and run into separate parameters.
+Thread-level methods select the complete `(namespace, thread_id)` and accept a `RunIdentity`. Run-level operations also select `run_id`.
 
 `get_run_status()` can atomically archive an expired producer lease as `owner_lost`.
 It raises `RunNotFound` when no durable record exists and never creates or recovers a
@@ -89,15 +92,13 @@ producer.
 | Field | Purpose |
 | --- | --- |
 | `channel` | Codec namespace |
-| `identity` | Nested threadId and runId |
+| `identity` | Complete namespace, thread_id and run_id |
 | `seq` | Thread-level committed position |
-| `messageId` | Stable message idempotency ID |
+| `message_id` | Stable message idempotency ID |
 | `codec` | Persisted format ID |
 | `payload` | Encoded bytes |
-| `createdAt` | UTC time allocated on first commit |
+| `created_at` | UTC time allocated on first commit |
 
-Messaging stores one current envelope shape. Rebuild records before deploying an
-incompatible application-owned format; runtime decoding does not negotiate formats.
 
 ## Observe owner commits
 
@@ -121,6 +122,6 @@ Attachments do not re-notify old commits. Observer failures are logged without c
 await channel.delete_stream(identity=identity)
 ```
 
-Deletion covers the entire threadId. An active producer raises `StreamDeleteConflict`; a missing stream is an idempotent success. Recreating the thread uses a new generation, and old handles can no longer read or mutate it.
+Deletion covers the complete `(namespace, thread_id)`. A live producer lease raises `StreamDeleteConflict`; an expired lease permits deletion. A missing stream is an idempotent success. Recreating the thread allocates a new generation; old handles retain their deletion error.
 
 Next: [Cancellation, deferred sources, and recovery](cancellation-and-recovery.md).

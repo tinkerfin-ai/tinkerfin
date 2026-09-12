@@ -302,7 +302,7 @@ async def test_generated_image_tool_preserves_actual_format_and_typed_result(
     )
     assert isinstance(result, ToolMessage)
     adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="generated", runId="run")
+        identity=RunIdentity(namespace="test", thread_id="generated", run_id="run")
     )
     events = adapter.process(
         {

@@ -361,7 +361,7 @@ function TraceDetails({
                 <div><dt>{t('类型')}</dt><dd>{traceKindLabel(entry.kind, t)}</dd></div>
                 <div><dt>{t('节点 ID')}</dt><dd>{entry.id}</dd></div>
                 <div><dt>{t('运行 ID')}</dt><dd>{entry.runId}</dd></div>
-                <div><dt>{t('图范围')}</dt><dd>{entry.namespace.length ? entry.namespace.join(' / ') : t('根图')}</dd></div>
+                <div><dt>{t('图范围')}</dt><dd>{entry.graphNamespace.length ? entry.graphNamespace.join(' / ') : t('根图')}</dd></div>
                 {entry.provider && <div><dt>{t('提供方')}</dt><dd>{entry.provider}</dd></div>}
                 {entry.model && <div><dt>{t('模型')}</dt><dd>{entry.model}</dd></div>}
                 {entry.kind === 'tool' && <div><dt>{t('工具')}</dt><dd>{entry.name}</dd></div>}

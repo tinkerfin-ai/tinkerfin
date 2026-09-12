@@ -12,7 +12,7 @@ from tinkerfin_messaging import MemoryBackend, MessageEnvelope, Messaging
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="stream-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="stream-1", run_id="run-1")
 
 
 class _TextCodec:
@@ -81,7 +81,7 @@ async def test_on_committed_receives_authoritative_envelopes_only_from_owner() -
 
     async with Messaging(backend=backend) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             _TrackedSource("one", "two"),
             identity=_identity(),
             after=0,
@@ -90,7 +90,7 @@ async def test_on_committed_receives_authoritative_envelopes_only_from_owner() -
         first_frames = await _collect(body)
 
         unused = _TrackedSource("unused")
-        replay = await channel.sse(
+        replay = await channel.open_sse(
             unused,
             identity=_identity(),
             after=0,
@@ -121,7 +121,7 @@ async def test_blocked_on_committed_keeps_first_sse_frame_available() -> None:
 
     async with Messaging(backend=MemoryBackend()) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             source,
             identity=_identity(),
             after=0,
@@ -148,7 +148,7 @@ async def test_on_committed_failure_is_logged_without_failing_the_run(
     caplog.set_level(logging.ERROR, logger="tinkerfin.messaging")
     async with Messaging(backend=MemoryBackend()) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             _TrackedSource("secret-payload"),
             identity=_identity(),
             after=0,
@@ -156,7 +156,7 @@ async def test_on_committed_failure_is_logged_without_failing_the_run(
         )
         assert await _collect(body) == [b"id: 1\ndata: secret-payload\n\n"]
 
-        replay = await channel.sse(
+        replay = await channel.open_sse(
             _TrackedSource("unused"),
             identity=_identity(),
             after=0,
@@ -195,7 +195,7 @@ async def test_on_committed_observes_the_accepted_cancellation_tail() -> None:
 
     async with Messaging(backend=MemoryBackend()) as messaging:
         channel = messaging.channel(name="events", codec=_TextCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             source,
             identity=_identity(),
             after=0,

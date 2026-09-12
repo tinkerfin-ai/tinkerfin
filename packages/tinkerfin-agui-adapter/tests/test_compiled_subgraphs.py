@@ -36,7 +36,7 @@ class _InterruptChildState(_State, total=False):
 
 
 def _identity(*, run_id: str = "run-1") -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
 
 
 def _increment(state: _State) -> dict[str, int]:
@@ -166,7 +166,7 @@ async def test_ordinary_compiled_subgraph_uses_graph_scope_not_subagent_identity
     for event in child_values:
         provenance = event.event["provenance"]
         assert provenance["kind"] == "compiled_subgraph"
-        assert provenance["namespace"][0].startswith("execute_step:")
+        assert provenance["graphNamespace"][0].startswith("execute_step:")
         assert "agentType" not in provenance
 
     task_events = [
@@ -197,7 +197,7 @@ async def test_nested_compiled_subgraphs_keep_complete_task_provenance() -> None
     nested = [
         event
         for event in task_events
-        if len(event.event["provenance"]["namespace"]) == 2
+        if len(event.event["provenance"]["graphNamespace"]) == 2
     ]
     phases: list[object] = []
     for event in nested:
@@ -207,8 +207,8 @@ async def test_nested_compiled_subgraphs_keep_complete_task_provenance() -> None
         provenance = event.event["provenance"]
         assert provenance["kind"] == "compiled_subgraph"
         assert provenance["nodeName"] == "middle"
-        assert provenance["namespace"][0].startswith("outer:")
-        assert provenance["namespace"][1].startswith("middle:")
+        assert provenance["graphNamespace"][0].startswith("outer:")
+        assert provenance["graphNamespace"][1].startswith("middle:")
         assert "agentType" not in provenance
     assert phases == ["start", "result"]
 
@@ -398,7 +398,7 @@ def test_same_interrupt_id_in_unrelated_child_scopes_is_rejected() -> None:
         )
 
 
-def test_root_values_rejects_a_missing_child_interrupt() -> None:
+def test_stream_completion_rejects_a_missing_child_interrupt() -> None:
     adapter = DeepAgentAgUiAdapter(identity=_identity())
     adapter.process(_ordinary_task_start(node="child", task_id="task-1"))
     adapter.process(
@@ -409,15 +409,16 @@ def test_root_values_rejects_a_missing_child_interrupt() -> None:
         )
     )
 
-    with pytest.raises(ValueError, match="did not propagate child interrupts"):
-        adapter.process(
-            {
-                "type": "values",
-                "ns": (),
-                "data": {"root_state": True},
-                "interrupts": (),
-            }
-        )
+    adapter.process(
+        {
+            "type": "values",
+            "ns": (),
+            "data": {"root_state": True},
+            "interrupts": (),
+        }
+    )
+    with pytest.raises(ValueError, match="not propagated by root values"):
+        adapter.finish()
 
 
 def test_exact_child_and_root_interrupt_replays_are_idempotent() -> None:
@@ -695,5 +696,32 @@ def test_nested_child_interrupt_propagates_through_ancestor_and_root_once() -> N
     assert isinstance(metadata, Mapping)
     source = metadata.get("source")
     assert isinstance(source, Mapping)
-    assert source["namespace"] == list(inner_namespace)
+    assert source["graphNamespace"] == list(inner_namespace)
     assert adapter.finish() == []
+
+
+@pytest.mark.parametrize("shared_scope", [False, True])
+def test_parallel_interrupt_batches_accumulate_until_stream_completion(
+    shared_scope: bool,
+) -> None:
+    adapter = DeepAgentAgUiAdapter(identity=_identity())
+    adapter.process(_ordinary_task_start(node="first", task_id="task-1"))
+    if not shared_scope:
+        adapter.process(_ordinary_task_start(node="second", task_id="task-2"))
+    first = _generic_interrupt_part(
+        namespace=("first:task-1",), interrupt_id="first", value={"kind": "first"}
+    )
+    second = _generic_interrupt_part(
+        namespace=("first:task-1",) if shared_scope else ("second:task-2",),
+        interrupt_id="second",
+        value={"kind": "second"},
+    )
+    adapter.process(first)
+    adapter.process(second)
+    adapter.process({**first, "ns": (), "data": {"messages": []}})
+    adapter.process({**second, "ns": (), "data": {"messages": []}})
+    adapter.finish()
+    assert [pending.id for pending in adapter.main_outcome().interrupts] == [
+        "first",
+        "second",
+    ]

@@ -31,7 +31,7 @@ const consumeConfirmedGroup = ({
     [{
       type: 'TOOL_CALL_START',
       rawEvent: {
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId,
       },
       toolCallId,
@@ -41,7 +41,7 @@ const consumeConfirmedGroup = ({
     [{
       type: 'TOOL_CALL_RESULT',
       rawEvent: {
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId,
         toolResultStatus: 'success',
       },
@@ -53,7 +53,7 @@ const consumeConfirmedGroup = ({
     [{
       type: 'STATE_SNAPSHOT',
       rawEvent: {
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId,
       },
       snapshot: { todos: [{ id: todoId, content: preview, status: 'in_progress' }] },
@@ -138,7 +138,7 @@ describe('todo group contracts', () => {
       [{
         type: 'TOOL_CALL_START',
         rawEvent: {
-          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
           runId: 'run-3',
         },
         toolCallId: 'tool-2',
@@ -148,7 +148,7 @@ describe('todo group contracts', () => {
       [{
         type: 'TOOL_CALL_RESULT',
         rawEvent: {
-          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
           runId: 'run-3',
           toolResultStatus: 'success',
         },
@@ -160,7 +160,7 @@ describe('todo group contracts', () => {
       [{
         type: 'STATE_SNAPSHOT',
         rawEvent: {
-          source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+          source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
           runId: 'run-3',
         },
         snapshot: { todos: [{ id: 'todo-2', content: '第二轮任务', status: 'in_progress' }] },
@@ -264,7 +264,7 @@ describe('todo group contracts', () => {
     projector.consume(parseConversationAgUiEvent({
       type: 'STATE_SNAPSHOT',
       rawEvent: {
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [] },
         runId: 'run-3',
       },
       snapshot: { todos: [{ id: 'todo-2', content: '第二轮任务', status: 'completed' }] },

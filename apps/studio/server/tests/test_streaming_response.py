@@ -175,8 +175,10 @@ async def test_native_trace_response_settles_wrapped_mysql_follow_before_return(
         pool_size=1,
         max_overflow=0,
     )
-    identity = RunIdentity(threadId="trace-response-thread", runId="trace-response-run")
-    store = SqlAlchemyTraceStore(engine, namespace="native-trace-response")
+    identity = RunIdentity(
+        namespace="test", thread_id="trace-response-thread", run_id="trace-response-run"
+    )
+    store = SqlAlchemyTraceStore(engine)
     await store.setup()
     writer = await store.open_writer(identity)
     now = datetime.now(UTC)
@@ -202,7 +204,7 @@ async def test_native_trace_response_settles_wrapped_mysql_follow_before_return(
     trace = await Tracer(
         projections=(ConversationFailureProjection(),), store=store
     ).get(
-        identity.thread_id,
+        identity.thread,
         head_run_id=identity.run_id,
     )
     updates = trace.follow()

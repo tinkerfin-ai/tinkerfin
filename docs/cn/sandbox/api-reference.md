@@ -58,8 +58,7 @@ Client 使用 OpenSandbox SDK 0.1.16 和官方 Server 0.2.3。下表方法均为
 
 Client 禁用 SDK 隐式的 transport 重试。显式设置的 `ConnectionConfig.retry_policy` 会保留，
 但启用 POST/PATCH 响应失败重放的配置会被 `ValueError` 拒绝。调用方传入的 transport 保留自身策略和
-所有权。SDK 创建遥测的后台任务无法在 Client 关闭时等待结束，因此托管配置副本禁用该遥测。
-调用方配置、headers 和环境变量不会被修改。
+所有权；调用方配置、headers 和环境变量不会被修改。
 
 初始化函数接收 `OpenSandboxBackend`，可以返回可等待对象或 `None`。I/O 应使用原生异步回调；
 同步回调直接在事件循环执行，必须保持非阻塞，Client 不会把它移入线程。连接和初始化共用
@@ -69,7 +68,9 @@ Client 禁用 SDK 隐式的 transport 重试。显式设置的 `ConnectionConfig
 
 ## Manager
 
-`OpenSandboxManager` 的构造参数和操作见 [Sandbox 生命周期](lifecycle.md)。`build_agent_middleware(backend, permissions=None)` 返回可直接传给 Deep Agents 的 middleware 元组。
+`OpenSandboxManager` 的构造参数和操作见 [Sandbox 生命周期](lifecycle.md)。
+`workspace(key)` 返回供 `TinkerFin.build(backend=...)` 使用的惰性声明。
+`build_agent_middleware(...)` 只用于由调用方管理的 Deep Agents Graph。
 
 `pause(key, timeout=30.0)` 在全部登记的持有者完成工作、且远端暂停已确认后返回 `None`。
 `resume(key, timeout=30.0)` 返回同一实例的可用 backend。两者的工作预算均以秒计，必须为正有限数值。
@@ -124,7 +125,7 @@ Manager 通过 `observers=()` 和 `notification_options=None` 配置通知。事
 | --- | --- |
 | `OpenSandboxState` | 自定义绑定、租约、预热池、可用状态、持有者协调和清理协议 |
 | `InMemoryOpenSandboxState(namespace="")` | 当前进程内状态 |
-| `SQLAlchemyOpenSandboxState(...)` | SQLite 或 MySQL 共享状态 |
+| `SQLAlchemyOpenSandboxState(...)` | 借用 `engine` 保存 SQLite、MySQL 或 PostgreSQL 共享状态 |
 | `get_sqlalchemy_opensandbox_state_schema(dialect=...)` | 生成完整建表 SQL |
 | `SQLAlchemyOpenSandboxStateSchema` | 不可变的 dialect、table names 和 DDL |
 

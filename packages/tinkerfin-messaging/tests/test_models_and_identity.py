@@ -23,7 +23,9 @@ from tinkerfin_messaging import (
 def _envelope(**changes: object) -> MessageEnvelope:
     values: dict[str, object] = {
         "channel": "events",
-        "identity": RunIdentity(threadId="conversation-1", runId="run-1"),
+        "identity": RunIdentity(
+            namespace="test", thread_id="conversation-1", run_id="run-1"
+        ),
         "seq": 1,
         "message_id": "run-1:1",
         "codec": "test.bytes.v1",
@@ -127,7 +129,9 @@ def test_envelope_rejects_identifiers_over_1024_characters(field: str) -> None:
 
 def test_envelope_rejects_unbounded_or_extra_identity_fields() -> None:
     with pytest.raises(ValidationError, match="at most 1024"):
-        _envelope(identity=RunIdentity(threadId="x" * 1025, runId="run-1"))
+        _envelope(
+            identity=RunIdentity(namespace="test", thread_id="x" * 1025, run_id="run-1")
+        )
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         _envelope(
             identity={

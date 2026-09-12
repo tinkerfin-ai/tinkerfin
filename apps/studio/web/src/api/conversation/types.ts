@@ -74,10 +74,10 @@ export interface ChatRequestPayload {
 
 interface EventSourceInfoBase {
   kind: "root" | "compiled_subgraph" | "deep_agent_subagent"
-  namespace: string[]
+  graphNamespace: string[]
   graphTaskId?: string | null
   nodeName?: string | null
-  parentNamespace?: string[] | null
+  parentGraphNamespace?: string[] | null
   parentToolCallId?: string | null
   subagentInput?: string | null
   subagentInvocationId?: string | null

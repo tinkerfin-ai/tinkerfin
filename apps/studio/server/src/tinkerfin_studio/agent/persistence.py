@@ -9,10 +9,15 @@ from typing import NoReturn, Self
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langgraph.store.base import BaseStore
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tinkerfin_langgraph_mysql import AsyncMyStore
-from tinkerfin_studio.config.settings import DatabaseSettings, RedisRuntimeSettings
+from tinkerfin_langgraph_store import SqlAlchemyStore
+from tinkerfin_studio.config.settings import RedisRuntimeSettings
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
+from tinkerfin_studio.infrastructure.redis_keys import (
+    CHECKPOINT_KEY_PREFIX,
+    CHECKPOINT_WRITE_KEY_PREFIX,
+)
 
 
 def _cleanup_failure(failures: tuple[BaseException, ...]) -> BaseException:
@@ -70,9 +75,9 @@ class _PersistenceResources:
 
     async def enter_store(
         self,
-        resource: AbstractAsyncContextManager[AsyncMyStore],
-    ) -> AsyncMyStore:
-        """进入 Store connection 并立即登记退出回调"""
+        resource: AbstractAsyncContextManager[SqlAlchemyStore],
+    ) -> SqlAlchemyStore:
+        """进入长期记忆 Store 并登记关闭回调"""
 
         store = await resource.__aenter__()
 
@@ -122,18 +127,18 @@ class AgentPersistence:
 
     def __init__(
         self,
-        database: DatabaseSettings,
+        engine: AsyncEngine,
         redis: RedisRuntimeSettings,
     ) -> None:
-        self._database_settings = database
+        self._engine = engine
         self._redis_settings = redis
         self._resources: _PersistenceResources | None = None
-        self._store: AsyncMyStore | None = None
+        self._store: SqlAlchemyStore | None = None
         self._checkpointer: AsyncRedisSaver | None = None
 
     @property
     def store(self) -> BaseStore:
-        """返回生命周期内可用的 MySQL Store"""
+        """返回生命周期内可用的长期记忆 Store"""
 
         if self._store is None:
             raise RuntimeError("Agent Store 尚未启动")
@@ -148,14 +153,14 @@ class AgentPersistence:
         return self._checkpointer
 
     async def __aenter__(self) -> Self:
-        """初始化单条 Store connection、Runtime Redis client 和 checkpoint 索引"""
+        """初始化长期记忆 Store 与会话恢复索引"""
 
         if self._resources is not None:
             raise RuntimeError("Agent persistence 已经启动")
         resources = _PersistenceResources()
         try:
-            # Store 集成负责 URL、当前 DDL 与连接清理，Studio 只提供宿主配置
-            store_resource = AsyncMyStore.from_conn_string(self._database_settings.url)
+            # 长期记忆与业务查询共用连接池，Store 负责建表校验和本次借用
+            store_resource = SqlAlchemyStore(self._engine)
             store = await resources.enter_store(store_resource)
             checkpoint_redis = create_redis_client(
                 self._redis_settings,
@@ -165,8 +170,8 @@ class AgentPersistence:
             resources.own_redis(checkpoint_redis)
             checkpointer = AsyncRedisSaver(
                 redis_client=checkpoint_redis,
-                checkpoint_prefix=self._redis_settings.checkpoint_prefix,
-                checkpoint_write_prefix=self._redis_settings.checkpoint_write_prefix,
+                checkpoint_prefix=CHECKPOINT_KEY_PREFIX,
+                checkpoint_write_prefix=CHECKPOINT_WRITE_KEY_PREFIX,
             )
             await checkpointer.asetup()
         except BaseException as error:
@@ -193,7 +198,7 @@ class AgentPersistence:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """完整结算 Redis client 与 MySQL Store connection"""
+        """关闭会话恢复连接，并等待长期记忆操作结束"""
 
         resources = self._resources
         if resources is None:

@@ -38,14 +38,14 @@ from langchain_core.tools import BaseTool, tool
 from langgraph.config import get_stream_writer
 
 from tinkerfin import (
-    DeepAgentDefinition,
-    NativeGraphRunStream,
+    AgentRuntime,
+    NativeRunStream,
     RunIdentity,
     TinkerFin,
 )
+from tinkerfin_contracts import AgentRunPreparation
 from tinkerfin_messaging import (
     MessageCodecInputSource,
-    MessageSource,
     MessageSubscription,
     Messaging,
     NativeStreamPart,
@@ -58,7 +58,7 @@ def _identity(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 def _run_agent_input(identity: RunIdentity) -> RunAgentInput:
@@ -103,6 +103,9 @@ class _ToolBindingFakeModel(FakeMessagesListChatModel):
 
 class _RejectedAgUiSource:
     messaging_cancel_waits_for_first_item = True
+    messaging_codec_profile = "agui.event"
+    messaging_source_type = BaseEvent
+    messaging_replay_type = BaseEvent
 
     def __init__(self, *, close_error: BaseException) -> None:
         self.messaging_identity = _identity(
@@ -131,6 +134,9 @@ class _RejectedAgUiSource:
 
 class _StaticAgUiSource:
     messaging_cancel_waits_for_first_item = True
+    messaging_codec_profile = "agui.event"
+    messaging_source_type = BaseEvent
+    messaging_replay_type = BaseEvent
 
     def __init__(self, identity: RunIdentity, event: BaseEvent) -> None:
         self.messaging_identity = identity
@@ -166,7 +172,7 @@ async def _events(
     return [message.data async for message in subscription]
 
 
-def _definition(*, custom: bool = False) -> DeepAgentDefinition[None]:
+def _definition(*, custom: bool = False) -> AgentRuntime[None]:
     model = _ToolBindingFakeModel(
         responses=[
             *(
@@ -189,18 +195,22 @@ def _definition(*, custom: bool = False) -> DeepAgentDefinition[None]:
             AIMessage(content="answer"),
         ]
     )
-    return TinkerFin().create_deep_agent(
-        model=model,
-        tools=[_emit_progress] if custom else [],
-        system_prompt="Answer briefly.",
+    return (
+        TinkerFin()
+        .with_namespace("test")
+        .build(
+            model=model,
+            tools=[_emit_progress] if custom else [],
+            system_prompt="Answer briefly.",
+        )
     )
 
 
 async def test_agui_stream_is_a_directly_iterable_message_source() -> None:
-    events = (
-        _definition()
-        .new_agui(identity=_identity())
-        .astream(InputAgentState(messages=[HumanMessage(content="AG-UI")]))
+    events = _definition().open_agui_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
+        input=InputAgentState(messages=[HumanMessage(content="AG-UI")]),
     )
 
     aiter(events)
@@ -213,14 +223,15 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
     async with Messaging() as messaging:
         native_channel = messaging.channel(name="native-events")
         native_identity = _identity(thread_id="native-thread", run_id="native-run")
-        native_source = definition.new(identity=native_identity).astream(
-            InputAgentState(messages=[HumanMessage(content="Native")]),
+        native_source = definition.open_run(
+            thread_id=native_identity.thread_id,
+            run_id=native_identity.run_id,
+            input=InputAgentState(messages=[HumanMessage(content="Native")]),
             stream_mode=("messages", "tasks", "values"),
-            subgraphs=True,
         )
-        assert isinstance(native_source, NativeGraphRunStream)
+        assert isinstance(native_source, NativeRunStream)
         assert isinstance(native_source, MessageCodecInputSource)
-        assert native_source.messaging_identity is native_identity
+        assert native_source.messaging_identity == native_identity
         assert native_source.messaging_codec_profile == "tinkerfin.native-stream"
         assert native_source.messaging_source_type is Mapping
         assert native_source.messaging_codec_input_type is NativeStreamPart
@@ -232,10 +243,12 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
 
         agui_channel = messaging.channel(name="agui-events")
         agui_identity = _identity(thread_id="agui-thread")
-        event_source = definition.new_agui(identity=agui_identity).astream(
-            InputAgentState(messages=[HumanMessage(content="AG-UI")])
+        event_source = definition.open_agui_run(
+            thread_id=agui_identity.thread_id,
+            run_id=agui_identity.run_id,
+            input=InputAgentState(messages=[HumanMessage(content="AG-UI")]),
         )
-        assert event_source.messaging_identity is agui_identity
+        assert event_source.messaging_identity == agui_identity
         assert event_source.messaging_codec_profile == "agui.event"
         agui = await agui_channel.wrap(
             event_source,
@@ -251,51 +264,55 @@ async def test_native_and_agui_streams_wrap_without_runtime_parameters() -> None
     assert agui_events[-1].type == "RUN_FINISHED"
 
 
-async def test_agui_run_source_opens_only_the_selected_owner() -> None:
-    tinkerfin = TinkerFin()
-    definition = tinkerfin.create_deep_agent(
-        model=_ToolBindingFakeModel(responses=[AIMessage(content="answer")]),
-        tools=[],
-    )
-    identity = _identity(thread_id="managed-thread", run_id="managed-run")
-    opened: list[RunIdentity] = []
+async def test_agui_run_source_prepares_only_the_selected_owner() -> None:
+    prepared: list[RunIdentity] = []
     transformed: list[str] = []
 
-    async def open_events(run_identity: RunIdentity):
-        assert run_identity is identity
-        opened.append(run_identity)
-        return await tinkerfin.open_agui_run(
-            run_identity,
-            agent=definition,
-            input=InputAgentState(messages=[HumanMessage(content="AG-UI")]),
+    async def prepare_tools(run: AgentRunPreparation[None]) -> list[BaseTool]:
+        prepared.append(run.identity)
+        return []
+
+    definition = (
+        TinkerFin()
+        .with_namespace("test")
+        .build(
+            model=_ToolBindingFakeModel(responses=[AIMessage(content="answer")]),
+            prepare_tools=prepare_tools,
         )
+    )
+    identity = _identity(thread_id="managed-thread", run_id="managed-run")
 
     async def transform_event(event: BaseEvent) -> BaseEvent:
         transformed.append(event.type.value)
         return event
 
     source = create_agui_run_source(
-        identity,
-        open_events=open_events,
+        definition.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=InputAgentState(messages=[HumanMessage(content="AG-UI")]),
+        ),
         transform_event=transform_event,
     )
-
-    async def must_not_open(_run_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        raise AssertionError("an attachment must not open a second managed run")
-
     candidate = create_agui_run_source(
-        identity,
-        open_events=must_not_open,
+        definition.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=InputAgentState(messages=[HumanMessage(content="AG-UI")]),
+        ),
+        transform_event=transform_event,
     )
+    assert prepared == []
     async with Messaging() as messaging:
         channel = messaging.channel(name="managed-agui")
         owner = await channel.wrap(source, after=0)
         owner_events = await _events(owner)
+        transformed_before_replay = list(transformed)
         attachment = await channel.wrap(candidate, after=0)
         attachment_events = await _events(attachment)
 
-    assert opened == [identity]
-    assert transformed
+    assert prepared == [identity]
+    assert transformed == transformed_before_replay
     assert owner_events == attachment_events
     assert owner_events[0].type == "RUN_STARTED"
     assert owner_events[-1].type == "RUN_FINISHED"
@@ -471,12 +488,8 @@ async def test_agui_run_source_rejects_protocol_identity_mutation(
     identity = _identity()
     opened = _StaticAgUiSource(identity, event)
 
-    async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        return opened
-
     source = create_agui_run_source(
-        identity,
-        open_events=open_events,
+        opened,
         transform_event=transform,
     )
 
@@ -553,17 +566,13 @@ async def test_agui_run_source_preserves_the_complete_run_input(
     )
     opened = _StaticAgUiSource(identity, event)
 
-    async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        return opened
-
     def change_input(source: BaseEvent) -> BaseEvent:
         assert isinstance(source, RunStartedEvent)
         assert source.input is not None
         return source.model_copy(update={"input": mutate_input(source.input)})
 
     source = create_agui_run_source(
-        identity,
-        open_events=open_events,
+        opened,
         transform_event=change_input,
     )
 
@@ -583,15 +592,11 @@ async def test_agui_run_source_allows_product_metadata_without_identity_changes(
         RunStartedEvent(thread_id=identity.thread_id, run_id=identity.run_id),
     )
 
-    async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        return opened
-
     def add_title(event: BaseEvent) -> BaseEvent:
         return event.model_copy(update={"title": "Product title"})
 
     source = create_agui_run_source(
-        identity,
-        open_events=open_events,
+        opened,
         transform_event=add_title,
     )
 
@@ -618,15 +623,11 @@ async def test_agui_run_source_allows_activity_content_without_replace_changes()
         ),
     )
 
-    async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        return opened
-
     def update_content(event: BaseEvent) -> BaseEvent:
         return event.model_copy(update={"content": {"status": "running"}})
 
     source = create_agui_run_source(
-        identity,
-        open_events=open_events,
+        opened,
         transform_event=update_content,
     )
 
@@ -658,9 +659,6 @@ async def test_agui_run_source_allows_additive_interrupt_product_metadata() -> N
     )
     opened = _StaticAgUiSource(identity, event)
 
-    async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        return opened
-
     def add_product_metadata(source: BaseEvent) -> BaseEvent:
         assert isinstance(source, RunFinishedEvent)
         assert isinstance(source.outcome, RunFinishedInterruptOutcome)
@@ -679,8 +677,7 @@ async def test_agui_run_source_allows_additive_interrupt_product_metadata() -> N
         )
 
     source = create_agui_run_source(
-        identity,
-        open_events=open_events,
+        opened,
         transform_event=add_product_metadata,
     )
 
@@ -724,82 +721,56 @@ async def test_agui_run_source_rejects_events_from_another_run_without_transform
     identity = _identity()
     opened = _StaticAgUiSource(identity, event)
 
-    async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-        return opened
-
-    source = create_agui_run_source(identity, open_events=open_events)
+    source = create_agui_run_source(opened)
 
     with pytest.raises(ValueError, match="RunIdentity"):
         await anext(aiter(source))
 
 
-async def test_agui_run_source_rejects_a_reconstructed_identity() -> None:
+@pytest.mark.parametrize("different_field", [None, "namespace", "thread_id", "run_id"])
+async def test_agui_run_source_compares_complete_identity_values(
+    different_field: str | None,
+) -> None:
     identity = _identity(thread_id="identity-thread", run_id="identity-run")
-    opened = None
+    values = identity.model_dump()
+    if different_field is not None:
+        values[different_field] = "different"
+    reconstructed = RunIdentity.model_validate(values)
+    assert reconstructed is not identity
+    event = RunStartedEvent(
+        thread_id=reconstructed.thread_id, run_id=reconstructed.run_id
+    )
+    opened = _StaticAgUiSource(reconstructed, event)
 
-    async def open_events(_run_identity: RunIdentity):
-        nonlocal opened
-        reconstructed = RunIdentity(
-            threadId=identity.thread_id,
-            runId=identity.run_id,
-        )
-        opened = TinkerFin().failed_agui_run(
-            RuntimeError("unused"),
-            identity=reconstructed,
-        )
-        return opened
-
-    source = create_agui_run_source(identity, open_events=open_events)
-    iterator = aiter(source)
-
-    with pytest.raises(ValueError, match="retain the supplied identity object"):
-        await anext(iterator)
-
-    assert opened is not None
-    with pytest.raises(StopAsyncIteration):
-        await anext(opened)
+    source = create_agui_run_source(opened)
+    assert source.messaging_identity == reconstructed
+    async with Messaging() as messaging:
+        channel = messaging.channel(name="identity-agui")
+        if different_field is None:
+            subscription = await channel.wrap(source, identity=identity)
+            assert await _events(subscription) == [event]
+        else:
+            with pytest.raises(ValueError, match="explicit identity must match"):
+                await channel.wrap(source, identity=identity)
+    await source.aclose()
+    assert opened.closed
 
 
 @pytest.mark.parametrize(
     "error_type",
-    [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+    [asyncio.CancelledError, KeyboardInterrupt, SystemExit, RuntimeError],
 )
-async def test_agui_run_source_propagates_rejected_source_cleanup_control(
+async def test_agui_run_source_preserves_original_cleanup_failure(
     error_type: type[BaseException],
 ) -> None:
-    identity = _identity(thread_id="identity-thread", run_id="identity-run")
-
-    async def open_events(_run_identity: RunIdentity) -> _RejectedAgUiSource:
-        return _RejectedAgUiSource(close_error=error_type("cleanup stopped"))
-
-    source = create_agui_run_source(identity, open_events=open_events)
-
+    error = error_type("cleanup stopped")
+    cause = LookupError("provider cleanup cause")
+    error.__cause__ = cause
+    source = create_agui_run_source(_RejectedAgUiSource(close_error=error))
     with pytest.raises(error_type) as captured:
-        await anext(aiter(source))
-
-    assert any(
-        "source validation also failed" in note
-        for note in getattr(captured.value, "__notes__", ())
-    )
-
-
-async def test_agui_run_source_retains_validation_over_ordinary_cleanup_failure() -> (
-    None
-):
-    identity = _identity(thread_id="identity-thread", run_id="identity-run")
-
-    async def open_events(_run_identity: RunIdentity) -> _RejectedAgUiSource:
-        return _RejectedAgUiSource(close_error=RuntimeError("cleanup failed"))
-
-    source = create_agui_run_source(identity, open_events=open_events)
-
-    with pytest.raises(ValueError) as captured:
-        await anext(aiter(source))
-
-    assert any(
-        "RuntimeError: cleanup failed" in note
-        for note in getattr(captured.value, "__notes__", ())
-    )
+        await source.aclose()
+    assert captured.value is error
+    assert captured.value.__cause__ is cause
 
 
 @tool("emit_progress")
@@ -812,14 +783,11 @@ def _emit_progress(value: int) -> str:
 
 async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
     def native_source(*, run_id: str):
-        return (
-            _definition(custom=True)
-            .new(identity=_identity(thread_id="custom-thread", run_id=run_id))
-            .astream(
-                InputAgentState(messages=[HumanMessage(content="Report progress")]),
-                stream_mode=("messages", "tasks", "values", "custom"),
-                subgraphs=True,
-            )
+        return _definition(custom=True).open_run(
+            thread_id=_identity(thread_id="custom-thread", run_id=run_id).thread_id,
+            run_id=_identity(thread_id="custom-thread", run_id=run_id).run_id,
+            input=InputAgentState(messages=[HumanMessage(content="Report progress")]),
+            stream_mode=("messages", "tasks", "values", "custom"),
         )
 
     direct = [part async for part in native_source(run_id="custom-direct")]
@@ -829,7 +797,7 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
 
     frames = [frame async for frame in native_source(run_id="custom-sse").to_sse()]
     frame_payloads = [
-        json.loads(frame.split("data: ", maxsplit=1)[1]) for frame in frames
+        json.loads(frame.split(b"data: ", maxsplit=1)[1]) for frame in frames
     ]
     assert any(
         payload["type"] == "custom" and payload["data"] == {"progress": 1}
@@ -848,10 +816,12 @@ async def test_real_custom_stream_is_consistent_across_all_consumers() -> None:
 
     events = [
         event
-        async for event in _definition(custom=True)
-        .new_agui(identity=_identity(thread_id="custom-thread", run_id="custom-agui"))
-        .astream(
-            InputAgentState(messages=[HumanMessage(content="Report progress")]),
+        async for event in _definition(custom=True).open_agui_run(
+            thread_id=_identity(
+                thread_id="custom-thread", run_id="custom-agui"
+            ).thread_id,
+            run_id=_identity(thread_id="custom-thread", run_id="custom-agui").run_id,
+            input=InputAgentState(messages=[HumanMessage(content="Report progress")]),
             stream_mode=("messages", "tasks", "values", "custom"),
         )
     ]
@@ -880,17 +850,12 @@ async def test_agui_run_source_accepts_typed_product_fields_and_rejects_changed_
             ),
         )
 
-        async def open_events(_identity: RunIdentity) -> MessageSource[BaseEvent]:
-            return opened
-
         def transform(event: BaseEvent) -> BaseEvent:
             return event.model_copy(
                 update={"runId": "other"} if change_identity else {"label": "Chart"}
             )
 
-        source = create_agui_run_source(
-            identity, open_events=open_events, transform_event=transform
-        )
+        source = create_agui_run_source(opened, transform_event=transform)
         try:
             if change_identity:
                 with pytest.raises(ValueError, match="protocol identity"):

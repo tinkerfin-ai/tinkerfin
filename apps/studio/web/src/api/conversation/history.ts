@@ -42,7 +42,7 @@ export interface TraceMessage {
   id: string
   traceSeq: number
   sourceId?: string | null
-  namespace: string[]
+  graphNamespace: string[]
   runId: string
   role: 'user' | 'assistant' | 'tool' | 'system' | 'other'
   content?: JsonValue | null
@@ -58,7 +58,7 @@ export interface TraceReasoning {
   id: string
   traceSeq: number
   messageId: string
-  namespace: string[]
+  graphNamespace: string[]
   runId: string
   extractor: string
   content?: JsonValue | null
@@ -72,7 +72,7 @@ export interface TraceInteraction {
   id: string
   traceSeq: number
   sourceId: string
-  namespace: string[]
+  graphNamespace: string[]
   runId: string
   kind: string
   toolCallIds: string[]

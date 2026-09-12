@@ -2,7 +2,7 @@
   <img src="apps/studio/web/public/brand/tinkerfin-mark.png" alt="TinkerFin" width="88" />
 </p>
 <h1 align="center">TinkerFin</h1>
-<p align="center"><strong>快速构建可交付的企业智能体应用。</strong></p>
+<p align="center"><strong>构建与交付企业智能体应用。</strong></p>
 <p align="center">
   <a href="README.md">English</a> · <a href="README.cn.md">简体中文</a> ·
   <a href="docs/cn/index.md">Documentation</a> · <a href="docs/cn/quick_start.md">Quick Start</a>
@@ -10,9 +10,11 @@
 <p align="center">
   <a href="docs/cn/runtime/quick_start.md"><img alt="Python 3.11+" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white" /></a>
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/License-Apache--2.0-52617A?style=flat-square" /></a>
-  <a href="https://github.com/tinkerfin-ai/tinkerfin/actions/workflows/packages-quality.yml"><img alt="Package checks" src="https://github.com/tinkerfin-ai/tinkerfin/actions/workflows/packages-quality.yml/badge.svg" /></a>
+  <a href="https://github.com/tinkerfin-ai/tinkerfin-harness/actions/workflows/packages-quality.yml"><img alt="Package checks" src="https://github.com/tinkerfin-ai/tinkerfin-harness/actions/workflows/packages-quality.yml/badge.svg" /></a>
   <a href="docs/cn/index.md"><img alt="Docs: English / 中文" src="https://img.shields.io/badge/Docs-English%20%2F%20中文-2563EB?style=flat-square" /></a>
 </p>
+
+## 项目说明
 
 **TinkerFin 是面向企业业务的智能体应用开发框架。** 围绕任务编排、人机协同、执行追踪与隔离运行，帮助团队将业务流程构建为**可规划、可执行、可追踪、可干预**的智能体应用。
 
@@ -21,7 +23,33 @@
 
 ![Studio 对话、任务清单与报告演示](docs/assets/screenshots/studio-cn.png)
 
-## 框架能力
+## 安装
+
+安装 Python 框架和要使用的模型集成：
+
+```bash
+pip install tinkerfin langchain-openai
+```
+
+Studio 使用 Docker 与 Docker Compose，[Studio 上手指南](docs/cn/studio/quick_start.md)
+说明所需服务和配置。
+
+## 快速开始
+
+### 体验 Studio
+
+通过 Docker Compose 启动后端，再单独启动 Web 客户端。初始账号为 `tinkerfin`，密码为 `123456`；登录后配置自己的模型。
+
+[打开 Studio 上手指南 →](docs/cn/studio/quick_start.md)
+
+### 接入 Python 框架
+
+需要 Python 3.11 或更高版本。配置模型密钥后，通过 `TinkerFin().with_namespace(...).build(...)` 构建
+`AgentRuntime` 并接收执行结果。
+
+[运行第一个智能体 →](docs/cn/runtime/quick_start.md)
+
+## 核心能力
 
 - **按需组合，接入自己的应用** — 按需配置模型、工具、技能和子智能体，组合运行管理、消息传递、执行追踪与沙箱能力。可搭配自己的前端，也可使用 Studio。
 - **先审计划，再执行任务** — Plan 模式先澄清需求、生成计划，经用户确认后交给智能体执行。关键工具操作可单独审批，多步骤任务中也能保留人工判断。
@@ -30,9 +58,7 @@
 - **为智能体管理独立工作环境** — 在隔离环境中读写文件、执行命令，支持环境复用、预热、暂停和恢复。由应用决定环境如何分配，框架负责连接与资源生命周期。
 - **持久状态，支持多进程运行** — 按需接入检查点、存储与运行协调，保存会话状态并在审批后继续执行；统一处理多进程下的运行归属、重复请求与取消。
 - **多租户集成** — 支持应用按租户、用户或项目划分会话与沙箱，使用存储命名空间区分数据范围。身份认证与访问授权由应用负责。
-- **上下文管理（规划中）** — 按任务筛选资料、压缩冗长历史，保留目标、约束与阶段结论，让有限的上下文装下真正影响下一步决策的信息。
-- **长期记忆治理（规划中）** — 跨会话保存和检索用户偏好、项目知识与任务经验，支持来源追溯、租户隔离、更新纠错、过期清理与主动删除。
-- **任务自动化（规划中）** — 计划支持定时与事件触发，让周期性工作和业务事件都能发起智能体任务，无需每次手动开启对话。
+- **运行与调度后台任务** — 立即执行宿主注册的操作，或设置一次性、固定速率和 Cron 调度；通过 [Automation](docs/cn/automation/index.md) 查看结果、取消执行或发起重试。
 
 ## Studio：支持多模态的智能体工作台
 
@@ -52,26 +78,6 @@
 
 *以上为当前 Studio 界面的演示数据截图。*
 
-## 快速开始
-
-### 体验 Studio
-
-准备 Docker 与 Docker Compose，再启动后端和 Web 客户端。初始账号为 `tinkerfin`，密码为 `123456`；登录后配置自己的模型。
-
-[打开 Studio 上手指南 →](docs/cn/studio/quick_start.md)
-
-### 接入 Python 框架
-
-需要 Python 3.11 或更高版本。
-
-```bash
-pip install tinkerfin langchain-openai
-```
-
-配置模型密钥后，即可创建智能体并接收执行结果。
-
-[运行第一个智能体 →](docs/cn/runtime/quick_start.md)
-
 ## 项目组成
 
 | 部分 | 用途 |
@@ -80,7 +86,7 @@ pip install tinkerfin langchain-openai
 | `apps/studio/` | 可部署、可扩展的智能体工作台，统一业务交互、计划审批与执行追踪 |
 | `docs/` | 覆盖应用搭建、部署运维与深度集成的双语文档 |
 
-## Documentation
+## 文档
 
 [中文文档首页 →](docs/cn/index.md)
 
@@ -93,8 +99,8 @@ pip install tinkerfin langchain-openai
 - [参与开发](docs/CONTRIBUTING.cn.md)
 - [安全漏洞报告](SECURITY.md)
 
-## License
+## 许可证
 
-仓库默认采用 [Apache License 2.0](LICENSE)。源自上游 LangGraph MySQL Store 的
-`tinkerfin-langgraph-mysql` 采用包内 [MIT License](packages/tinkerfin-langgraph-mysql/LICENSE)
-与 [NOTICE](packages/tinkerfin-langgraph-mysql/NOTICE)。
+仓库默认采用 [Apache License 2.0](LICENSE)。
+`tinkerfin-langgraph-store` 采用包内 [MIT License](packages/tinkerfin-langgraph-store/LICENSE)
+与 [NOTICE](packages/tinkerfin-langgraph-store/NOTICE)。

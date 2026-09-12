@@ -111,11 +111,12 @@ jobs:
           --cov=tinkerfin_contracts
           --cov=tinkerfin_native_stream
           --cov=tinkerfin_tracing
-          --cov=tinkerfin_langgraph_mysql
-          --cov=langgraph.store.mysql
+          --cov=tinkerfin_langgraph_store
+          --cov=tinkerfin_sqlalchemy
           --cov=tinkerfin_agui_adapter
           --cov=tinkerfin_messaging
           --cov=tinkerfin_sandbox
+          --cov=tinkerfin_automation
           --cov-branch
           --cov-report=term-missing
           --cov-fail-under=80

@@ -15,8 +15,8 @@ Docker runs the backend, database, Redis, and OpenSandbox. Start the Web client 
 Build and run from the repository:
 
 ```bash
-git clone https://github.com/tinkerfin-ai/tinkerfin.git
-cd tinkerfin/apps/studio/server/deploy
+git clone https://github.com/tinkerfin-ai/tinkerfin-harness.git
+cd tinkerfin-harness/apps/studio/server/deploy
 ./deploy.sh --build
 ```
 

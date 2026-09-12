@@ -62,6 +62,11 @@ _PROJECTS = (
     ),
     _WheelProject("tinkerfin", _ROOT / "packages/tinkerfin", "tinkerfin/py.typed"),
     _WheelProject(
+        "tinkerfin-automation",
+        _ROOT / "packages/tinkerfin-automation",
+        "tinkerfin_automation/py.typed",
+    ),
+    _WheelProject(
         "tinkerfin-messaging",
         _ROOT / "packages/tinkerfin-messaging",
         "tinkerfin_messaging/py.typed",
@@ -77,9 +82,14 @@ _PROJECTS = (
         "tinkerfin_sandbox/py.typed",
     ),
     _WheelProject(
-        "tinkerfin-langgraph-mysql",
-        _ROOT / "packages/tinkerfin-langgraph-mysql",
-        "tinkerfin_langgraph_mysql/py.typed",
+        "tinkerfin-langgraph-store",
+        _ROOT / "packages/tinkerfin-langgraph-store",
+        "tinkerfin_langgraph_store/py.typed",
+    ),
+    _WheelProject(
+        "tinkerfin-sqlalchemy",
+        _ROOT / "packages/tinkerfin-sqlalchemy",
+        "tinkerfin_sqlalchemy/py.typed",
     ),
     _WheelProject("tinkerfin-studio", _ROOT / "apps/studio/server", None),
 )
@@ -123,6 +133,28 @@ _CORE_CASES = (
         ("ag_ui", "tinkerfin_agui_adapter", "redis"),
     ),
     _InstallCase(
+        "automation-core",
+        "tinkerfin-automation==0.1.0",
+        ("tinkerfin_automation", "tinkerfin", "langchain", "langchain_core"),
+        (
+            "tinkerfin-automation",
+            "tinkerfin-contracts",
+            "tinkerfin",
+            "langchain",
+            "langchain-core",
+            "pydantic",
+            "tzdata",
+        ),
+        (
+            "apscheduler",
+            "sqlalchemy",
+            "aiosqlite",
+            "asyncmy",
+        ),
+        ("apscheduler", "sqlalchemy", "aiosqlite", "asyncmy"),
+        smoke="automation_core",
+    ),
+    _InstallCase(
         "messaging-core",
         "tinkerfin-messaging==0.1.0",
         ("tinkerfin_messaging",),
@@ -147,16 +179,63 @@ _CORE_CASES = (
         ("sqlalchemy", "aiosqlite", "asyncmy"),
     ),
     _InstallCase(
-        "langgraph-mysql-core",
-        "tinkerfin-langgraph-mysql==0.1.0",
-        ("langgraph.store.mysql", "tinkerfin_langgraph_mysql"),
-        ("tinkerfin-langgraph-mysql", "asyncmy", "langgraph-checkpoint", "orjson"),
-        ("aiomysql", "pymysql", "langgraph-checkpoint-mysql"),
-        ("aiomysql", "pymysql"),
+        "langgraph-store-core",
+        "tinkerfin-langgraph-store==0.1.0",
+        ("tinkerfin_langgraph_store",),
+        ("tinkerfin-langgraph-store", "langgraph-checkpoint"),
+        (
+            "sqlalchemy",
+            "asyncmy",
+            "asyncpg",
+            "aiosqlite",
+            "langgraph-checkpoint-mysql",
+        ),
+        (
+            "sqlalchemy",
+            "asyncmy",
+            "asyncpg",
+            "aiosqlite",
+            "langgraph.store.mysql",
+        ),
+    ),
+    _InstallCase(
+        "sqlalchemy-transactions",
+        "tinkerfin-sqlalchemy==0.1.0",
+        ("tinkerfin_sqlalchemy",),
+        ("tinkerfin-sqlalchemy", "sqlalchemy", "greenlet"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
     ),
 )
 
 _FULL_CASES = (
+    _InstallCase(
+        "messaging-sqlalchemy",
+        "tinkerfin-messaging[sqlalchemy]==0.1.0",
+        ("tinkerfin_messaging.sqlalchemy", "tinkerfin_sqlalchemy"),
+        ("tinkerfin-messaging", "tinkerfin-sqlalchemy", "sqlalchemy"),
+        ("asyncmy", "asyncpg", "aiosqlite", "redis"),
+        ("asyncmy", "asyncpg", "aiosqlite", "redis"),
+        full_matrix_only=True,
+    ),
+    _InstallCase(
+        "langgraph-store-sqlalchemy",
+        "tinkerfin-langgraph-store[sqlalchemy]==0.1.0",
+        ("tinkerfin_langgraph_store.sqlalchemy",),
+        ("tinkerfin-langgraph-store", "tinkerfin-sqlalchemy", "sqlalchemy"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
+        full_matrix_only=True,
+    ),
+    _InstallCase(
+        "automation-sqlalchemy",
+        "tinkerfin-automation[sqlalchemy]==0.1.0",
+        ("tinkerfin_automation.sqlalchemy", "tinkerfin_sqlalchemy"),
+        ("tinkerfin-automation", "tinkerfin-sqlalchemy", "sqlalchemy"),
+        ("apscheduler", "asyncmy", "asyncpg", "aiosqlite"),
+        ("apscheduler", "asyncmy", "asyncpg", "aiosqlite"),
+        full_matrix_only=True,
+    ),
     _InstallCase(
         "runtime-agui",
         "tinkerfin[agui]==0.1.0",
@@ -219,41 +298,21 @@ _FULL_CASES = (
         full_matrix_only=True,
     ),
     _InstallCase(
-        "tracing-sqlite",
-        "tinkerfin-tracing[sqlite]==0.1.0",
-        ("tinkerfin_tracing", "sqlalchemy", "aiosqlite"),
-        ("tinkerfin-tracing", "sqlalchemy", "aiosqlite"),
-        ("asyncmy",),
-        ("asyncmy",),
-        smoke="trace_sqlite",
+        "tracing-sqlalchemy",
+        "tinkerfin-tracing[sqlalchemy]==0.1.0",
+        ("tinkerfin_tracing", "tinkerfin_sqlalchemy", "sqlalchemy"),
+        ("tinkerfin-tracing", "tinkerfin-sqlalchemy", "sqlalchemy"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
         full_matrix_only=True,
     ),
     _InstallCase(
-        "tracing-mysql",
-        "tinkerfin-tracing[mysql]==0.1.0",
-        ("tinkerfin_tracing", "sqlalchemy", "asyncmy"),
-        ("tinkerfin-tracing", "sqlalchemy", "asyncmy"),
-        ("aiosqlite",),
-        ("aiosqlite",),
-        full_matrix_only=True,
-    ),
-    _InstallCase(
-        "sandbox-sqlite",
-        "tinkerfin-sandbox[sqlite]==0.1.0",
-        ("tinkerfin_sandbox", "sqlalchemy", "aiosqlite"),
-        ("tinkerfin-sandbox", "sqlalchemy", "aiosqlite"),
-        ("asyncmy",),
-        ("asyncmy",),
-        smoke="sandbox_sqlite",
-        full_matrix_only=True,
-    ),
-    _InstallCase(
-        "sandbox-mysql",
-        "tinkerfin-sandbox[mysql]==0.1.0",
-        ("tinkerfin_sandbox", "sqlalchemy", "asyncmy"),
-        ("tinkerfin-sandbox", "sqlalchemy", "asyncmy"),
-        ("aiosqlite",),
-        ("aiosqlite",),
+        "sandbox-sqlalchemy",
+        "tinkerfin-sandbox[sqlalchemy]==0.1.0",
+        ("tinkerfin_sandbox", "tinkerfin_sqlalchemy", "sqlalchemy"),
+        ("tinkerfin-sandbox", "tinkerfin-sqlalchemy", "sqlalchemy"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
+        ("asyncmy", "asyncpg", "aiosqlite"),
         full_matrix_only=True,
     ),
 )
@@ -264,7 +323,7 @@ _STUDIO_CASE = _InstallCase(
     (
         "tinkerfin_studio",
         "tinkerfin",
-        "tinkerfin_langgraph_mysql",
+        "tinkerfin_langgraph_store",
         "tinkerfin_messaging",
         "tinkerfin_sandbox",
         "tinkerfin_tracing",
@@ -272,7 +331,7 @@ _STUDIO_CASE = _InstallCase(
     (
         "tinkerfin-studio",
         "tinkerfin",
-        "tinkerfin-langgraph-mysql",
+        "tinkerfin-langgraph-store",
         "tinkerfin-messaging",
         "tinkerfin-sandbox",
         "tinkerfin-tracing",
@@ -416,18 +475,21 @@ def wheel_directory(tmp_path_factory: pytest.TempPathFactory) -> Path:
             )
             metadata = archive.read(metadata_name).decode("utf-8")
             wheel_python_payload = _wheel_python_payload(archive)
+        first_party = {canonicalize_name(item.name) for item in _PROJECTS}
+        for line in metadata.splitlines():
+            if line.startswith("Requires-Dist: "):
+                requirement = Requirement(line.removeprefix("Requires-Dist: "))
+                if canonicalize_name(requirement.name) in first_party:
+                    assert str(requirement.specifier) == "==0.1.0"
         source_root = project.path / "src"
         assert wheel_python_payload == _source_python_payload(source_root)
         assert any(name.endswith(".dist-info/licenses/LICENSE") for name in names)
         assert "Description-Content-Type: text/markdown" in metadata
         if project.marker is not None:
             assert project.marker in names
-        if project.name == "tinkerfin-langgraph-mysql":
+        if project.name == "tinkerfin-langgraph-store":
             assert any(name.endswith(".dist-info/licenses/NOTICE") for name in names)
-            assert "langgraph/store/mysql/py.typed" in names
-            assert not any(
-                name.startswith("langgraph/checkpoint/mysql/") for name in names
-            )
+            assert not any(name.startswith("langgraph/") for name in names)
             assert not any("store_migrations" in name for name in names)
         if project.name == "tinkerfin":
             assert "tinkerfin/agui_native.py" not in names
@@ -462,24 +524,46 @@ for root in case["forbidden_modules"]:
         raise AssertionError(f"forbidden module loaded: {root}")
 
 async def smoke() -> None:
-    if case["smoke"] == "trace_sqlite":
-        from sqlalchemy.ext.asyncio import create_async_engine
-        from tinkerfin_tracing import SqlAlchemyTraceStore
-        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        try:
-            await SqlAlchemyTraceStore(engine, namespace="wheel-matrix").setup()
-        finally:
-            await engine.dispose()
-    elif case["smoke"] == "sandbox_sqlite":
-        from tinkerfin_sandbox import SQLAlchemyOpenSandboxState
-        state = SQLAlchemyOpenSandboxState(
-            url="sqlite+aiosqlite:///:memory:",
-            namespace="wheel-matrix",
+    if case["smoke"] == "automation_core":
+        from tinkerfin_automation import (
+            AutomationService,
+            TinkerFinTarget,
+            create_automation_tools,
         )
+        service = AutomationService(namespace="wheel-matrix")
         try:
-            await state.start(warm_pool_size=0)
+            tools = create_automation_tools(
+                service,
+                owner_id="wheel-owner",
+                allowed_targets={"summary"},
+            )
+            assert len(tools) == 9
+            assert {tool.name for tool in tools} >= {
+                "execute_automation_once",
+                "run_automation_task_now",
+            }
+            assert TinkerFinTarget is not None
         finally:
-            await state.aclose()
+            await service.close()
+    elif case["smoke"] == "automation_sqlite":
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from tinkerfin_automation import AutomationService, SqlAlchemyAutomationStore
+        from sqlalchemy.pool import AsyncAdaptedQueuePool
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:", poolclass=AsyncAdaptedQueuePool, pool_size=1, max_overflow=0
+        )
+        store = SqlAlchemyAutomationStore(engine)
+        service = AutomationService(namespace="wheel-matrix", store=store)
+        try:
+            execution = await service.execute_once(
+                owner_id="wheel-owner",
+                target="summary",
+            )
+            assert execution.task_id is None
+        finally:
+            await service.close()
+            await store.close()
+            await engine.dispose()
 
 asyncio.run(smoke())
 """

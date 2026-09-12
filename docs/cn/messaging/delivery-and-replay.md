@@ -19,31 +19,33 @@ subscription = await channel.wrap(
 - 同一 thread 有另一个活跃 run：抛出 `RunAlreadyActive`；
 - codec 与 channel 已绑定格式不同：抛出 `CodecMismatch`。
 
-`runId` 是幂等 key。Messaging 不读取或保存业务请求摘要；同一个 `RunIdentity` 的正文是否一致由应用校验。
+`run_id` 是同一 namespace 与线程内的运行幂等标识。Messaging 不读取或保存业务请求摘要；同一个 `RunIdentity` 的正文是否一致由应用校验。
 
 ## 直接获得 SSE
 
 ```python
+from starlette.responses import StreamingResponse
 from tinkerfin_messaging import parse_sse_event_id
 
 
-body = await channel.sse(
+body = await channel.open_sse(
     source,
     identity=identity,
     after=lambda: parse_sse_event_id(request.headers.get("Last-Event-ID")),
-    on_source_ready=activate_business_run,
-    on_delivery_not_started=cleanup_business_run,
 )
+return StreamingResponse(body, media_type="text/event-stream")
 ```
 
 `after` resolver 只调用一次，并且在 durable prepare 之前执行。`parse_sse_event_id()` 只接受
 canonical 非负 ASCII 十进制值。返回的每帧使用提交序号作为 SSE `id`。
 
-`on_source_ready` 在请求 source 就绪后、producer 创建之前为新 owner 调用一次。
+可选回调 `on_source_ready` 在请求 source 就绪后、producer 创建之前为新 owner 调用一次。
 `on_delivery_not_started` 只在 source 未就绪且 attachment 未成立时调用；attachment 不调用两者。
 返回 body 由调用方拥有，不再消费时必须关闭。
 
 有效 attachment 成立后，Messaging 会关闭未打开的 single-use candidate source，调用方不能复用。
+
+相同字节流也可交给 `EventSourceResponse(body)`。HTTP 关闭约束见[流与 SSE](../runtime/streams-and-sse.md)。
 
 ## 运行中主动发布消息
 
@@ -91,7 +93,7 @@ status = await channel.get_run_status(identity=identity)
 | `follow()` | 指定 run | 先回放，再等待该 run 的权威终止 |
 | `get_run_status()` | 指定 run | 不取得 owner 的当前 durable 状态 |
 
-虽然 thread 级 API 只使用 `identity.threadId` 定位日志，接口仍统一接收完整 `RunIdentity`，避免 thread/run 在不同层重复平铺。
+线程级方法按完整 `(namespace, thread_id)` 定位日志，参数使用 `RunIdentity`；运行级方法再按 `run_id` 定位。
 
 `get_run_status()` 可原子把过期 producer lease 归档为 `owner_lost`。没有 durable
 run 时抛出 `RunNotFound`，且不会创建或恢复 producer。
@@ -103,15 +105,13 @@ run 时抛出 `RunNotFound`，且不会创建或恢复 producer。
 | 字段 | 作用 |
 | --- | --- |
 | `channel` | codec 命名空间 |
-| `identity` | 嵌套的 `threadId` 与 `runId` |
+| `identity` | 完整 namespace、thread_id 和 run_id |
 | `seq` | thread 内连续位置 |
-| `messageId` | thread 内稳定的消息幂等 ID |
+| `message_id` | thread 内稳定的消息幂等 ID |
 | `codec` | 持久化格式 ID |
 | `payload` | 编码后的 bytes |
-| `createdAt` | 首次提交时分配的 UTC 时间 |
+| `created_at` | 首次提交时分配的 UTC 时间 |
 
-Messaging 只存储一种当前 Envelope 结构。应用自有格式发生不兼容变化时应先重建记录，
-运行时不会协商或识别多种格式。
 
 ## 提交观察函数
 
@@ -137,6 +137,6 @@ subscription = await channel.wrap(
 await channel.delete_stream(identity=identity)
 ```
 
-删除范围是整个 `identity.threadId`。活跃生产者会触发 `StreamDeleteConflict`；缺失或已经删除的 thread 是成功的幂等 no-op。删除后用相同 threadId 创建新 run 会进入新的 generation，旧 handle 不能再读写。
+删除范围是完整 `(namespace, thread_id)`。有效的生产者租约会触发 `StreamDeleteConflict`，租约已失效则允许删除；线程缺失或已删除时重复调用仍成功。再次使用相同线程会创建新代际，旧句柄保留原删除错误。
 
 下一篇：[取消、延迟创建与恢复](cancellation-and-recovery.md)。

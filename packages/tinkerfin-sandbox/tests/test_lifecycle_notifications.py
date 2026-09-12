@@ -22,8 +22,10 @@ from test_manager import (
     _new_manager,
     _ReconnectableFakeClient,
     _ResettableLocalBackend,
+    _resource_key,
 )
 from test_recovery_policy import _fast_policy, _RecoveringClient
+from tests.support.sql_engines import SqlEngineFactory
 
 from tinkerfin_sandbox import (
     OpenSandboxBackend,
@@ -93,7 +95,7 @@ def startup_state_url(request: pytest.FixtureRequest, tmp_path: Path) -> str:
 async def test_transient_recovery_preserves_identity_and_notifies_in_order() -> None:
     recorder = _Recorder()
     client = _RecoveringClient([OpenSandboxBackendTimeoutError("secret endpoint")])
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client, state=state, recovery_policy=_fast_policy(), observers=[recorder]
     ) as manager:
@@ -108,7 +110,7 @@ async def test_transient_recovery_preserves_identity_and_notifies_in_order() -> 
     assert recorder.events[-1].workspace_may_have_changed
     assert client.create_calls == 0
     assert client.destroy_calls == []
-    assert state.bindings == {"owner": "original"}
+    assert state.bindings == {_resource_key("owner"): "original"}
     assert recorder.close_calls == 0
 
 
@@ -116,7 +118,7 @@ async def test_transient_recovery_preserves_identity_and_notifies_in_order() -> 
 async def test_missing_default_binding_and_repeated_checks_share_one_outage() -> None:
     recorder = _Recorder()
     client = _FakeClient()
-    state = _FakeState({"owner": "missing"})
+    state = _FakeState({_resource_key("owner"): "missing"})
     client.inspection_results["missing"] = OpenSandboxRuntimeInfo.unavailable(
         "missing", "not_found"
     )
@@ -128,7 +130,7 @@ async def test_missing_default_binding_and_repeated_checks_share_one_outage() ->
             assert details is not None and not details.available
             with pytest.raises(OpenSandboxBackendUnavailableError):
                 await manager.get("owner")
-        assert state.bindings == {"owner": "missing"}
+        assert state.bindings == {_resource_key("owner"): "missing"}
         assert client.create_calls == 0
         assert client.destroy_calls == []
     assert _kinds(recorder) == [Kind.UNAVAILABLE, Kind.RECOVERING, Kind.RECOVERY_FAILED]
@@ -150,7 +152,7 @@ async def test_replacement_waits_for_binding_and_handle_publication() -> None:
             return await super().bind_owner(claim, sandbox_id)
 
     recorder = _Recorder()
-    state = GatedState({"owner": "missing"})
+    state = GatedState({_resource_key("owner"): "missing"})
     client = _FakeClient()
     async with _new_manager(
         client=client,
@@ -166,7 +168,7 @@ async def test_replacement_waits_for_binding_and_handle_publication() -> None:
         backend = await getting
         await recorder.wait_for(Kind.REPLACED)
         event = recorder.events[-1]
-        assert state.bindings == {"owner": backend.id}
+        assert state.bindings == {_resource_key("owner"): backend.id}
         assert event.diagnostic_context == {
             "sandbox_id": backend.id,
             "previous_sandbox_id": "missing",
@@ -179,7 +181,7 @@ async def test_replacement_waits_for_binding_and_handle_publication() -> None:
 async def test_failed_or_uncertain_binding_never_announces_replacement(
     uncertain: bool,
 ) -> None:
-    state = _FakeState({"owner": "missing"})
+    state = _FakeState({_resource_key("owner"): "missing"})
     state.save_error = RuntimeError("secret database response")
     if uncertain:
         state.commit_before_save_error = True
@@ -219,7 +221,7 @@ async def test_cancelled_committed_replacement_is_announced_when_reconnected(
     cached: bool,
 ) -> None:
     recorder = _Recorder()
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     client = _RecoveringClient([])
     async with _new_manager(
         client=client,
@@ -251,7 +253,7 @@ async def test_adopting_external_binding_change_announces_replacement() -> None:
         client=client, state=state, observers=[recorder]
     ) as manager:
         handle = await manager.get("owner")
-        state.bindings["owner"] = "external"
+        state.bindings[_resource_key("owner")] = "external"
         client.connected["external"] = _FakeBackend("external")
         assert await manager.get("owner") is handle
     assert _kinds(recorder) == [Kind.REPLACED]
@@ -268,7 +270,7 @@ async def test_recovery_failures_do_not_rebuild_for_initialization_errors() -> N
     client = _RecoveringClient([failure])
     async with _new_manager(
         client=client,
-        state=_FakeState({"owner": "original"}),
+        state=_FakeState({_resource_key("owner"): "original"}),
         observers=[recorder],
         recovery_policy=_fast_policy(recreate=True),
     ) as manager:
@@ -289,7 +291,9 @@ async def test_cancellation_is_not_a_recovery_failure() -> None:
     recorder = _Recorder()
     client = _RecoveringClient([OpenSandboxBackendTimeoutError("temporary")])
     async with _new_manager(
-        client=client, state=_FakeState({"owner": "original"}), observers=[recorder]
+        client=client,
+        state=_FakeState({_resource_key("owner"): "original"}),
+        observers=[recorder],
     ) as manager:
         getting = asyncio.create_task(manager.get("owner"))
         await recorder.wait_for(Kind.RECOVERING)
@@ -324,7 +328,7 @@ async def test_confirmed_absence_updates_workspace_evidence_without_repeating_it
 ):
     recorder = _Recorder()
     client = _FakeClient()
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client, state=state, observers=[recorder]
     ) as manager:
@@ -363,7 +367,7 @@ async def test_initializer_side_effects_are_reported_without_claiming_rollback(
         )
         raise RuntimeError("initializer failed after writing")
 
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     client = OpenSandboxClient(
         connection_config=ConnectionConfig(),
         config=OpenSandboxConfig(warm_pool_size=0, workspace_root=None),
@@ -377,7 +381,7 @@ async def test_initializer_side_effects_are_reported_without_claiming_rollback(
     ) as manager:
         with pytest.raises(OpenSandboxInitializationError):
             await manager.get("owner")
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
         assert marker.read_text(encoding="utf-8") == "initializer side effect"
         creating.assert_not_awaited()
     assert _kinds(recorder) == [Kind.UNAVAILABLE, Kind.RECOVERY_FAILED]
@@ -392,7 +396,7 @@ async def test_uncached_inspection_does_not_announce_recovery_before_handle_publ
 ):
     recorder = _Recorder()
     client = _FakeClient()
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     client.inspection_results["original"] = OpenSandboxRuntimeInfo.unavailable(
         "original", "unreachable"
     )
@@ -649,12 +653,15 @@ async def test_routine_warm_verification_has_no_degradation_notifications() -> N
 
 @pytest.mark.asyncio
 async def test_shared_capacity_notifications_follow_readiness_only(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'notifications.db'}"
     recorder = _Recorder()
-    state = SQLAlchemyOpenSandboxState(url=url, namespace="notifications")
-    peer = SQLAlchemyOpenSandboxState(url=url, namespace="notifications")
+    state = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(url), namespace="notifications"
+    )
+    peer = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="notifications")
     async with _new_manager(
         client=_FakeClient(), state=state, warm_pool_size=1, observers=[recorder]
     ) as manager:
@@ -698,10 +705,10 @@ async def test_shared_capacity_notifications_follow_readiness_only(
     indirect=True,
 )
 async def test_new_manager_cannot_accept_unverified_capacity_claimed_by_a_peer(
-    startup_state_url: str, strict: bool
+    sql_engine: SqlEngineFactory, startup_state_url: str, strict: bool
 ) -> None:
     url = startup_state_url
-    peer = SQLAlchemyOpenSandboxState(url=url, namespace="startup")
+    peer = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="startup")
     await peer.start(warm_pool_size=1)
     creating = await peer.claim_warm_slot()
     assert creating is not None
@@ -711,7 +718,7 @@ async def test_new_manager_cannot_accept_unverified_capacity_claimed_by_a_peer(
     client = _FakeClient()
     manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="startup"),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="startup"),
         warm_pool_size=1,
         fail_on_startup_warmup_error=strict,
     )
@@ -733,10 +740,11 @@ async def test_new_manager_cannot_accept_unverified_capacity_claimed_by_a_peer(
 
 @pytest.mark.asyncio
 async def test_initial_warm_verification_accumulates_without_all_slot_claims_each_round(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'startup-progress.db'}"
-    peer = SQLAlchemyOpenSandboxState(url=url, namespace="startup")
+    peer = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="startup")
     await peer.start(warm_pool_size=2)
     for number in range(2):
         creating = await peer.claim_warm_slot()
@@ -755,7 +763,7 @@ async def test_initial_warm_verification_accumulates_without_all_slot_claims_eac
     recorder = _Recorder()
     manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="startup"),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="startup"),
         warm_pool_size=2,
         observers=[recorder],
     )
@@ -800,13 +808,14 @@ async def test_explicit_reset_notifies_only_after_workspace_contents_are_cleared
     async with _new_manager(
         client=client, state=_FakeState(), observers=[recorder]
     ) as manager:
-        backend = await manager.get("owner")
-        await manager.reset("owner")
+        backend = await manager.get("owner", namespace="workspace-company")
+        await manager.reset("owner", namespace="workspace-company")
         await recorder.wait_for(Kind.WORKSPACE_RESET)
         assert list(workspace.iterdir()) == []
         assert backend.id == "sandbox-1"
         assert client.create_calls == 1 and client.destroy_calls == []
     assert _kinds(recorder) == [Kind.WORKSPACE_RESET]
+    assert recorder.events[0].namespace == "workspace-company"
     assert recorder.events[0].workspace_may_have_changed
     assert not recorder.events[0].replaced
 
@@ -826,7 +835,7 @@ async def test_cancelled_destroy_announces_the_confirmed_result_once() -> None:
     recorder = _Recorder()
     client = _FakeClient()
     client.destroy_gate = asyncio.Event()
-    state = _FakeState({"owner": "existing"})
+    state = _FakeState({_resource_key("owner"): "existing"})
     async with _new_manager(
         client=client, state=state, observers=[recorder]
     ) as manager:

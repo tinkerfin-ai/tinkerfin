@@ -26,7 +26,7 @@ NOW = datetime.now(UTC)
 def _common() -> dict[str, object]:
     return {
         "sourceObservationId": "observation-1",
-        "identity": RunIdentity(threadId="thread-1", runId="run-1"),
+        "identity": RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1"),
         "occurredAt": NOW,
         "monotonicNs": 1,
     }
@@ -209,7 +209,7 @@ def test_subagent_scope_evidence_is_explicit_and_omitted_at_root() -> None:
     child = root.model_copy(
         update={
             "call_id": "model:child",
-            "namespace": ("tools:child",),
+            "graph_namespace": ("tools:child",),
             "in_subagent_scope": True,
         }
     )
@@ -239,7 +239,7 @@ def test_subagent_status_matches_its_lifecycle_phase(
         SubagentFact.model_validate(
             {
                 **_common(),
-                "namespace": ("tools:child",),
+                "graph_namespace": ("tools:child",),
                 "phase": phase,
                 "subagentId": "subagent:child",
                 "status": status,
@@ -252,7 +252,7 @@ def test_subagent_relationship_evidence_belongs_only_to_its_start() -> None:
         SubagentFact.model_validate(
             {
                 **_common(),
-                "namespace": ("tools:child",),
+                "graph_namespace": ("tools:child",),
                 "phase": "updated",
                 "subagentId": "subagent:child",
                 "parentToolCallId": "call-task",
@@ -263,7 +263,7 @@ def test_subagent_relationship_evidence_belongs_only_to_its_start() -> None:
     started = SubagentFact.model_validate(
         {
             **_common(),
-            "namespace": ("tools:child",),
+            "graph_namespace": ("tools:child",),
             "phase": "started",
             "subagentId": "subagent:child",
             "parentToolCallId": "call-task",
@@ -309,7 +309,7 @@ def test_failure_origin_requires_a_failed_terminal_run() -> None:
     ),
 )
 @pytest.mark.parametrize(
-    "scope", ({"namespace": ("child",)}, {"in_subagent_scope": True})
+    "scope", ({"graph_namespace": ("child",)}, {"in_subagent_scope": True})
 )
 def test_all_run_lifecycle_phases_are_root_scoped(
     phase_fields: dict[str, object],
@@ -322,6 +322,6 @@ def test_all_run_lifecycle_phases_are_root_scoped(
             config=CapturedValue(disposition="inline", safe_size_bytes=4),
         )
     valid = RunFact.model_validate(fields)
-    assert valid.namespace == () and valid.in_subagent_scope is False
+    assert valid.graph_namespace == () and valid.in_subagent_scope is False
     with pytest.raises(ValidationError, match="root scope"):
         RunFact.model_validate({**fields, **scope})

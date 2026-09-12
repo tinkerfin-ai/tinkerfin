@@ -1,7 +1,7 @@
 [project]
 name = "tinkerfin-tracing"
 version = "0.1.0"
-description = "Semantic Runtime tracing with bounded in-memory and SQL persistence."
+description = "Semantic Runtime tracing with bounded memory and durable database persistence."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -18,23 +18,19 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.12,<3",
-    "tinkerfin-contracts>=0.1.0,<0.9.0",
+    "tinkerfin-contracts==0.1.0",
 ]
 
 [project.optional-dependencies]
-sqlite = [
-    "aiosqlite>=0.22,<0.23",
+sqlalchemy = [
     "sqlalchemy[asyncio]==2.0.52",
-]
-mysql = [
-    "asyncmy==0.2.14",
-    "sqlalchemy[asyncio]==2.0.52",
+    "tinkerfin-sqlalchemy==0.1.0",
 ]
 
 [project.urls]
-Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
-Repository = "https://github.com/tinkerfin-ai/tinkerfin"
-Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin-harness/issues"
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -48,3 +44,4 @@ tinkerfin_tracing = ["py.typed"]
 
 [tool.uv.sources]
 tinkerfin-contracts = { workspace = true }
+tinkerfin-sqlalchemy = { workspace = true }

@@ -23,7 +23,7 @@ manager = OpenSandboxManager(
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `client` | 必填 | 创建、连接、检查和销毁 Sandbox 的异步 client |
-| `key_resolver` | 必填 | 把应用 key 转成稳定、非空字符串 |
+| `key_resolver` | `None` | 自定义 key 需要解析为稳定非空字符串；字符串 key 可直接使用 |
 | `state` | `None` | 绑定和租约状态；默认使用内存状态 |
 | `warm_pool_size` | `None` | 覆盖配置中的预热数量 |
 | `fail_on_startup_warmup_error` | `False` | 预热失败时是否让 `start()` 直接失败 |
@@ -136,14 +136,11 @@ finally:
 
 `start()` 可以重复调用；manager 关闭后不能重新启动。
 
-启动会为每个已发布 warm slot 取得 fencing claim，重新连接远端实例，执行数据面健康检查；
-`ttl` 为有限时长时，还会续期。
-缺失实例会在启动返回前被原子替换。启用 `fail_on_startup_warmup_error=True` 后，认证、重连、健康
-检查、续期、创建或 State 发布任一步失败都会向外传播，宿主不得报告 ready。
+启动时通过重连、健康检查、有限生存期续期及替换缺失实例来验证预热容量。
+启用 `fail_on_startup_warmup_error=True` 后，任一步失败或容量验证不完整都会导致启动失败。
 
-Manager 首次报告就绪前，必须为全部配置容量建立验证依据。其他 worker 正在检查部分容量时，
-启动验证可能尚未完成：严格预热会失败，普通启动则保持未就绪，并通过现有维护循环继续验证。
-验证进度跨轮保留；已经完成启动验证的 Manager 不会仅因其他 worker 的常规检查而重新要求核验全池。
+Manager 首次报告就绪前必须验证全部配置容量。其他 worker 的检查可能使验证延迟；
+普通启动会保持未就绪，直到验证完成。常规检查不会使此前已验证的容量失效。
 
 Manager 运行期间会周期检查预热实例的健康状态，为有限生存时间的实例续期，并替换不可用容量。
 `ttl=None` 时仍会继续健康维护。后台补充失败不会推翻已经交给当前请求的 owner
@@ -239,16 +236,15 @@ manager = OpenSandboxManager(
 重复显式销毁只在首次确认移除后产生一次事件。常规关闭不会发布用户故障或销毁事件。
 预热容量事件的 `owner_key=None`，不会被报告成用户 Sandbox 故障。
 
-外部变化由现有 `get()`、`is_healthy()`、`get_details()` 或预热维护检查发现。通知不会增加远端用户
-Sandbox 周期轮询、持久化待投递记录或跨进程交付保证。暂停/恢复协调使用的共享 State 轮询独立于
-通知投递。观察事实属于当前 Manager；需要可靠存档时，
-宿主负责自己的存储。
+外部变化通过 `get()`、`is_healthy()`、`get_details()` 或预热维护发现。
+通知属于当前 Manager，尽力投递，不额外轮询远端用户 Sandbox，也不保证持久化或跨进程交付。
+需要保存通知时，由消费方负责存储。
 
 每个观察者使用独立顺序队列，默认最多 128 条待投递事件，另有一条正在执行，单次回调时限为 1 秒。
 通过 `notification_options=OpenSandboxNotificationOptions(max_pending_events=128, timeout=1.0)`
 配置。队列满时丢弃新事件；回调异常、超时和取消不会影响 Sandbox 操作或其他观察者。关闭会在资源
 结算后，并发排空各观察者已接收的通知；遵守协作式取消的回调最多再等待
-`(max_pending_events + 1) * timeout`。Manager 不关闭借用的观察者；未配置观察者时不创建投递任务。
+`(max_pending_events + 1) * timeout`。Manager 不关闭借用的观察者。
 
 观察者必须使用非阻塞异步操作并传播取消。回调及其创建的任务不得调用当前 Manager 的资源操作、
 readiness/start 或关闭方法，否则会收到 `OpenSandboxObserverReentryError`。需要操作 Manager 的
@@ -258,14 +254,10 @@ readiness/start 或关闭方法，否则会收到 `OpenSandboxObserverReentryErr
 
 创建、健康检查、替换、重置、销毁和关闭开始后，即使发起它的请求被取消，manager 仍会完成必要的资源回收。调用方收到取消不代表远端清理已经结束。
 
-`OpenSandboxClient.destroy()` 会为每个 Sandbox ID 保留一个 task。并发调用方共同等待同一次远端
-kill 和本地 close。调用方取消会先等待收尾，再继续传播取消。kill 已成功时，SDK close
-失败不会将其变成远端销毁失败。Client 关闭前会等待创建/连接结果交接、取消后的结果回收、SDK 子请求
-和正在进行的销毁，再关闭 `ConnectionConfig` 未提供 transport 时由 Client 创建的共享 transport。并发关闭调用会共同
-等待同一个受 Client 持有的结算任务；取消等待者不会取消 transport 关闭，关闭任务失败后仍可重试且
-不会丢失所有权。调用方显式传入的 transport 始终按借用资源处理，Client 不会关闭它。
-
-如果业务要在取消后立刻给用户响应，可以让清理继续由 manager 持有，并通过监控或状态接口观察最终结果。
+对同一 Sandbox 并发调用 `OpenSandboxClient.destroy()` 会共享结果。调用方取消会等待销毁与
+本地清理完成后再传播；远端已销毁时，SDK 关闭失败不会改变远端销毁结果。
+Client 关闭会先等待已接受的操作，再关闭自己创建的 transport。并发关闭调用共享结果；
+取消等待者不会中止清理，关闭失败可以重试。调用方传入的 transport 仍由调用方负责关闭。
 
 ## 查看详情
 

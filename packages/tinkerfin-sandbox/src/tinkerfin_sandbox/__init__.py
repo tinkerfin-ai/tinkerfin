@@ -119,14 +119,12 @@ def __getattr__(name: str) -> object:
         try:
             from .lifecycle import sqlalchemy as sqlalchemy_lifecycle
         except ModuleNotFoundError as error:
-            if error.name != "sqlalchemy" and not (
+            if error.name not in {"sqlalchemy", "tinkerfin_sqlalchemy"} and not (
                 error.name and error.name.startswith("sqlalchemy.")
             ):
                 raise
             raise ImportError(
-                "SQLAlchemyOpenSandboxState requires an optional database extra; "
-                'install "tinkerfin-sandbox[sqlite]" or '
-                '"tinkerfin-sandbox[mysql]"'
+                'SQLAlchemyOpenSandboxState requires "tinkerfin-sandbox[sqlalchemy]"'
             ) from error
         value = getattr(sqlalchemy_lifecycle, name)
         globals()[name] = value

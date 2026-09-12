@@ -88,7 +88,7 @@ class HitlRequest(RuntimeModel):
 class HitlToolCallCandidate:
     """One position-preserving Tool call considered for HITL correlation."""
 
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     tool_call_id: str
     tool_name: str
     parent_message_id: str
@@ -469,7 +469,7 @@ def _checkpoint_tool_call_candidates(
                 ) from error
             candidates.append(
                 HitlToolCallCandidate(
-                    namespace=(),
+                    graph_namespace=(),
                     tool_call_id=normalized_call_id,
                     tool_name=name,
                     parent_message_id=parent_message_id,

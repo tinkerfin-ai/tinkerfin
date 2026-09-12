@@ -119,7 +119,7 @@ class TraceGraphNodeMutation:
     parent_subagent_id: str | None = None
     model_call_id: str | None = None
     model_call_seq: int | None = None
-    namespace: tuple[str, ...] | None = None
+    graph_namespace: tuple[str, ...] | None = None
     agent_name: str | None = None
     provider: str | None = None
     model: str | None = None
@@ -167,7 +167,7 @@ class StoredTraceGraphNode:
     status: TraceGraphNodeStatus
     name: str
     run_id: str
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     agent_name: str | None
     provider: str | None
     model: str | None
@@ -425,8 +425,9 @@ class TraceLedgerBackend(Protocol):
     """Persist one shared Trace Ledger through five storage-oriented operations.
 
     Implementations borrow their database client from the host. They must preserve
-    cancellation, atomically apply every resolved storage effect, and resolve an
-    uncertain commit before returning or raising a stable Trace Store error.
+    cancellation and atomically apply every resolved storage effect. Success
+    requires proof of commit; an uncertain outcome that cannot be confirmed raises
+    a stable Trace Store error without replaying unproven writes.
     """
 
     async def prepare_storage(self) -> None:
@@ -452,7 +453,8 @@ class TraceLedgerBackend(Protocol):
         The Backend obtains current state and storage time inside its transaction or
         conditional-write loop, calls ``resolve_ledger_change()``, and applies the
         returned effect as one unit. Optimistic conflicts may repeat resolution with
-        fresh state. An uncertain commit must be resolved before returning.
+        fresh state. An uncertain commit must be confirmed before returning success;
+        otherwise the Backend raises a stable Trace Store error.
 
         Args:
             change: Complete framework-created semantic change request.

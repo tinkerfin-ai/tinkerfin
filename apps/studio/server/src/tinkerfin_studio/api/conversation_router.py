@@ -55,7 +55,7 @@ def _graph_namespace(value: str) -> tuple[str, ...]:
         return ()
     segments = tuple(value.split("|"))
     if any(not segment or segment != segment.strip() for segment in segments):
-        raise ValueError("namespace 必须是 root 或以 | 分隔的规范路径")
+        raise ValueError("graph_namespace 必须是 root 或以 | 分隔的规范路径")
     return segments
 
 
@@ -70,7 +70,9 @@ async def _trace_graph_filter(
     agents: Annotated[list[str] | None, Query(alias="agent")] = None,
     providers: Annotated[list[str] | None, Query(alias="provider")] = None,
     models: Annotated[list[str] | None, Query(alias="model")] = None,
-    namespaces: Annotated[list[str] | None, Query(alias="namespace")] = None,
+    graph_namespaces: Annotated[
+        list[str] | None, Query(alias="graph_namespace")
+    ] = None,
     search: Annotated[
         str | None, Query(alias="query", min_length=1, max_length=255)
     ] = None,
@@ -87,7 +89,9 @@ async def _trace_graph_filter(
             agent_names=set(agents or ()),
             providers=set(providers or ()),
             models=set(models or ()),
-            namespaces={_graph_namespace(value) for value in namespaces or ()},
+            graph_namespaces={
+                _graph_namespace(value) for value in graph_namespaces or ()
+            },
             search=search,
             started_after=started_after,
             started_before=started_before,
@@ -99,7 +103,7 @@ async def _trace_graph_filter(
             [
                 {
                     "type": "value_error",
-                    "loc": ("query", "namespace"),
+                    "loc": ("query", "graph_namespace"),
                     "msg": str(error),
                     "input": None,
                 }

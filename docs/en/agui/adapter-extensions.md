@@ -15,6 +15,7 @@ The converter does not create a Graph, invoke a model, read checkpoints, or prov
 ## The simplest conversion path
 
 ```python
+from contextlib import aclosing
 from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
@@ -31,11 +32,12 @@ events = astream_events(
     identity=RunIdentity(threadId="thread-1", runId="run-1"),
 )
 
-async for event in events:
-    await send_event(event)
+async with aclosing(events):
+    async for event in events:
+        await send_event(event)
 ```
 
-`astream_events()` creates `RUN_STARTED`, converts intermediate parts, and emits exactly one main terminal. It exclusively consumes and closes `parts`, so do not share that iterator with another consumer.
+Fully consuming `astream_events()` delivers one `RUN_STARTED` and one main terminal around the converted events. The async context closes the source even on early exit. Do not share `parts` with another consumer.
 
 ### Parameters
 
@@ -50,7 +52,7 @@ async for event in events:
 
 `private_state_keys` is explicit for the standalone converter because it cannot infer
 which host fields are private. It never deletes nested same-named fields. TinkerFin
-Plan Definitions provide their internal keys automatically.
+Plan Runtimes provide their internal keys automatically.
 
 ## Durable images and documents
 
@@ -58,11 +60,13 @@ Plan Definitions provide their internal keys automatically.
 and `size_bytes`. Its `content_block()` produces a LangChain `image` or `file`
 block with `file_id`, `mime_type`, and `extras.attachment`. Store the reference in
 messages; the host authorizes access and supplies image bytes through
-`TinkerFin().attachments(AttachmentSupport(read_image=...))` when making model
+`TinkerFin().with_attachments(AttachmentSupport(read_image=...))` when making model
 requests. Each destination model uses its own image capability; custom compiled
 agents configure their own attachment access.
 
-Ordinary runtime callers pass standard user messages to `TinkerFin.open_agui_run(messages=...)`; the runtime owns validation and conversion. `AgUiUserInput` provides ID-free text/attachment inspection and authorized descriptor replacement for hosts assigning message IDs.
+Ordinary callers pass standard user messages to `runtime.open_agui_run(messages=...)`;
+the Runtime owns validation and conversion. `AgUiUserInput` provides ID-free text and
+attachment inspection plus authorized descriptor replacement for hosts assigning IDs.
 
 For custom adapter integrations, the low-level `user_message_to_langchain()` from `tinkerfin_agui_adapter.media` converts AG-UI
 user input. Durable images use `type: "image"`, documents use `type: "document"`,
@@ -80,6 +84,15 @@ subagent output with its owning invocation.
 payload. The package includes `contracts/message-attachments.schema.json` and a
 matching fixture captured through real LangChain tool invocation. Descriptors
 contain no bytes, credentials, or temporary download URLs.
+
+`AttachmentToolCallResultEvent`, `AttachmentAssistantMessage`, and
+`AttachmentToolMessage` declare typed `attachments` fields.
+`AttachmentMessagesSnapshotEvent` validates and serializes attachment-bearing history.
+After generic AG-UI replay, call `parse_attachment_output_event(event)` to validate a
+tool result or snapshot and obtain its public attachment types. The package also ships
+`tool-call-result.schema.json`, `assistant-message.schema.json`, `tool-message.schema.json`,
+and `messages-snapshot.schema.json` under `contracts/`; the shared fixture covers live
+output and matching history.
 
 ## Encode events as SSE
 
@@ -109,8 +122,8 @@ lifecycle = AgUiLifecycleEventFactory()
 identity = RunIdentity(threadId="thread-1", runId="run-1")
 adapter = DeepAgentAgUiAdapter(identity=identity)
 
-await send_event(lifecycle.started(identity=identity))
 try:
+    await send_event(lifecycle.started(identity=identity))
     async for part in parts:
         for event in adapter.process(part):
             await send_event(event)
@@ -132,6 +145,8 @@ except Exception:
             code="runtime_error",
         )
     )
+finally:
+    await parts.aclose()
 ```
 
 `abort()` closes only child text, reasoning, and Tool lifecycles. The custom
@@ -160,10 +175,10 @@ from tinkerfin_agui_adapter import ScopedIdCodec
 
 codec = ScopedIdCodec()
 public_id = codec.encode("tool", ("researcher",), "call-7")
-kind, namespace, raw_id = codec.decode(public_id)
+kind, graph_namespace, raw_id = codec.decode(public_id)
 ```
 
-Store the complete scoped ID. Raw tool IDs may repeat in different namespaces.
+Store the complete scoped ID. Raw tool IDs may repeat in different graph namespaces.
 
 ## Parse framework extensions
 
@@ -189,12 +204,3 @@ results expose `relatedSubagentInvocationId`. These fields describe Agent nestin
 standard AG-UI `parentRunId` retains branch and time-travel lineage semantics.
 
 Next: [AG-UI usage reference](api-reference.md).
-
-`AttachmentToolCallResultEvent`, `AttachmentAssistantMessage`, and
-`AttachmentToolMessage` declare typed `attachments` fields.
-`AttachmentMessagesSnapshotEvent` validates and serializes attachment-bearing history.
-After generic AG-UI replay, call `parse_attachment_output_event(event)` to validate a
-tool result or snapshot and obtain its public attachment types. The package also ships
-`tool-call-result.schema.json`, `assistant-message.schema.json`, `tool-message.schema.json`,
-and `messages-snapshot.schema.json` under `contracts/`; the shared fixture covers live
-output and matching history.

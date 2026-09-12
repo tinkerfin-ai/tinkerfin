@@ -20,7 +20,7 @@ from tinkerfin_tracing.writing import TraceBatchWriter, TraceWritePolicy
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-write", runId="run-write")
+    return RunIdentity(namespace="test", thread_id="thread-write", run_id="run-write")
 
 
 def _fact(index: int) -> RunFact:
@@ -173,7 +173,7 @@ async def test_pending_budget_backpressures_and_cancelled_waiter_is_not_enqueued
         await blocked
     gate.release.set()
     await writer.force()
-    snapshot = await store.snapshot(_identity().thread_id)
+    snapshot = await store.snapshot(_identity().thread)
     assert snapshot.as_of_seq == 2
     await writer.aclose()
 
@@ -198,7 +198,7 @@ async def test_cancelled_force_does_not_cancel_owned_commit_or_leave_tasks() -> 
     gate.release.set()
     await writer.force()
     await writer.aclose()
-    snapshot = await store.snapshot(_identity().thread_id)
+    snapshot = await store.snapshot(_identity().thread)
     assert snapshot.as_of_seq == 1
     await asyncio.sleep(0)
     live_names = {

@@ -15,7 +15,7 @@ pip install tinkerfin-messaging
 按宿主实际使用的 codec 和 backend 安装 extra。下面的示例需要 AG-UI：
 
 ```bash
-pip install tinkerfin "tinkerfin-messaging[agui]"
+pip install "tinkerfin[agui]" "tinkerfin-messaging[agui]"
 pip install "tinkerfin-messaging[native]"
 pip install "tinkerfin-messaging[agui,redis]"
 ```
@@ -23,53 +23,34 @@ pip install "tinkerfin-messaging[agui,redis]"
 ## 把 TinkerFin 流变成可续传 SSE
 
 ```python
-from tinkerfin import RunIdentity, TinkerFin
-from tinkerfin_messaging import Messaging, create_agui_run_source
+from contextlib import aclosing
 
+from tinkerfin import TinkerFin
+from tinkerfin_messaging import Messaging
 
-tinkerfin = TinkerFin()
-agent = tinkerfin.create_deep_agent(model=model, tools=tools)
-identity = RunIdentity(threadId="thread-42", runId="run-7")
-source = create_agui_run_source(
-    identity,
-    open_events=lambda run_identity: tinkerfin.open_agui_run(
-        run_identity,
-        agent=agent,
-        input=graph_input,
-    ),
+runtime = TinkerFin().with_namespace("customer-1").build(model=model, tools=tools)
+source = runtime.open_agui_run(
+    thread_id="thread-42", run_id="run-7", input=graph_input,
 )
 
 async with Messaging() as messaging:
     channel = messaging.channel(name="agent-events")
-    body = await channel.sse(
-        source,
-        after=0,
-        on_source_ready=activate_business_run,
-        on_delivery_not_started=cleanup_business_run,
-    )
-
-    async for chunk in body:
-        await send_to_client(chunk)
+    body = await channel.open_sse(source, after=0)
+    async with aclosing(body):
+        async for chunk in body:
+            await send_to_client(chunk)
 ```
 
-`create_agui_run_source()` 会把模型、Sandbox 与 Graph setup 留到 owner 确定后；attachment 不会
-打开 Agent。Name-only channel 不需要重复传 codec、thread 或 run，空流也能在第一条数据前识别。
-可选 transform 可以补充产品 metadata 或调整内容，但不得改变事件类型以及 Run、消息、Tool、快照或
-interrupt 的关联身份，也不得改变可选 `RUN_STARTED.input` 的任何字段。需要改变输出协议时，应使用
-高级、无 profile 的 `map_source()` 边界。
+Runtime 自动提供 namespace、运行身份和消息格式。Messaging 确定生产者后才打开 Agent 或
+Sandbox，附着请求直接复用已有运行。每个 source 只能使用一次，未被选中的候选 source
+也会关闭。提前退出或 HTTP 建立失败时，调用方负责关闭返回的 SSE 流。直接传入 Runtime
+对象流，无需提前编码为 SSE。
 
-`on_source_ready` 只在请求 source 就绪后为新 owner 激活宿主投递。source 未就绪且 attachment
-未成立时，`on_delivery_not_started` 负责宿主清理；attachment 不调用这两个 callback。
+只有需要更新业务投递状态时，才在 channel 上配置 `on_source_ready` 和
+`on_delivery_not_started`。附着请求不会调用这两个函数。模型、工具、输入及 HTTP 发送由应用提供。
 
-Attachment 不会打开未使用的候选 source，但 Messaging 会在返回前关闭这个 single-use
-candidate。`wrap()` 或 `sse()` 返回后不得复用它。
-
-`AgUiCodec` 需要 `[agui]`，`NativeStreamPartCodec` 需要 `[native]`，`RedisBackend`
-需要 `[redis]`。缺少 extra 时，相应懒加载入口会给出准确安装命令；Messaging Core 不会因此
-加载完整 Agent Runtime。
-
-`body` 已经是调用方拥有的 SSE bytes 流；HTTP setup 在消费前失败时应关闭它。不要再调用
-Runtime 的 `to_sse()`，也不要把已经编码过的 `SseBody` 交给 Messaging。
+`AgUiCodec` 需要 `[agui]`，`NativeStreamPartCodec` 需要 `[native]`，`RedisBackend` 需要
+`[redis]`，`SqlAlchemyBackend` 需要 `[sqlalchemy]` 和所选异步驱动。
 
 ## 自定义 source
 
@@ -86,16 +67,17 @@ subscription = await channel.wrap(
 
 如果 source 自带 RunIdentity，又显式提供了不同值，Messaging 会在 backend prepare 和 source 打开前拒绝。
 
-## 四个核心概念
+## 核心概念
 
 | 名称 | 作用 |
 | --- | --- |
 | channel name | 一种稳定的消息格式，例如 AG-UI |
-| `RunIdentity.threadId` | thread 级有序日志、generation 和回放游标 |
-| `RunIdentity.runId` | 一次语义生产者，也是调用方的幂等 key |
+| `RunIdentity.namespace` | 应用定义的数据隔离范围 |
+| `RunIdentity.thread_id` | thread 级有序日志、generation 和回放游标 |
+| `RunIdentity.run_id` | 一次语义生产者，也是调用方的幂等 key |
 | `seq` | thread 日志内从 1 开始的连续提交位置 |
 
-同一个 `RunIdentity` 永远表示同一次语义运行。网络重试、附着和回放复用它；新输入使用新的 `runId`。Messaging 不比较请求正文，权限、正文一致性和业务幂等由调用方负责。
+同一个 `RunIdentity` 永远表示同一次语义运行。网络重试、附着和回放复用它；新输入使用新的 `run_id`。Messaging 不比较请求正文，权限、正文一致性和业务幂等由调用方负责。
 
 ## `after` 游标
 
@@ -123,5 +105,5 @@ async with Messaging(backend=backend) as messaging:
 
 - [投递、回放和 SSE](delivery-and-replay.md)
 - [取消、延迟创建与恢复](cancellation-and-recovery.md)
-- [Redis、自定义 codec 和 backend](backends-and-codecs.md)
+- [存储、消息格式和自定义后端](backends-and-codecs.md)
 - [Messaging 使用参考](api-reference.md)

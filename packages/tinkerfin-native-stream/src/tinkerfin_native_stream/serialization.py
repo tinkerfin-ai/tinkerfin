@@ -24,7 +24,7 @@ class NativeStreamPart(BaseModel):
     )
 
     mode: NativeStreamMode = Field(alias="type")
-    namespace: tuple[str, ...] = Field(alias="ns")
+    graph_namespace: tuple[str, ...] = Field(alias="ns")
     data: JsonValue
     interrupts: tuple[JsonValue, ...] = ()
 

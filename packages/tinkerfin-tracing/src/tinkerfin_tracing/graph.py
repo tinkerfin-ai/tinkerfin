@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import cast
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
@@ -60,14 +59,17 @@ class TraceGraphFilter(TraceModel):
     filtered result retains its execution scope. They never become direct matches.
     """
 
-    kinds: AbstractSet[TraceGraphNodeKind] = frozenset()
-    statuses: AbstractSet[TraceGraphNodeStatus] = frozenset()
+    kinds: AbstractSet[TraceGraphNodeKind] = Field(default=frozenset(), strict=False)
+    statuses: AbstractSet[TraceGraphNodeStatus] = Field(
+        default=frozenset(), strict=False
+    )
     model_call_id: str | None = Field(default=None, min_length=1, max_length=2048)
-    agent_names: AbstractSet[str] = frozenset()
-    providers: AbstractSet[str] = frozenset()
-    models: AbstractSet[str] = frozenset()
-    namespaces: AbstractSet[tuple[str, ...]] = Field(
+    agent_names: AbstractSet[str] = Field(default=frozenset(), strict=False)
+    providers: AbstractSet[str] = Field(default=frozenset(), strict=False)
+    models: AbstractSet[str] = Field(default=frozenset(), strict=False)
+    graph_namespaces: AbstractSet[tuple[str, ...]] = Field(
         default=frozenset(),
+        strict=False,
         description="Exact graph scopes; the empty tuple selects the root graph",
     )
     search: str | None = Field(
@@ -88,23 +90,6 @@ class TraceGraphFilter(TraceModel):
         description="Exclusive UTC upper bound for event start time",
     )
 
-    @field_validator(
-        "kinds",
-        "statuses",
-        "agent_names",
-        "providers",
-        "models",
-        "namespaces",
-        mode="before",
-    )
-    @classmethod
-    def collections_are_frozen(cls, value: object) -> object:
-        """Accept ordinary collection literals and freeze them at the boundary."""
-
-        if isinstance(value, (set, frozenset, list, tuple)):
-            return frozenset(cast(Iterable[object], value))
-        return value
-
     @field_validator("agent_names", "providers", "models")
     @classmethod
     def names_are_canonical(cls, values: AbstractSet[str]) -> AbstractSet[str]:
@@ -118,17 +103,17 @@ class TraceGraphFilter(TraceModel):
             raise ValueError("Trace Graph filter names must be canonical text")
         return values
 
-    @field_validator("namespaces")
+    @field_validator("graph_namespaces")
     @classmethod
     def namespaces_are_bounded(
         cls,
         values: AbstractSet[tuple[str, ...]],
     ) -> AbstractSet[tuple[str, ...]]:
-        """Bound graph scopes and reject ambiguous namespace segments."""
+        """Bound graph scopes and reject ambiguous graph namespace segments."""
 
         if len(values) > 64:
-            raise ValueError("Trace Graph filters accept at most 64 namespaces")
-        if any(len(namespace) > 64 for namespace in values):
+            raise ValueError("Trace Graph filters accept at most 64 graph namespaces")
+        if any(len(graph_namespace) > 64 for graph_namespace in values):
             raise ValueError("Trace Graph namespaces accept at most 64 segments")
         if any(len(segment) > 1024 for value in values for segment in value):
             raise ValueError("Trace Graph namespace segments are too long")
@@ -250,7 +235,7 @@ class TraceGraphNode(TraceModel):
     status: TraceGraphNodeStatus
     name: str = Field(min_length=1, max_length=1024)
     run_id: str = Field(min_length=1, max_length=1024)
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     agent_name: str | None = Field(default=None, min_length=1, max_length=1024)
     provider: str | None = Field(default=None, min_length=1, max_length=1024)
     model: str | None = Field(default=None, min_length=1, max_length=1024)
@@ -297,7 +282,7 @@ class TraceGraphNode(TraceModel):
             raise ValueError("Trace Graph event identifiers must be canonical")
         return value
 
-    @field_validator("namespace")
+    @field_validator("graph_namespace")
     @classmethod
     def namespace_is_bounded(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         """Bound Subagent scope paths and reject ambiguous segments."""

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
-from typing import Any, TypedDict, cast
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, cast
 
 import pytest
 from ag_ui.core import BaseEvent, RunFinishedEvent
 from ag_ui.core.types import ResumeEntry
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
@@ -18,16 +18,14 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from tinkerfin import (
-    AgUiResumeBinding,
     AgUiResumeCheckpoint,
     AgUiResumeRequest,
-    DeepAgentDefinition,
-    DeepAgentsV2RuntimeProfile,
     RunIdentity,
     TinkerFin,
 )
-from tinkerfin._agui_lineage_state import LINEAGE_STATE_KEY
-from tinkerfin.agui_resume import RESUME_MARKER_STATE_KEY
+from tinkerfin._agui_lineage_state import LINEAGE_METADATA_KEY, RESUME_METADATA_KEY
+from tinkerfin._checkpoint import NamespaceCheckpointer
+from tinkerfin.runtime_profile import DeepAgentsV2RuntimeProfile
 from tinkerfin_contracts import (
     ObservationBoundary,
     RunObservationSession,
@@ -36,15 +34,23 @@ from tinkerfin_contracts import (
 )
 
 
-class _ResumeState(TypedDict, total=False):
-    _tinkerfin_lineage: dict[str, object]
-    _tinkerfin_resume: dict[str, object]
+class _SetupProfile(DeepAgentsV2RuntimeProfile):
+    def __init__(self, before_build: Callable[[], Awaitable[None]]) -> None:
+        super().__init__()
+        self._before_build = before_build
+
+    async def create_agent_graph(
+        self,
+        factory: Callable[..., object],
+        args: tuple[object, ...],
+        kwargs: Mapping[str, object],
+    ) -> object:
+        await self._before_build()
+        return await super().create_agent_graph(factory, args, kwargs)
+
+
+class _ResumeState(MessagesState, total=False):
     result: str
-
-
-class _ToolReviewState(MessagesState, total=False):
-    _tinkerfin_lineage: dict[str, object]
-    _tinkerfin_resume: dict[str, object]
 
 
 class _OrderSession:
@@ -90,15 +96,30 @@ def _install_resume_graph(
     def build(*_args: object, **_kwargs: object):
         async def reviewed(state: _ResumeState) -> dict[str, object]:
             del state
-            answer = interrupt({"question": "continue?"})
+            answer = interrupt(
+                {
+                    "action_requests": [{"name": "continue_run", "args": {}}],
+                    "review_configs": [
+                        {
+                            "action_name": "continue_run",
+                            "allowed_decisions": ["approve"],
+                        }
+                    ],
+                }
+            )
             executions.append(answer)
-            return {"result": "done"}
+            return {
+                "result": "done",
+                "messages": [
+                    ToolMessage(content="continued", tool_call_id="continue-call")
+                ],
+            }
 
         builder = StateGraph(_ResumeState)
         builder.add_node("reviewed", reviewed)
         builder.add_edge(START, "reviewed")
         builder.add_edge("reviewed", END)
-        graph = builder.compile(checkpointer=saver)
+        graph = builder.compile(checkpointer=NamespaceCheckpointer(saver, "test"))
         graphs.append(graph)
         return graph
 
@@ -113,11 +134,25 @@ async def _create_interrupted_parent(
     definition: object,
     graphs: list[CompiledStateGraph[Any, Any, Any, Any]],
 ) -> str:
-    identity = RunIdentity(threadId="thread-1", runId="run-parent")
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
-    )
-    events = [event async for event in runtime.astream({})]
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-parent")
+    runtime = cast(Any, definition)
+    events = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input={
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {"name": "continue_run", "args": {}, "id": "continue-call"}
+                        ],
+                    )
+                ]
+            },
+        )
+    ]
     assert events[-1].type.value == "RUN_FINISHED"
     snapshot = await graphs[-1].aget_state(
         {"configurable": {"thread_id": identity.thread_id}}
@@ -126,12 +161,16 @@ async def _create_interrupted_parent(
     return snapshot.interrupts[0].id
 
 
-def _resume_binding(interrupt_id: str) -> tuple[RunIdentity, AgUiResumeBinding]:
-    identity = RunIdentity(threadId="thread-1", runId="run-resume")
-    return identity, AgUiResumeBinding(
-        mode="resume",
-        resume_data={"answer": "continue"},
-        native_interrupt_ids=(interrupt_id,),
+def _resume_request(interrupt_id: str) -> tuple[RunIdentity, AgUiResumeRequest]:
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-resume")
+    return identity, AgUiResumeRequest(
+        entries=(
+            ResumeEntry(
+                interrupt_id=interrupt_id,
+                status="resolved",
+                payload={"type": "approve"},
+            ),
+        )
     )
 
 
@@ -143,8 +182,8 @@ def _assert_private_marker_absent(events: list[BaseEvent]) -> None:
         ],
         ensure_ascii=False,
     )
-    assert RESUME_MARKER_STATE_KEY not in serialized
-    assert LINEAGE_STATE_KEY not in serialized
+    assert RESUME_METADATA_KEY not in serialized
+    assert LINEAGE_METADATA_KEY not in serialized
 
 
 @pytest.mark.asyncio
@@ -153,11 +192,12 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
 ) -> None:
     default_saver = MemorySaver()
     saver = MemorySaver()
+    tinkerfin = TinkerFin(checkpointer=default_saver).with_namespace("test")
     graphs: list[CompiledStateGraph[Any, Any, Any, Any]] = []
     resumed: list[object] = []
 
     def build(*_args: object, **_kwargs: object):
-        async def reviewed(state: _ToolReviewState) -> dict[str, object]:
+        async def reviewed(state: MessagesState) -> dict[str, object]:
             del state
             decision = interrupt(
                 {
@@ -173,11 +213,11 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
             resumed.append(decision)
             return {}
 
-        builder = StateGraph(_ToolReviewState)
+        builder = StateGraph(MessagesState)
         builder.add_node("reviewed", reviewed)
         builder.add_edge(START, "reviewed")
         builder.add_edge("reviewed", END)
-        graph = builder.compile(checkpointer=saver)
+        graph = builder.compile(checkpointer=NamespaceCheckpointer(saver, "test"))
         graphs.append(graph)
         return graph
 
@@ -185,13 +225,10 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
         "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
         build,
     )
-    tinkerfin = TinkerFin(checkpointer=default_saver)
-    definition = tinkerfin.create_deep_agent(
-        model="provider:model",
-        tools=[],
-        checkpointer=saver,
+    definition = tinkerfin.build(model="provider:model", tools=[], checkpointer=saver)
+    parent_identity = RunIdentity(
+        namespace="test", thread_id="thread-managed", run_id="run-parent"
     )
-    parent_identity = RunIdentity(threadId="thread-managed", runId="run-parent")
     review_message = AIMessage(
         id="review-message",
         content="",
@@ -204,9 +241,9 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
             }
         ],
     )
-    parent = await tinkerfin.open_agui_run(
-        parent_identity,
-        agent=definition,
+    parent = definition.open_agui_run(
+        thread_id=parent_identity.thread_id,
+        run_id=parent_identity.run_id,
         input={"messages": [review_message]},
     )
     parent_events = [event async for event in parent]
@@ -227,17 +264,18 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
         )
     )
     resume_identity = RunIdentity(
-        threadId=parent_identity.thread_id,
-        runId="run-resume",
+        namespace="test",
+        thread_id=parent_identity.thread_id,
+        run_id="run-resume",
     )
     checkpoints: list[AgUiResumeCheckpoint] = []
 
     async def checkpointed(checkpoint: AgUiResumeCheckpoint) -> None:
         checkpoints.append(checkpoint)
 
-    resumed_stream = await tinkerfin.open_agui_run(
-        resume_identity,
-        agent=definition,
+    resumed_stream = definition.open_agui_run(
+        thread_id=resume_identity.thread_id,
+        run_id=resume_identity.run_id,
         resume=request,
         parent_run_id=parent_identity.run_id,
         on_resume_saved=checkpointed,
@@ -251,20 +289,24 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
 
     releases = 0
 
-    async def fail_agent_setup() -> DeepAgentDefinition[None]:
+    async def fail_agent_setup() -> None:
         raise RuntimeError("retry factory failed")
 
     async def release_unprepared() -> None:
         nonlocal releases
         releases += 1
 
-    retry = await tinkerfin.open_agui_run(
-        resume_identity,
-        agent=fail_agent_setup,
+    retry_runtime = (
+        TinkerFin(checkpointer=saver, runtime_profile=_SetupProfile(fail_agent_setup))
+        .with_namespace("test")
+        .build(model="provider:model")
+    )
+    retry = retry_runtime.open_agui_run(
+        thread_id=resume_identity.thread_id,
+        run_id=resume_identity.run_id,
         resume=request,
         parent_run_id=parent_identity.run_id,
         on_resume_not_saved=release_unprepared,
-        resume_checkpointer=saver,
     )
     retry_events = [event async for event in retry]
 
@@ -273,10 +315,11 @@ async def test_open_agui_run_reuses_one_graph_for_resume_resolution_and_executio
 
 
 @pytest.mark.asyncio
-async def test_open_agui_run_releases_a_pre_definition_resume_failure_once() -> None:
+async def test_open_agui_run_releases_preparation_failure_once() -> None:
     saver = MemorySaver()
-    tinkerfin = TinkerFin(checkpointer=saver)
-    identity = RunIdentity(threadId="thread-unprepared", runId="run-resume")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-unprepared", run_id="run-resume"
+    )
     request = AgUiResumeRequest(
         entries=(
             ResumeEntry.model_validate(
@@ -289,16 +332,21 @@ async def test_open_agui_run_releases_a_pre_definition_resume_failure_once() -> 
     )
     releases = 0
 
-    async def fail_agent_setup() -> DeepAgentDefinition[None]:
+    async def fail_agent_setup() -> None:
         raise RuntimeError("model setup failed")
 
     async def release_unprepared() -> None:
         nonlocal releases
         releases += 1
 
-    stream = await tinkerfin.open_agui_run(
-        identity,
-        agent=fail_agent_setup,
+    runtime = (
+        TinkerFin(checkpointer=saver, runtime_profile=_SetupProfile(fail_agent_setup))
+        .with_namespace("test")
+        .build(model="provider:model")
+    )
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         resume=request,
         on_resume_not_saved=release_unprepared,
     )
@@ -308,13 +356,12 @@ async def test_open_agui_run_releases_a_pre_definition_resume_failure_once() -> 
     assert releases == 1
 
 
-async def test_lazy_resume_uses_its_declared_override_before_definition_exists() -> (
-    None
-):
+async def test_resume_preparation_uses_the_bound_override_saver() -> None:
     default_saver = MemorySaver()
     override_saver = MemorySaver()
-    tinkerfin = TinkerFin(checkpointer=default_saver)
-    identity = RunIdentity(threadId="thread-declared-saver", runId="run-resume")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-declared-saver", run_id="run-resume"
+    )
     request = AgUiResumeRequest(
         entries=(
             ResumeEntry.model_validate(
@@ -327,19 +374,25 @@ async def test_lazy_resume_uses_its_declared_override_before_definition_exists()
     )
     releases = 0
 
-    async def fail_agent_setup() -> DeepAgentDefinition[None]:
+    async def fail_agent_setup() -> None:
         raise RuntimeError("model setup failed")
 
     async def release_unprepared() -> None:
         nonlocal releases
         releases += 1
 
-    stream = await tinkerfin.open_agui_run(
-        identity,
-        agent=fail_agent_setup,
+    runtime = (
+        TinkerFin(
+            checkpointer=default_saver, runtime_profile=_SetupProfile(fail_agent_setup)
+        )
+        .with_namespace("test")
+        .build(model="provider:model", checkpointer=override_saver)
+    )
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         resume=request,
         on_resume_not_saved=release_unprepared,
-        resume_checkpointer=override_saver,
     )
     events = [event async for event in stream]
 
@@ -347,56 +400,36 @@ async def test_lazy_resume_uses_its_declared_override_before_definition_exists()
     assert releases == 1
 
 
-async def test_lazy_resume_fails_closed_when_definition_changes_saver() -> None:
-    default_saver = MemorySaver()
-    override_saver = MemorySaver()
-    tinkerfin = TinkerFin(checkpointer=default_saver)
-    definition = tinkerfin.create_deep_agent(
-        model="provider:model",
-        tools=[],
-        checkpointer=override_saver,
+async def test_execution_cannot_replace_the_bound_checkpoint_saver() -> None:
+    runtime = (
+        TinkerFin(checkpointer=MemorySaver())
+        .with_namespace("test")
+        .build(model="provider:model")
     )
-    identity = RunIdentity(threadId="thread-saver-mismatch", runId="run-resume")
     request = AgUiResumeRequest(
-        entries=(
-            ResumeEntry.model_validate(
-                {
-                    "interruptId": "interrupt-1#0",
-                    "status": "cancelled",
-                }
-            ),
-        )
+        entries=(ResumeEntry(interrupt_id="pending", status="cancelled"),)
     )
-    releases = 0
-
-    async def create_agent() -> DeepAgentDefinition[Any]:
-        return definition
-
-    async def release_unprepared() -> None:
-        nonlocal releases
-        releases += 1
-
-    stream = await tinkerfin.open_agui_run(
-        identity,
-        agent=create_agent,
-        resume=request,
-        on_resume_not_saved=release_unprepared,
-    )
-    events = [event async for event in stream]
-
-    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    assert releases == 0
-    assert stream.error is not None
-    assert "declared resume_checkpointer" in str(stream.error)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        runtime.open_agui_run(
+            thread_id="thread",
+            run_id="run",
+            resume=request,
+            resume_checkpointer=MemorySaver(),
+        )  # pyright: ignore[reportCallIssue]
 
 
-@pytest.mark.parametrize("release_fails", [False, True])
-async def test_open_agui_run_settles_pre_definition_resume_cancellation_once(
-    release_fails: bool,
+class _ReleaseControl(BaseException):
+    """Represent process control delivered by the resume claim owner."""
+
+
+@pytest.mark.parametrize("release_kind", ["success", "ordinary", "control"])
+async def test_open_agui_run_settles_preparation_cancellation_once(
+    release_kind: str,
 ) -> None:
     saver = MemorySaver()
-    tinkerfin = TinkerFin(checkpointer=saver)
-    identity = RunIdentity(threadId="thread-cancel-setup", runId="run-resume")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-cancel-setup", run_id="run-resume"
+    )
     request = AgUiResumeRequest(
         entries=(
             ResumeEntry.model_validate(
@@ -410,8 +443,15 @@ async def test_open_agui_run_settles_pre_definition_resume_cancellation_once(
     entered = asyncio.Event()
     blocked = asyncio.Event()
     releases = 0
+    release_error = (
+        _ReleaseControl("host release interrupted")
+        if release_kind == "control"
+        else RuntimeError("host release failed")
+    )
+    release_cause = OSError("release original cause")
+    release_error.__cause__ = release_cause
 
-    async def create_agent() -> DeepAgentDefinition[None]:
+    async def create_agent() -> None:
         entered.set()
         await blocked.wait()
         raise AssertionError("cancelled Agent setup resumed unexpectedly")
@@ -419,35 +459,60 @@ async def test_open_agui_run_settles_pre_definition_resume_cancellation_once(
     async def release_unprepared() -> None:
         nonlocal releases
         releases += 1
-        if release_fails:
-            raise RuntimeError("host release failed")
+        if release_kind != "success":
+            raise release_error
 
-    task = asyncio.create_task(
-        tinkerfin.open_agui_run(
-            identity,
-            agent=create_agent,
-            resume=request,
-            on_resume_not_saved=release_unprepared,
-        )
+    runtime = (
+        TinkerFin(checkpointer=saver, runtime_profile=_SetupProfile(create_agent))
+        .with_namespace("test")
+        .build(model="provider:model")
     )
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        resume=request,
+        on_resume_not_saved=release_unprepared,
+    )
+    task = asyncio.create_task(stream.messaging_owner_preflight())
     await entered.wait()
     task.cancel()
     task.cancel()
 
-    with pytest.raises(asyncio.CancelledError) as captured:
+    expected = _ReleaseControl if release_kind == "control" else asyncio.CancelledError
+    with pytest.raises(expected) as captured:
         await task
 
     assert releases == 1
-    if release_fails:
-        assert any("host release failed" in note for note in captured.value.__notes__)
+    if release_kind == "control":
+        assert captured.value is release_error
+    if release_kind != "success":
+        pending_errors: list[BaseException] = [captured.value]
+        retained: set[int] = set()
+        while pending_errors:
+            error = pending_errors.pop()
+            if id(error) in retained:
+                continue
+            retained.add(id(error))
+            pending_errors.extend(
+                item
+                for item in (error.__cause__, error.__context__)
+                if item is not None
+            )
+            if isinstance(error, BaseExceptionGroup):
+                pending_errors.extend(error.exceptions)
+        assert id(release_error) in retained
+        assert id(release_cause) in retained
+    await stream.aclose()
+    await stream.aclose()
 
 
 async def test_open_agui_run_retains_marker_probe_across_repeated_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver = MemorySaver()
-    tinkerfin = TinkerFin(checkpointer=saver)
-    identity = RunIdentity(threadId="thread-cancel-probe", runId="run-resume")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-cancel-probe", run_id="run-resume"
+    )
     request = AgUiResumeRequest(
         entries=(
             ResumeEntry.model_validate(
@@ -464,7 +529,7 @@ async def test_open_agui_run_retains_marker_probe_across_repeated_cancellation(
     release_probe = asyncio.Event()
     releases = 0
 
-    async def create_agent() -> DeepAgentDefinition[None]:
+    async def create_agent() -> None:
         factory_started.set()
         await factory_blocked.wait()
         raise AssertionError("cancelled Agent setup resumed unexpectedly")
@@ -482,14 +547,18 @@ async def test_open_agui_run_retains_marker_probe_across_repeated_cancellation(
         "tinkerfin._agui_lineage.agui_resume_marker_is_durable",
         marker_is_durable,
     )
-    task = asyncio.create_task(
-        tinkerfin.open_agui_run(
-            identity,
-            agent=create_agent,
-            resume=request,
-            on_resume_not_saved=release_unprepared,
-        )
+    runtime = (
+        TinkerFin(checkpointer=saver, runtime_profile=_SetupProfile(create_agent))
+        .with_namespace("test")
+        .build(model="provider:model")
     )
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        resume=request,
+        on_resume_not_saved=release_unprepared,
+    )
+    task = asyncio.create_task(stream.messaging_owner_preflight())
     await factory_started.wait()
     task.cancel("first")
     await probe_started.wait()
@@ -503,14 +572,14 @@ async def test_open_agui_run_retains_marker_probe_across_repeated_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_definition_prepares_resume_from_checkpoint_not_host_payload(
+async def test_runtime_resolves_resume_from_checkpoint_decisions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver = MemorySaver()
     resumed: list[object] = []
 
     def build(*_args: object, **_kwargs: object):
-        async def reviewed(state: _ToolReviewState) -> dict[str, object]:
+        async def reviewed(state: MessagesState) -> dict[str, object]:
             del state
             decision = interrupt(
                 {
@@ -533,18 +602,22 @@ async def test_definition_prepares_resume_from_checkpoint_not_host_payload(
             resumed.append(decision)
             return {}
 
-        builder = StateGraph(_ToolReviewState)
+        builder = StateGraph(MessagesState)
         builder.add_node("reviewed", reviewed)
         builder.add_edge(START, "reviewed")
         builder.add_edge("reviewed", END)
-        return builder.compile(checkpointer=saver)
+        return builder.compile(checkpointer=NamespaceCheckpointer(saver, "test"))
 
     monkeypatch.setattr(
         "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
         build,
     )
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
-    parent_identity = RunIdentity(threadId="thread-native-resume", runId="run-parent")
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
+    parent_identity = RunIdentity(
+        namespace="test", thread_id="thread-native-resume", run_id="run-parent"
+    )
     review_message = AIMessage(
         id="review-message",
         content="",
@@ -563,9 +636,14 @@ async def test_definition_prepares_resume_from_checkpoint_not_host_payload(
             },
         ],
     )
-    parent = definition.new_agui(identity=parent_identity)
+    parent = definition
     parent_events = [
-        event async for event in parent.astream({"messages": [review_message]})
+        event
+        async for event in parent.open_agui_run(
+            thread_id=parent_identity.thread_id,
+            run_id=parent_identity.run_id,
+            input={"messages": [review_message]},
+        )
     ]
     terminal = parent_events[-1]
     assert isinstance(terminal, RunFinishedEvent)
@@ -574,8 +652,9 @@ async def test_definition_prepares_resume_from_checkpoint_not_host_payload(
     public_ids = tuple(item.id for item in outcome.interrupts)
 
     resume_identity = RunIdentity(
-        threadId=parent_identity.thread_id,
-        runId="run-resume",
+        namespace="test",
+        thread_id=parent_identity.thread_id,
+        run_id="run-resume",
     )
     request = AgUiResumeRequest(
         entries=tuple(
@@ -589,50 +668,48 @@ async def test_definition_prepares_resume_from_checkpoint_not_host_payload(
             for interrupt_id in reversed(public_ids)
         )
     )
-    binding = await definition.prepare_agui_resume(
-        identity=resume_identity,
-        parent_run_id=parent_identity.run_id,
-        request=request,
-    )
+    binding = request
 
-    assert binding.native_interrupt_ids
-    assert binding.prior_tool_call_ids
     failed_checkpoints: list[AgUiResumeCheckpoint] = []
 
     async def fail_after_staging(checkpoint: AgUiResumeCheckpoint) -> None:
         failed_checkpoints.append(checkpoint)
         raise RuntimeError("host settlement unavailable")
 
-    failed_runtime = definition.new_agui(
-        identity=resume_identity,
-        parent_run_id=parent_identity.run_id,
-        resume=binding,
-        on_resume_checkpointed=fail_after_staging,
-    )
-    failed_events = [event async for event in failed_runtime.astream()]
+    failed_runtime = definition
+    failed_events = [
+        event
+        async for event in failed_runtime.open_agui_run(
+            thread_id=resume_identity.thread_id,
+            run_id=resume_identity.run_id,
+            parent_run_id=parent_identity.run_id,
+            resume=binding,
+            on_resume_saved=fail_after_staging,
+        )
+    ]
 
     assert failed_events[-1].type.value == "RUN_ERROR"
     assert resumed == []
     assert len(failed_checkpoints) == 1
 
-    recovered = await definition.prepare_agui_resume(
-        identity=resume_identity,
-        request=request,
-    )
+    recovered = request
     recovered_checkpoints: list[AgUiResumeCheckpoint] = []
 
     async def checkpointed(checkpoint: AgUiResumeCheckpoint) -> None:
         recovered_checkpoints.append(checkpoint)
 
-    resumed_runtime = definition.new_agui(
-        identity=resume_identity,
-        resume=recovered,
-        on_resume_checkpointed=checkpointed,
-    )
-    resumed_events = [event async for event in resumed_runtime.astream()]
+    resumed_runtime = definition
+    resumed_events = [
+        event
+        async for event in resumed_runtime.open_agui_run(
+            thread_id=resume_identity.thread_id,
+            run_id=resume_identity.run_id,
+            resume=recovered,
+            on_resume_saved=checkpointed,
+        )
+    ]
 
     assert resumed_events[-1].type.value == "RUN_FINISHED"
-    assert recovered == binding
     assert recovered_checkpoints == failed_checkpoints
     assert recovered_checkpoints[0].parent_run_id == parent_identity.run_id
     assert resumed == [{"decisions": [{"type": "approve"}, {"type": "approve"}]}]
@@ -643,9 +720,11 @@ async def test_checkpoint_callback_failure_retries_without_reexecuting_decision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, graphs, executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     checkpoints: list[AgUiResumeCheckpoint] = []
     initialization_releases = 0
 
@@ -657,14 +736,15 @@ async def test_checkpoint_callback_failure_retries_without_reexecuting_decision(
         checkpoints.append(checkpoint)
         raise RuntimeError("checkpoint observer unavailable")
 
-    failed_runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    failed_runtime = cast(Any, definition)
+    failed_stream = failed_runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_checkpointed=fail_after_recording,
+        on_resume_saved=fail_after_recording,
         on_resume_not_saved=release_unprepared,
     )
-    failed_stream = failed_runtime.astream()
     failed_events = [event async for event in failed_stream]
 
     assert [event.type.value for event in failed_events] == [
@@ -685,20 +765,21 @@ async def test_checkpoint_callback_failure_retries_without_reexecuting_decision(
     async def observe(_part: Mapping[str, object]) -> None:
         trace.append("part")
 
-    retry_runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    retry_runtime = cast(Any, definition)
+    retry_stream = retry_runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_checkpointed=checkpointed,
+        on_resume_saved=checkpointed,
         on_resume_not_saved=release_unprepared,
-        on_part=observe,
+        on_native_part=observe,
     )
-    retry_stream = retry_runtime.astream()
     retry_events = [event async for event in retry_stream]
 
     assert retry_events[-1].type.value == "RUN_FINISHED"
     assert retry_stream.error is None
-    assert executions == [{"answer": "continue"}]
+    assert executions == [{"decisions": [{"type": "approve"}]}]
     assert checkpoints[0] == checkpoints[1]
     assert trace[0] == "checkpointed"
     assert "part" in trace
@@ -711,9 +792,11 @@ async def test_resume_staging_failure_releases_unprepared_host_claim_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, graphs, executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     original_stage = DeepAgentsV2RuntimeProfile.stage_resume_intent
     releases = 0
     checkpoints: list[AgUiResumeCheckpoint] = []
@@ -734,14 +817,15 @@ async def test_resume_staging_failure_releases_unprepared_host_claim_once(
         checkpoints.append(checkpoint)
 
     monkeypatch.setattr(DeepAgentsV2RuntimeProfile, "stage_resume_intent", fail_stage)
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    runtime = cast(Any, definition)
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_checkpointed=checkpointed,
+        on_resume_saved=checkpointed,
         on_resume_not_saved=release_unprepared,
     )
-    stream = runtime.astream()
     events = [event async for event in stream]
 
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
@@ -759,19 +843,23 @@ async def test_resume_staging_failure_releases_unprepared_host_claim_once(
     async def retry_checkpointed(checkpoint: AgUiResumeCheckpoint) -> None:
         retry_checkpoints.append(checkpoint)
 
-    retry = cast(Any, definition).new_agui(
-        identity=identity,
-        parent_run_id="run-parent",
-        resume=binding,
-        on_resume_checkpointed=retry_checkpointed,
-        on_resume_not_saved=release_unprepared,
-    )
-    retry_events = [event async for event in retry.astream()]
+    retry = cast(Any, definition)
+    retry_events = [
+        event
+        async for event in retry.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id="run-parent",
+            resume=binding,
+            on_resume_saved=retry_checkpointed,
+            on_resume_not_saved=release_unprepared,
+        )
+    ]
 
     assert retry_events[-1].type.value == "RUN_FINISHED"
     assert releases == 1
     assert len(retry_checkpoints) == 1
-    assert executions == [{"answer": "continue"}]
+    assert executions == [{"decisions": [{"type": "approve"}]}]
 
 
 @pytest.mark.asyncio
@@ -779,9 +867,11 @@ async def test_resume_staging_cancellation_releases_unprepared_host_claim_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _saver, graphs, executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     entered = asyncio.Event()
     allow_stage_settlement = asyncio.Event()
     releases = 0
@@ -800,13 +890,14 @@ async def test_resume_staging_cancellation_releases_unprepared_host_claim_once(
         releases += 1
 
     monkeypatch.setattr(DeepAgentsV2RuntimeProfile, "stage_resume_intent", block_stage)
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    runtime = cast(Any, definition)
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
         on_resume_not_saved=release_unprepared,
     )
-    stream = runtime.astream()
     assert (await anext(stream)).type.value == "RUN_STARTED"
     pull = asyncio.create_task(anext(stream))
     await asyncio.wait_for(entered.wait(), timeout=5)
@@ -826,9 +917,11 @@ async def test_resume_post_write_cancellation_keeps_the_durable_host_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, graphs, executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     original_stage = DeepAgentsV2RuntimeProfile.stage_resume_intent
     releases = 0
 
@@ -850,23 +943,26 @@ async def test_resume_post_write_cancellation_keeps_the_durable_host_claim(
         "stage_resume_intent",
         write_then_cancel,
     )
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    runtime = cast(Any, definition)
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
         on_resume_not_saved=release_unprepared,
     )
-    stream = runtime.astream()
     assert (await anext(stream)).type.value == "RUN_STARTED"
 
     with pytest.raises(asyncio.CancelledError):
         await anext(stream)
     await stream.aclose()
 
-    head = await saver.aget_tuple({"configurable": {"thread_id": identity.thread_id}})
+    head = await NamespaceCheckpointer(saver, "test").aget_tuple(
+        {"configurable": {"thread_id": identity.thread_id}}
+    )
     assert head is not None
     assert any(
-        channel == RESUME_MARKER_STATE_KEY
+        channel == RESUME_METADATA_KEY
         for _task_id, channel, _value in head.pending_writes or ()
     )
     assert releases == 0
@@ -880,9 +976,11 @@ async def test_resume_graph_factory_failure_uses_pre_marker_settlement(
     error: BaseException,
 ) -> None:
     saver, graphs, _executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     releases = 0
 
     def fail_factory(*_args: object, **_kwargs: object) -> object:
@@ -896,17 +994,19 @@ async def test_resume_graph_factory_failure_uses_pre_marker_settlement(
         "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
         fail_factory,
     )
-    failing_definition = TinkerFin(checkpointer=saver).create_deep_agent(
-        model="provider:model",
-        tools=[],
+    failing_definition = (
+        TinkerFin(checkpointer=saver)
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
     )
-    runtime = cast(Any, failing_definition).new_agui(
-        identity=identity,
+    runtime = cast(Any, failing_definition)
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
         on_resume_not_saved=release_unprepared,
     )
-    stream = runtime.astream()
     if isinstance(error, Exception):
         first = await anext(stream)
         second = await anext(stream)
@@ -925,23 +1025,28 @@ async def test_resume_graph_factory_failure_preserves_a_durable_retry_claim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, graphs, _executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin(checkpointer=saver).create_deep_agent(
-        model="provider:model",
-        tools=[],
+    definition = (
+        TinkerFin(checkpointer=saver)
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
     )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
 
     async def fail_after_marker(_checkpoint: AgUiResumeCheckpoint) -> None:
         raise RuntimeError("host settlement unavailable")
 
-    first = cast(Any, definition).new_agui(
-        identity=identity,
-        parent_run_id="run-parent",
-        resume=binding,
-        on_resume_checkpointed=fail_after_marker,
-    )
-    first_events = [event async for event in first.astream()]
+    first = cast(Any, definition)
+    first_events = [
+        event
+        async for event in first.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id="run-parent",
+            resume=binding,
+            on_resume_saved=fail_after_marker,
+        )
+    ]
     assert first_events[-1].type.value == "RUN_ERROR"
 
     def fail_factory(*_args: object, **_kwargs: object) -> object:
@@ -957,17 +1062,22 @@ async def test_resume_graph_factory_failure_preserves_a_durable_retry_claim(
         nonlocal releases
         releases += 1
 
-    retry_definition = TinkerFin(checkpointer=saver).create_deep_agent(
-        model="provider:model",
-        tools=[],
+    retry_definition = (
+        TinkerFin(checkpointer=saver)
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
     )
-    retry = cast(Any, retry_definition).new_agui(
-        identity=identity,
-        parent_run_id="run-parent",
-        resume=binding,
-        on_resume_not_saved=release_unprepared,
-    )
-    retry_events = [event async for event in retry.astream()]
+    retry = cast(Any, retry_definition)
+    retry_events = [
+        event
+        async for event in retry.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id="run-parent",
+            resume=binding,
+            on_resume_not_saved=release_unprepared,
+        )
+    ]
 
     assert retry_events[-1].type.value == "RUN_ERROR"
     assert releases == 0
@@ -978,9 +1088,11 @@ async def test_resume_staging_keeps_primary_failure_when_claim_release_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _saver, graphs, _executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     releases = 0
 
     async def fail_stage(
@@ -997,13 +1109,14 @@ async def test_resume_staging_keeps_primary_failure_when_claim_release_fails(
         raise RuntimeError("claim release unavailable")
 
     monkeypatch.setattr(DeepAgentsV2RuntimeProfile, "stage_resume_intent", fail_stage)
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    runtime = cast(Any, definition)
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
         on_resume_not_saved=fail_release,
     )
-    stream = runtime.astream()
     events = [event async for event in stream]
 
     assert events[-1].type.value == "RUN_ERROR"
@@ -1020,9 +1133,11 @@ async def test_close_during_checkpoint_callback_keeps_exactly_once_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _saver, graphs, executions = _install_resume_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupt_id = await _create_interrupted_parent(definition, graphs)
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
     checkpoints: list[AgUiResumeCheckpoint] = []
     checkpoint_entered = asyncio.Event()
 
@@ -1031,13 +1146,14 @@ async def test_close_during_checkpoint_callback_keeps_exactly_once_marker(
         checkpoint_entered.set()
         await asyncio.Event().wait()
 
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
+    runtime = cast(Any, definition)
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         parent_run_id="run-parent",
         resume=binding,
-        on_resume_checkpointed=checkpointed,
+        on_resume_saved=checkpointed,
     )
-    stream = runtime.astream()
     first = await anext(stream)
     assert first.type.value == "RUN_STARTED"
     next_event = asyncio.create_task(anext(stream))
@@ -1053,16 +1169,20 @@ async def test_close_during_checkpoint_callback_keeps_exactly_once_marker(
     async def checkpoint_retry(checkpoint: AgUiResumeCheckpoint) -> None:
         checkpoints.append(checkpoint)
 
-    retry = cast(Any, definition).new_agui(
-        identity=identity,
-        parent_run_id="run-parent",
-        resume=binding,
-        on_resume_checkpointed=checkpoint_retry,
-    )
-    events = [event async for event in retry.astream()]
+    retry = cast(Any, definition)
+    events = [
+        event
+        async for event in retry.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id="run-parent",
+            resume=binding,
+            on_resume_saved=checkpoint_retry,
+        )
+    ]
 
     assert events[-1].type.value == "RUN_FINISHED"
-    assert executions == [{"answer": "continue"}]
+    assert executions == [{"decisions": [{"type": "approve"}]}]
     assert len(checkpoints) == 2
     assert checkpoints[0] == checkpoints[1]
     _assert_private_marker_absent(events)
@@ -1075,18 +1195,14 @@ async def test_trace_resume_checkpoint_forces_before_user_callback_and_output(
     saver, graphs, executions = _install_resume_graph(monkeypatch)
     order: list[str] = []
     definition = cast(
-        Any,
-        TinkerFin().observe(_OrderObserver(order)),
-    ).create_deep_agent(
-        model="provider:model",
-        tools=[],
-    )
+        Any, TinkerFin().with_namespace("test").with_observer(_OrderObserver(order))
+    ).build(model="provider:model", tools=[])
     interrupt_id = await _create_interrupted_parent(definition, graphs)
     order.clear()
-    identity, binding = _resume_binding(interrupt_id)
+    identity, binding = _resume_request(interrupt_id)
 
     async def checkpointed(_checkpoint: AgUiResumeCheckpoint) -> None:
-        head = await saver.aget_tuple(
+        head = await NamespaceCheckpointer(saver, "test").aget_tuple(
             {"configurable": {"thread_id": identity.thread_id}}
         )
         assert head is not None
@@ -1094,23 +1210,27 @@ async def test_trace_resume_checkpoint_forces_before_user_callback_and_output(
         private_channels = {
             channel
             for _task_id, channel, _value in head.pending_writes or ()
-            if channel in {LINEAGE_STATE_KEY, RESUME_MARKER_STATE_KEY}
+            if channel == RESUME_METADATA_KEY
         }
-        assert private_channels == {LINEAGE_STATE_KEY, RESUME_MARKER_STATE_KEY}
+        assert private_channels == {RESUME_METADATA_KEY}
         assert executions == []
         order.append("callback")
 
     async def on_part(_part: Mapping[str, object]) -> None:
         order.append("part")
 
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
-        parent_run_id="run-parent",
-        resume=binding,
-        on_resume_checkpointed=checkpointed,
-        on_part=on_part,
-    )
-    events = [event async for event in runtime.astream()]
+    runtime = cast(Any, definition)
+    events = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id="run-parent",
+            resume=binding,
+            on_resume_saved=checkpointed,
+            on_native_part=on_part,
+        )
+    ]
 
     assert events[-1].type.value == "RUN_FINISHED"
     trace_index = order.index("trace:run.resume_checkpointed")

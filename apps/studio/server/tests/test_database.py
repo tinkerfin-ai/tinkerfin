@@ -42,19 +42,18 @@ async def test_sandbox_state_close_keeps_shared_business_engine_usable(
 
 
 @pytest.mark.docker_integration
-async def test_mysql_connection_budget_uses_server_limit_and_one_agent_connection(
+async def test_mysql_connection_budget_covers_the_shared_pool(
     mysql_sandbox_url: str,
 ) -> None:
-    """共享 Engine 容量与独立 Agent Store connection 必须一起校验"""
+    """所有持久化能力共用连接池，预算不重复计算"""
 
     database = Database(mysql_sandbox_url, pool_size=2, max_overflow=1)
     async with database:
         verified = await database.verify_connection_budget(
-            configured_budget=4,
+            configured_budget=3,
             management_reserve=1,
         )
         assert verified.sqlalchemy_pool_capacity == 3
-        assert verified.dedicated_agent_store_connections == 1
         assert verified.server_max_connections >= 5
 
         with pytest.raises(RuntimeError, match="max_connections"):

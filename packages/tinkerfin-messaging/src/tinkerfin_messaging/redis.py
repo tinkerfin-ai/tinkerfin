@@ -903,8 +903,9 @@ class RedisBackend:
         ):
             active_run = self._stored_run_from_values(
                 RunIdentity(
-                    threadId=query.identity.thread_id,
-                    runId=active_run_id,
+                    namespace=query.identity.namespace,
+                    thread_id=query.identity.thread_id,
+                    run_id=active_run_id,
                 ),
                 generation=current_generation,
                 values=active_values,

@@ -20,16 +20,18 @@ from tinkerfin_messaging import (
     MemoryBackend,
     MessageSubscription,
     Messaging,
-    MessagingTransition,
-    MessagingTransitionResult,
     RunNotFound,
     RunProducerFailed,
     UnexpectedMessagingBackendError,
 )
+from tinkerfin_messaging.backend_contract import (
+    MessagingTransition,
+    MessagingTransitionResult,
+)
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="conversation-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="conversation-1", run_id="run-1")
 
 
 class _TextCodec:
@@ -605,11 +607,14 @@ async def test_concurrent_cancel_callers_share_one_callback_and_settlement(
     release = asyncio.Event()
     source = _CancellableSource(release=release)
     cancel_calls = 0
+    callback_started, release_callback = asyncio.Event(), asyncio.Event()
+    caller_started = (asyncio.Event(), asyncio.Event())
 
     async def cancel_run() -> tuple[str, ...]:
         nonlocal cancel_calls
         cancel_calls += 1
-        await asyncio.sleep(0)
+        callback_started.set()
+        await release_callback.wait()
         release.set()
         return ("async-cancelled-tail",)
 
@@ -621,13 +626,19 @@ async def test_concurrent_cancel_callers_share_one_callback_and_settlement(
             after=0,
             cancel=cancel_run,
         )
-        results = await asyncio.wait_for(
-            asyncio.gather(
-                channel.cancel(identity=_identity()),
-                channel.cancel(identity=_identity()),
-            ),
-            timeout=1,
-        )
+
+        async def cancel(index: int) -> bool:
+            caller_started[index].set()
+            return await channel.cancel(identity=_identity())
+
+        callers = tuple(asyncio.create_task(cancel(index)) for index in range(2))
+        try:
+            await asyncio.gather(
+                *(started.wait() for started in caller_started), callback_started.wait()
+            )
+        finally:
+            release_callback.set()
+            results = await asyncio.gather(*callers)
         assert await _data(subscription) == ["started", "async-cancelled-tail"]
 
     assert sorted(results) == [False, True]
@@ -842,13 +853,17 @@ async def test_cancel_callback_can_join_the_source_consumer_without_deadlock(
         await asyncio.wait_for(source.started.wait(), timeout=1)
 
         cancelling = asyncio.create_task(channel.cancel(identity=_identity()))
-        done, _ = await asyncio.wait({cancelling}, timeout=0.2)
-        completed_without_cycle = cancelling in done
-        if not completed_without_cycle:
+        try:
+            # A source that joins its consumer must close without a forced release.
+            # Database round-trip latency is unrelated to this ownership guarantee.
+            async with asyncio.timeout(10):
+                await source.closed.wait()
+                assert not source.force_join_return.is_set()
+                assert await cancelling is True
+        finally:
             source.force_join_return.set()
-        assert await asyncio.wait_for(cancelling, timeout=1) is True
+            await asyncio.gather(cancelling, return_exceptions=True)
 
-    assert completed_without_cycle
     assert source.closed.is_set()
 
 

@@ -21,7 +21,6 @@ from opensandbox.config import ConnectionConfig
 from redis.asyncio import Redis
 
 from tinkerfin import TinkerFin
-from tinkerfin.redis import RedisRunCoordinator
 from tinkerfin_messaging import MessagingLimits, MessagingRetentionPolicy
 from tinkerfin_messaging.agui import AgUiCodec
 from tinkerfin_messaging.messaging import MessageChannel, Messaging
@@ -31,6 +30,7 @@ from tinkerfin_sandbox.lifecycle.manager import OpenSandboxManager
 from tinkerfin_sandbox.lifecycle.sqlalchemy import SQLAlchemyOpenSandboxState
 from tinkerfin_sandbox.models import OpenSandboxConfig
 from tinkerfin_studio.agent.persistence import AgentPersistence
+from tinkerfin_studio.agent.subagents import SubagentSettings, load_subagents
 from tinkerfin_studio.attachments.service import AttachmentService
 from tinkerfin_studio.attachments.storage import DiskAttachmentStorage
 from tinkerfin_studio.config.logging import setup_logging
@@ -43,6 +43,7 @@ from tinkerfin_studio.conversation.todo_groups import TodoGroupQueryExecutor
 from tinkerfin_studio.health import ReadinessService
 from tinkerfin_studio.infrastructure.database import Database
 from tinkerfin_studio.infrastructure.redis_client import create_redis_client
+from tinkerfin_studio.infrastructure.redis_keys import MESSAGING_KEY_PREFIX
 from tinkerfin_studio.infrastructure.sandbox_events import SandboxEventLogger
 from tinkerfin_studio.models.transport import ModelTransport
 from tinkerfin_tracing import (
@@ -55,6 +56,7 @@ logger = logging.getLogger(__name__)
 _STUDIO_MESSAGING_LIMITS = MessagingLimits(
     max_message_payload_bytes=4 * 1024 * 1024,
 )
+_STUDIO_MESSAGING_RETENTION = MessagingRetentionPolicy.expire_after(24 * 60 * 60)
 _ResourceT = TypeVar("_ResourceT")
 
 
@@ -145,9 +147,9 @@ class ApplicationResources:
     model_http_client: httpx.AsyncClient
     attachments: AttachmentService
     database: Database
-    redis_control: Redis
     redis_runtime: Redis
     agent_persistence: AgentPersistence
+    agent_subagents: dict[str, SubagentSettings]
     tinkerfin: TinkerFin
     tracer: Tracer
     todo_group_query: TodoGroupQueryExecutor
@@ -159,7 +161,7 @@ class ApplicationResources:
 
 
 def build_lifespan():
-    """构造数据库与两个 Redis 故障域的 FastAPI 生命周期"""
+    """构造数据库、Redis 与 Sandbox 的 FastAPI 生命周期"""
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -188,17 +190,13 @@ def build_lifespan():
                     management_reserve=database_settings.management_connection_reserve,
                 )
                 logger.info(
-                    "MySQL 连接预算已验证：共享池=%s，Agent Store=%s，预算=%s，管理保留=%s",
+                    "MySQL 连接预算已验证：共享池=%s，预算=%s，管理保留=%s",
                     connection_budget.sqlalchemy_pool_capacity,
-                    connection_budget.dedicated_agent_store_connections,
                     connection_budget.configured_budget,
                     connection_budget.management_reserve,
                 )
-                redis_control_settings = settings.redis_control
                 redis_runtime_settings = settings.redis_runtime
-                redis_control = create_redis_client(redis_control_settings)
                 redis_runtime = create_redis_client(redis_runtime_settings)
-                stack.push_async_callback(redis_control.aclose)
                 stack.push_async_callback(redis_runtime.aclose)
                 http_client = await _enter_lifespan_context(
                     stack, outcome, httpx.AsyncClient(trust_env=False)
@@ -215,34 +213,16 @@ def build_lifespan():
                         timeout=600,
                     ),
                 )
-                control_ready, runtime_ready = await asyncio.gather(
-                    cast(Awaitable[bool], redis_control.ping()),
-                    cast(Awaitable[bool], redis_runtime.ping()),
-                )
-                if not control_ready:
-                    raise RuntimeError("Redis Control PING 未返回成功")
-                if not runtime_ready:
-                    raise RuntimeError("Redis Runtime PING 未返回成功")
+                if not await cast(Awaitable[bool], redis_runtime.ping()):
+                    raise RuntimeError("Redis PING 未返回成功")
 
                 persistence = await _enter_lifespan_context(
                     stack,
                     outcome,
-                    AgentPersistence(settings.database, redis_runtime_settings),
+                    AgentPersistence(database.engine, redis_runtime_settings),
                 )
-                run_coordinator = await _enter_lifespan_context(
-                    stack,
-                    outcome,
-                    RedisRunCoordinator.from_client(
-                        redis_control,
-                        key_resolver=lambda identity: identity.thread_id,
-                        key_prefix=redis_control_settings.run_key_prefix,
-                    ),
-                )
-                trace_store = SqlAlchemyTraceStore(
-                    database.engine,
-                    namespace="tinkerfin-studio",
-                )
-                # Trace Store 借用业务 Engine 并在接收请求前校验唯一当前 Schema
+                trace_store = SqlAlchemyTraceStore(database.engine)
+                # 接收请求前检查轨迹存储，数据库连接仍由应用统一管理
                 await trace_store.setup()
                 tracer = Tracer(
                     projections=(ConversationFailureProjection(),),
@@ -252,12 +232,11 @@ def build_lifespan():
                     ),
                 )
                 todo_group_query = TodoGroupQueryExecutor()
-                # 每个 Run 由框架打开独立 Trace session，写入失败会让 Agent fail-closed
-                # Studio 授权保留有界错误摘要；Tracer 仍不接管共享 Engine，reasoning 默认省略
+                # 为会话记录运行轨迹；轨迹写入失败时中止运行
+                # 保留有长度限制的错误摘要，省略模型的内部推理内容
                 tinkerfin = TinkerFin(
-                    checkpointer=persistence.checkpointer,
-                    run_coordinator=run_coordinator,
-                ).observe(tracer)
+                    checkpointer=persistence.checkpointer
+                ).with_observer(tracer)
                 sandbox_settings = settings.sandbox
                 sandbox_manager = await _enter_lifespan_context(
                     stack,
@@ -294,16 +273,10 @@ def build_lifespan():
                 )
                 messaging_backend = RedisBackend(
                     redis_runtime,
-                    key_prefix=redis_runtime_settings.messaging_key_prefix,
+                    key_prefix=MESSAGING_KEY_PREFIX,
                     limits=_STUDIO_MESSAGING_LIMITS,
                     # Messaging 只承担短期断线续播；长期正文由 Trace 提供
-                    retention_policy=(
-                        MessagingRetentionPolicy.disabled()
-                        if settings.messaging_retention_seconds == 0
-                        else MessagingRetentionPolicy.expire_after(
-                            settings.messaging_retention_seconds
-                        )
-                    ),
+                    retention_policy=_STUDIO_MESSAGING_RETENTION,
                 )
                 messaging = await _enter_lifespan_context(
                     stack, outcome, Messaging(backend=messaging_backend)
@@ -319,6 +292,7 @@ def build_lifespan():
                 )
                 stack.push_async_callback(conversation_trace.aclose)
                 await conversation_trace.recover_preparing()
+                agent_subagents = await load_subagents()
                 application.state.resources = ApplicationResources(
                     settings=settings,
                     model_http_client=model_http_client,
@@ -326,9 +300,9 @@ def build_lifespan():
                         database, DiskAttachmentStorage(settings.attachment_directory)
                     ),
                     database=database,
-                    redis_control=redis_control,
                     redis_runtime=redis_runtime,
                     agent_persistence=persistence,
+                    agent_subagents=agent_subagents,
                     tinkerfin=tinkerfin,
                     tracer=tracer,
                     todo_group_query=todo_group_query,
@@ -338,8 +312,7 @@ def build_lifespan():
                     conversation_trace=conversation_trace,
                     readiness=ReadinessService(
                         database=database,
-                        redis_control=redis_control,
-                        redis_runtime=redis_runtime,
+                        redis=redis_runtime,
                         sandbox=settings.sandbox,
                         sandbox_ready=sandbox_manager.check_ready,
                         http_client=http_client,

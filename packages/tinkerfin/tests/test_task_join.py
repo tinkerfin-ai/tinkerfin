@@ -13,12 +13,12 @@ from langchain.agents.middleware.types import InputAgentState
 from langchain_core.runnables import RunnableConfig
 
 from tinkerfin import (
-    DeepAgentDefinition,
+    AgentRuntime,
     RunIdentity,
     RunObservationError,
     TinkerFin,
-    join_task,
 )
+from tinkerfin._tasks import join_task
 from tinkerfin_contracts import (
     NativeStateObservation,
     ObservationBoundary,
@@ -282,7 +282,7 @@ async def test_join_task_preserves_process_control_in_an_isolated_runner(
     code = """
 import asyncio
 import sys
-from tinkerfin import join_task
+from tinkerfin._tasks import join_task
 control_type = {"KeyboardInterrupt": KeyboardInterrupt, "SystemExit": SystemExit}[sys.argv[1]]
 async def main():
     release = asyncio.Event()
@@ -379,7 +379,7 @@ class _ClosingGraph:
 
 
 async def test_observer_operation_cancellation_keeps_terminal_delivery_available(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     class CancellingObserver(_RecordingObserver):
         async def observe(self, observation: RuntimeObservation) -> None:
@@ -400,11 +400,21 @@ async def test_observer_operation_cancellation_keeps_terminal_delivery_available
     observer = CancellingObserver()
     healthy = _RecordingObserver()
     definition = definition_factory(
-        ValuesGraph(), tinkerfin=TinkerFin().observe(observer).observe(healthy)
+        ValuesGraph(),
+        tinkerfin=TinkerFin()
+        .with_namespace("test")
+        .with_observer(observer)
+        .with_observer(healthy),
     )
-    stream = definition.new(
-        identity=RunIdentity(threadId="operation-cancel", runId="native")
-    ).astream({"messages": []})
+    stream = definition.open_run(
+        thread_id=RunIdentity(
+            namespace="test", thread_id="operation-cancel", run_id="native"
+        ).thread_id,
+        run_id=RunIdentity(
+            namespace="test", thread_id="operation-cancel", run_id="native"
+        ).run_id,
+        input={"messages": []},
+    )
     with pytest.raises(asyncio.CancelledError, match="observer operation cancelled"):
         await anext(stream)
     assert observer.closed == healthy.closed == 1
@@ -418,7 +428,7 @@ async def test_observer_operation_cancellation_keeps_terminal_delivery_available
 @pytest.mark.parametrize("source_fails", [False, True])
 @pytest.mark.parametrize("cleanup_kind", ["error", "cancel", "control"])
 async def test_runtime_keeps_observer_close_control_visible_after_source_failure(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
     source_fails: bool,
     cleanup_kind: Literal["error", "cancel", "control"],
 ) -> None:
@@ -450,11 +460,18 @@ async def test_runtime_keeps_observer_close_control_visible_after_source_failure
 
     observer = ClosingObserver()
     definition = definition_factory(
-        SourceGraph(), tinkerfin=TinkerFin().observe(observer)
+        SourceGraph(),
+        tinkerfin=TinkerFin().with_namespace("test").with_observer(observer),
     )
-    stream = definition.new(
-        identity=RunIdentity(threadId="close-control", runId="native")
-    ).astream({"messages": []})
+    stream = definition.open_run(
+        thread_id=RunIdentity(
+            namespace="test", thread_id="close-control", run_id="native"
+        ).thread_id,
+        run_id=RunIdentity(
+            namespace="test", thread_id="close-control", run_id="native"
+        ).run_id,
+        input={"messages": []},
+    )
     expected = (
         _ProcessControl
         if cleanup_kind == "control"
@@ -477,7 +494,7 @@ async def test_runtime_keeps_observer_close_control_visible_after_source_failure
 @pytest.mark.parametrize("cancel_registered_first", [False, True])
 @pytest.mark.parametrize("source_fails", [False, True])
 async def test_runtime_close_control_is_independent_of_observer_order(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
     cancel_registered_first: bool,
     source_fails: bool,
 ) -> None:
@@ -514,11 +531,20 @@ async def test_runtime_close_control_is_independent_of_observer_order(
     )
     definition = definition_factory(
         SourceGraph(),
-        tinkerfin=TinkerFin().observe(observers[0]).observe(observers[1]),
+        tinkerfin=TinkerFin()
+        .with_namespace("test")
+        .with_observer(observers[0])
+        .with_observer(observers[1]),
     )
-    stream = definition.new(
-        identity=RunIdentity(threadId="close-order", runId="native")
-    ).astream({"messages": []})
+    stream = definition.open_run(
+        thread_id=RunIdentity(
+            namespace="test", thread_id="close-order", run_id="native"
+        ).thread_id,
+        run_id=RunIdentity(
+            namespace="test", thread_id="close-order", run_id="native"
+        ).run_id,
+        input={"messages": []},
+    )
     with pytest.raises(_ProcessControl) as captured:
         async for _part in stream:
             pass
@@ -530,7 +556,7 @@ async def test_runtime_close_control_is_independent_of_observer_order(
 @pytest.mark.parametrize("cleanup_kind", ["normal", "failed", "control"])
 @pytest.mark.parametrize("cancel_count", [0, 1, 2])
 async def test_runtime_preserves_cancellation_when_observer_and_source_cleanup_fail(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
     caplog: pytest.LogCaptureFixture,
     cleanup_kind: Literal["normal", "failed", "control"],
     cancel_count: int,
@@ -546,11 +572,21 @@ async def test_runtime_preserves_cancellation_when_observer_and_source_cleanup_f
     )
     graph = _ClosingGraph(error)
     definition = definition_factory(
-        graph, tinkerfin=TinkerFin().observe(failed).observe(healthy)
+        graph,
+        tinkerfin=TinkerFin()
+        .with_namespace("test")
+        .with_observer(failed)
+        .with_observer(healthy),
     )
-    stream = definition.new(
-        identity=RunIdentity(threadId="join-precedence", runId="cleanup")
-    ).astream({"messages": []})
+    stream = definition.open_run(
+        thread_id=RunIdentity(
+            namespace="test", thread_id="join-precedence", run_id="cleanup"
+        ).thread_id,
+        run_id=RunIdentity(
+            namespace="test", thread_id="join-precedence", run_id="cleanup"
+        ).run_id,
+        input={"messages": []},
+    )
     caller = asyncio.create_task(anext(stream))
     try:
         await asyncio.wait_for(graph.started.wait(), 2)
@@ -660,10 +696,10 @@ async def main():
     observer = Observer()
     graph = Graph()
     state.update(observer=observer, graph=graph)
-    factory = TinkerFin().observe(observer)
+    factory = TinkerFin().with_namespace("test").with_observer(observer)
     with patch("tinkerfin.runtime_profile._deepagents_graph.create_deep_agent", return_value=graph):
-        definition = factory.create_deep_agent(model="provider:model", tools=[])
-        stream = definition.new(identity=RunIdentity(threadId="shutdown", runId=phase)).astream({"messages": []})
+        definition = factory.build(model="provider:model", tools=[])
+        stream = definition.open_run(thread_id="shutdown", run_id=phase, input={"messages": []})
         caller = asyncio.create_task(anext(stream))
         state["caller"] = caller
         await graph.started.wait()

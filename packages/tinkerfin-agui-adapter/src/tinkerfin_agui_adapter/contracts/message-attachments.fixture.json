@@ -13,8 +13,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages",
         "toolResultStatus": "success"
@@ -30,8 +30,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages",
         "toolResultStatus": "success"
@@ -56,8 +56,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages",
         "toolResultStatus": "success"
@@ -75,8 +75,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages"
       },
@@ -91,8 +91,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages"
       },
@@ -118,8 +118,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages"
       },
@@ -133,8 +133,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "messages"
       },
@@ -179,8 +179,8 @@
         "source": {
           "agentName": "main",
           "agentType": "main",
-          "kind": "root",
-          "namespace": []
+          "graphNamespace": [],
+          "kind": "root"
         },
         "streamMode": "values"
       },

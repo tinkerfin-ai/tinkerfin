@@ -44,13 +44,13 @@ from tinkerfin_tracing.errors import TraceStoreProtocolError
 from tinkerfin_tracing.facts import TraceEvent
 
 NOW = datetime(2026, 9, 4, 4, 0, tzinfo=UTC)
-IDENTITY = RunIdentity(threadId="thread", runId="run")
+IDENTITY = RunIdentity(namespace="test", thread_id="thread", run_id="run")
 
 
 class _CommonFactArgs(TypedDict):
     source_observation_id: str
     identity: RunIdentity
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     occurred_at: datetime
     monotonic_ns: int
 
@@ -75,7 +75,7 @@ def _common(
     return {
         "source_observation_id": f"observation-{sequence}",
         "identity": IDENTITY,
-        "namespace": namespace,
+        "graph_namespace": namespace,
         "occurred_at": NOW + timedelta(milliseconds=sequence),
         "monotonic_ns": sequence,
     }
@@ -457,7 +457,7 @@ def _subagent_node(
         status=TraceGraphNodeStatus.SUCCEEDED,
         name=f"subagent-{index}",
         run_id="run",
-        namespace=tuple(
+        graph_namespace=tuple(
             f"tools:{value}"
             for value in range(
                 namespace_depth if namespace_depth is not None else index + 1
@@ -540,7 +540,7 @@ def test_subagent_scope_accepts_a_leaf_inside_level_64() -> None:
         status=TraceGraphNodeStatus.SUCCEEDED,
         name="AssistantMessage",
         run_id="run",
-        namespace=tuple(f"tools:{value}" for value in range(64)),
+        graph_namespace=tuple(f"tools:{value}" for value in range(64)),
         started_at=NOW + timedelta(milliseconds=64),
         completed_at=NOW + timedelta(milliseconds=64),
         started_seq=65,
@@ -866,8 +866,8 @@ def test_context_locator_cannot_reuse_another_contribution() -> None:
 
 
 def test_plan_locator_cannot_reuse_another_run_revision() -> None:
-    first_identity = RunIdentity(threadId="thread", runId="plan-a")
-    second_identity = RunIdentity(threadId="thread", runId="plan-b")
+    first_identity = RunIdentity(namespace="test", thread_id="thread", run_id="plan-a")
+    second_identity = RunIdentity(namespace="test", thread_id="thread", run_id="plan-b")
     events = (
         _event(
             1,

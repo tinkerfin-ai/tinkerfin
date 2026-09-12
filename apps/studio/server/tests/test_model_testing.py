@@ -719,3 +719,68 @@ async def test_connection_and_dns_failures_have_safe_network_result(
         result.code == "network_error"
         and "private-draft-key" not in result.model_dump_json()
     )
+
+
+async def test_http_cancellation_waits_for_client_close_after_repeated_cancel(
+    database, monkeypatch
+):
+    """重复取消请求不能截断测试客户端已开始的关闭"""
+    started, cleaning, release, closed = (asyncio.Event() for _ in range(4))
+
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("不可达")
+
+        async def aclose(self) -> None:
+            cleaning.set()
+            await release.wait()
+            closed.set()
+
+    app = FastAPI()
+    app.include_router(model_router.router)
+    app.dependency_overrides[model_router._test_user] = lambda: UserContext(
+        user_id=1, username="tester", display_name="Tester", roles=(), disabled=False
+    )
+    monkeypatch.setattr(
+        model_router,
+        "get_resources",
+        lambda app: SimpleNamespace(
+            database=database, settings=SimpleNamespace(model_allowed_origins=())
+        ),
+    )
+    monkeypatch.setattr(testing, "ModelTransport", lambda **kwargs: Transport())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        request = asyncio.create_task(
+            client.post(
+                "/models/configurations/test",
+                json={
+                    "kind": "basic",
+                    "configuration": {
+                        **draft().model_dump(mode="json"),
+                        "api_key": "private-draft-key",
+                    },
+                },
+            )
+        )
+        try:
+            await started.wait()
+            request.cancel("首次取消")
+            await cleaning.wait()
+            request.cancel("重复取消")
+            delivered = asyncio.Event()
+            asyncio.get_running_loop().call_soon(delivered.set)
+            await delivered.wait()
+            assert not request.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+            assert closed.is_set()
+        finally:
+            release.set()
+            if not request.done():
+                request.cancel()
+            await asyncio.gather(request, return_exceptions=True)

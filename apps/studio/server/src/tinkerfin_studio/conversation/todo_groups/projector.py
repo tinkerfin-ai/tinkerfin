@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, TypeGuard
 
@@ -42,123 +42,59 @@ class _TodoValue:
     status: Literal["pending", "in_progress", "completed"]
 
 
+@dataclass(slots=True, kw_only=True, eq=False)
 class _ToolCallState:
-    __slots__ = (
-        "created_at",
-        "result",
-        "source_tool_call_id",
-        "started_trace_seq",
-        "tool_call_id",
+    """一个工具调用的关联身份及结果"""
+
+    tool_call_id: str
+    source_tool_call_id: str
+    started_trace_seq: int
+    created_at: datetime
+    result: Literal["pending", "succeeded", "failed"] = field(
+        default="pending", init=False
     )
 
-    def __init__(
-        self,
-        *,
-        tool_call_id: str,
-        source_tool_call_id: str,
-        started_trace_seq: int,
-        created_at: datetime,
-    ) -> None:
-        self.tool_call_id = tool_call_id
-        self.source_tool_call_id = source_tool_call_id
-        self.started_trace_seq = started_trace_seq
-        self.created_at = created_at
-        self.result: Literal["pending", "succeeded", "failed"] = "pending"
 
-
+@dataclass(slots=True, kw_only=True, eq=False)
 class _GroupState:
-    __slots__ = (
-        "created_at",
-        "created_order",
-        "status",
-        "todos",
-        "tool_call_id",
-        "turn_id",
-    )
+    """一次提问的任务组及最近任务状态"""
 
-    def __init__(
-        self,
-        *,
-        turn_id: str,
-        tool_call_id: str,
-        created_at: datetime,
-        created_order: int,
-        todos: tuple[_TodoValue, ...],
-    ) -> None:
-        self.turn_id = turn_id
-        self.tool_call_id = tool_call_id
-        self.created_at = created_at
-        self.created_order = created_order
-        self.status: TodoGroupStatus = "running"
-        self.todos = todos
+    turn_id: str
+    tool_call_id: str
+    created_at: datetime
+    created_order: int
+    todos: tuple[_TodoValue, ...]
+    status: TodoGroupStatus = field(default="running", init=False)
 
 
+@dataclass(slots=True, kw_only=True, eq=False)
 class _TurnState:
-    __slots__ = (
-        "expected_user_message_source_id",
-        "group",
-        "message_error",
-        "origin_run_id",
-        "root_todo_calls",
-        "selected_candidate_tool_call_id",
-        "turn_id",
-        "user_message_id",
-        "user_message_preview",
-    )
+    """用户提问与候选任务工具之间的关联状态"""
 
-    def __init__(
-        self,
-        *,
-        turn_id: str,
-        origin_run_id: str,
-        expected_user_message_source_id: str | None,
-    ) -> None:
-        self.turn_id = turn_id
-        self.origin_run_id = origin_run_id
-        self.expected_user_message_source_id = expected_user_message_source_id
-        self.user_message_id: str | None = None
-        self.user_message_preview: str | None = None
-        self.message_error = False
-        self.root_todo_calls: list[_ToolCallState] = []
-        self.selected_candidate_tool_call_id: str | None = None
-        self.group: _GroupState | None = None
+    turn_id: str
+    origin_run_id: str
+    expected_user_message_source_id: str | None
+    user_message_id: str | None = field(default=None, init=False)
+    user_message_preview: str | None = field(default=None, init=False)
+    message_error: bool = field(default=False, init=False)
+    root_todo_calls: list[_ToolCallState] = field(default_factory=list, init=False)
+    selected_candidate_tool_call_id: str | None = field(default=None, init=False)
+    group: _GroupState | None = field(default=None, init=False)
 
 
+@dataclass(slots=True, kw_only=True, eq=False)
 class _RunState:
-    __slots__ = (
-        "input_kind",
-        "outcome",
-        "outcome_applied",
-        "parent_run_id",
-        "resume_checkpointed",
-        "run_id",
-        "turn_id",
-    )
+    """普通提问或恢复运行在所属提问中的状态"""
 
-    def __init__(
-        self,
-        *,
-        run_id: str,
-        input_kind: Literal["ordinary", "branch", "resume", "abandon"],
-        parent_run_id: str | None,
-        turn_id: str | None,
-    ) -> None:
-        self.run_id = run_id
-        self.input_kind = input_kind
-        self.parent_run_id = parent_run_id
-        self.turn_id = turn_id
-        self.resume_checkpointed = False
-        self.outcome: (
-            Literal[
-                "succeeded",
-                "interrupted",
-                "failed",
-                "cancelled",
-                "abandoned",
-            ]
-            | None
-        ) = None
-        self.outcome_applied = False
+    run_id: str
+    input_kind: Literal["ordinary", "branch", "resume", "abandon"]
+    parent_run_id: str | None
+    turn_id: str | None
+    resume_checkpointed: bool = field(default=False, init=False)
+    outcome: (
+        Literal["succeeded", "interrupted", "failed", "cancelled", "abandoned"] | None
+    ) = field(default=None, init=False)
+    outcome_applied: bool = field(default=False, init=False)
 
 
 class TodoGroupProjector:
@@ -441,7 +377,7 @@ class TodoGroupProjector:
         self._run_heads.add(run_id)
 
     def _consume_turn(self, fact: TurnFact) -> None:
-        if fact.namespace:
+        if fact.graph_namespace:
             return
         run_id = fact.identity.run_id
         run = self._runs.get(run_id)
@@ -464,7 +400,7 @@ class TodoGroupProjector:
         self._run_to_turn[run_id] = fact.turn_id
 
     def _consume_message(self, fact: MessageFact) -> None:
-        if fact.namespace:
+        if fact.graph_namespace:
             return
         turn = self._turn_for_run(fact.identity.run_id)
         if turn is None:
@@ -500,7 +436,7 @@ class TodoGroupProjector:
         turn.user_message_preview = preview
 
     def _consume_tool(self, event: TraceEvent, fact: ToolFact) -> None:
-        if fact.namespace or fact.tool_name != "write_todos":
+        if fact.graph_namespace or fact.tool_name != "write_todos":
             return
         if fact.phase == "started":
             turn = self._turn_for_run(fact.identity.run_id)
@@ -538,7 +474,7 @@ class TodoGroupProjector:
         self._select_candidate(self._turns[turn_id])
 
     def _consume_state(self, event: TraceEvent, fact: StateRevisionFact) -> None:
-        if fact.namespace:
+        if fact.graph_namespace:
             return
         if fact.changes.disposition == "omitted":
             self._fail("todo_state_omitted")

@@ -57,7 +57,9 @@ async def test_interrupt_correlation_is_public_and_remains_resumable(
         event
         async for event in astream_events(
             parts(),
-            identity=RunIdentity(threadId="privacy-thread", runId="privacy-run"),
+            identity=RunIdentity(
+                namespace="test", thread_id="privacy-thread", run_id="privacy-run"
+            ),
             expose_reasoning_events=expose_reasoning,
         )
     ]
@@ -155,7 +157,9 @@ async def test_interleaved_text_and_parallel_tools_share_one_message(
         event
         async for event in astream_events(
             parts(),
-            identity=RunIdentity(threadId="mixed-thread", runId="mixed-run"),
+            identity=RunIdentity(
+                namespace="test", thread_id="mixed-thread", run_id="mixed-run"
+            ),
         )
     ]
     starts = [event for event in events if isinstance(event, TextMessageStartEvent)]

@@ -19,21 +19,23 @@ from tinkerfin_messaging import (
     MessageEnvelope,
     MessageSubscription,
     Messaging,
-    MessagingBackend,
-    MessagingBackendSettings,
     MessagingClosed,
     MessagingNotStarted,
-    MessagingTransition,
-    MessagingTransitionResult,
     RecoverableMessage,
     RecoveryCheckpoint,
     RunProducerFailed,
 )
 from tinkerfin_messaging._messaging_ledger import BackendRunHandle
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackend,
+    MessagingBackendSettings,
+    MessagingTransition,
+    MessagingTransitionResult,
+)
 
 
 def _identity(*, run_id: str = "run-1") -> RunIdentity:
-    return RunIdentity(threadId="conversation-1", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="conversation-1", run_id=run_id)
 
 
 class _TextCodec:
@@ -1534,14 +1536,29 @@ async def test_caller_cancellation_outranks_late_close_failure() -> None:
     await asyncio.wait_for(backend.finish_started.wait(), timeout=1)
 
     closing.cancel("caller cancelled close")
-    done, _ = await asyncio.wait({closing}, timeout=0.05)
-    settled_before_finish = closing in done
+    cancellation_delivered = asyncio.Event()
+    asyncio.get_running_loop().call_soon(cancellation_delivered.set)
+    await cancellation_delivered.wait()
+    settled_before_finish = closing.done()
     backend.release_finish.set()
     with pytest.raises(asyncio.CancelledError) as captured:
         await closing
 
-    notes = "\n".join(getattr(captured.value, "__notes__", ()))
     assert not settled_before_finish
-    assert "BackendOwnershipLost" in notes
+    pending: list[BaseException] = [captured.value]
+    seen: set[int] = set()
+    retained = False
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        retained = retained or isinstance(error, BackendOwnershipLost)
+        pending.extend(
+            item for item in (error.__cause__, error.__context__) if item is not None
+        )
+        if isinstance(error, BaseExceptionGroup):
+            pending.extend(error.exceptions)
+    assert retained
     assert source.close_calls == 1
     assert backend.finish_calls == 1

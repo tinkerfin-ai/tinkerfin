@@ -12,7 +12,8 @@ class MessagingLimits:
     Limits apply to encoded payload and checkpoint bytes before backend mutation.
     Thread totals count committed payload bytes and messages in the current generation;
     `delete_stream()` starts a new generation with empty thread counters. Total limits
-    cover one MemoryBackend instance or Redis key_prefix across all channels. Bytes
+    cover one MemoryBackend instance, SQL database, or Redis key_prefix across all
+    channels. Bytes
     count payloads and retained checkpoint positions and message identifiers, including
     both per-message evidence and the latest checkpoint of each Run. Records count
     channels, threads, live generations, Runs, messages, and generation tombstones.

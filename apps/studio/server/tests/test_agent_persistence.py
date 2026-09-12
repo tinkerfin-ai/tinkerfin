@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from types import TracebackType
-from uuid import uuid4
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from tests.support.docker_services import RedisTestService
 
 from tinkerfin_studio.agent import persistence as persistence_module
 from tinkerfin_studio.agent.persistence import AgentPersistence
-from tinkerfin_studio.config.settings import DatabaseSettings, RedisRuntimeSettings
+from tinkerfin_studio.config.settings import RedisRuntimeSettings
 
 
 @dataclass(slots=True)
@@ -82,44 +84,40 @@ class _FakeSaver:
             raise self._trace.saver_setup_error
 
 
-def _database_settings() -> DatabaseSettings:
-    return DatabaseSettings(
-        url="mysql+asyncmy://root:secret@127.0.0.1:3306/test",
-        connection_budget=21,
-        management_connection_reserve=10,
-    )
+@pytest_asyncio.fixture
+async def persistence_engine() -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine("sqlite+aiosqlite://")
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
 
 
 def _redis_settings(
     *,
     host: str = "127.0.0.1",
     port: int = 6379,
-    prefix: str = "test",
 ) -> RedisRuntimeSettings:
     return RedisRuntimeSettings(
         host=host,
         port=port,
         database=15,
         checkpoint_database=0,
-        messaging_key_prefix=f"{prefix}:messaging",
-        checkpoint_prefix=f"{prefix}:checkpoint",
-        checkpoint_write_prefix=f"{prefix}:checkpoint-write",
     )
 
 
 def _install_fakes(
     monkeypatch: pytest.MonkeyPatch,
     trace: _LifecycleTrace,
+    persistence_engine: AsyncEngine,
 ) -> tuple[_FakeStore, _FakeRedis, _FakeSaver]:
     resource = _FakeStoreResource(trace)
     redis = _FakeRedis(trace)
     saver = _FakeSaver(trace)
 
-    class StoreFactory:
-        @classmethod
-        def from_conn_string(cls, url: str) -> _FakeStoreResource:
-            assert url == _database_settings().url
-            return resource
+    def create_store(engine: AsyncEngine) -> _FakeStoreResource:
+        assert engine is persistence_engine
+        return resource
 
     def create_redis(*_args: object, **_kwargs: object) -> _FakeRedis:
         trace.events.append("redis.create")
@@ -133,23 +131,24 @@ def _install_fakes(
             raise trace.saver_create_error
         return saver
 
-    monkeypatch.setattr(persistence_module, "AsyncMyStore", StoreFactory)
+    monkeypatch.setattr(persistence_module, "SqlAlchemyStore", create_store)
     monkeypatch.setattr(persistence_module, "create_redis_client", create_redis)
     monkeypatch.setattr(persistence_module, "AsyncRedisSaver", create_saver)
     return resource.store, redis, saver
 
 
-def _persistence() -> AgentPersistence:
-    return AgentPersistence(_database_settings(), _redis_settings())
+def _persistence(engine: AsyncEngine) -> AgentPersistence:
+    return AgentPersistence(engine, _redis_settings())
 
 
 @pytest.mark.asyncio
 async def test_successful_lifecycle_publishes_then_closes_owned_resources(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     trace = _LifecycleTrace()
-    store, _redis, saver = _install_fakes(monkeypatch, trace)
-    persistence = _persistence()
+    store, _redis, saver = _install_fakes(monkeypatch, trace, persistence_engine)
+    persistence = _persistence(persistence_engine)
 
     async with persistence:
         assert persistence.store is store
@@ -172,13 +171,14 @@ async def test_successful_lifecycle_publishes_then_closes_owned_resources(
 @pytest.mark.asyncio
 async def test_store_setup_failure_closes_before_other_resources_start(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     setup_error = RuntimeError("store setup failed")
     trace = _LifecycleTrace(store_setup_error=setup_error)
-    _install_fakes(monkeypatch, trace)
+    _install_fakes(monkeypatch, trace, persistence_engine)
 
     with pytest.raises(RuntimeError, match="store setup failed") as raised:
-        await _persistence().__aenter__()
+        await _persistence(persistence_engine).__aenter__()
 
     assert raised.value is setup_error
     assert trace.events == ["store.enter", "store.setup", "store.close"]
@@ -187,11 +187,12 @@ async def test_store_setup_failure_closes_before_other_resources_start(
 @pytest.mark.asyncio
 async def test_redis_close_failure_still_closes_store_and_settles_once(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     redis_error = RuntimeError("redis close failed")
     trace = _LifecycleTrace(redis_close_error=redis_error)
-    _install_fakes(monkeypatch, trace)
-    persistence = await _persistence().__aenter__()
+    _install_fakes(monkeypatch, trace, persistence_engine)
+    persistence = await _persistence(persistence_engine).__aenter__()
 
     with pytest.raises(RuntimeError, match="redis close failed") as raised:
         await persistence.__aexit__(None, None, None)
@@ -210,6 +211,7 @@ async def test_redis_close_failure_still_closes_store_and_settles_once(
 @pytest.mark.asyncio
 async def test_multiple_cleanup_failures_are_reported_together(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     redis_error = RuntimeError("redis close failed")
     store_error = OSError("store close failed")
@@ -217,8 +219,8 @@ async def test_multiple_cleanup_failures_are_reported_together(
         redis_close_error=redis_error,
         store_close_error=store_error,
     )
-    _install_fakes(monkeypatch, trace)
-    persistence = await _persistence().__aenter__()
+    _install_fakes(monkeypatch, trace, persistence_engine)
+    persistence = await _persistence(persistence_engine).__aenter__()
 
     with pytest.raises(ExceptionGroup) as raised:
         await persistence.__aexit__(None, None, None)
@@ -230,6 +232,7 @@ async def test_multiple_cleanup_failures_are_reported_together(
 @pytest.mark.asyncio
 async def test_setup_failure_remains_primary_when_both_cleanups_fail(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     setup_error = ValueError("checkpointer setup failed")
     redis_error = RuntimeError("redis close failed")
@@ -239,10 +242,10 @@ async def test_setup_failure_remains_primary_when_both_cleanups_fail(
         redis_close_error=redis_error,
         store_close_error=store_error,
     )
-    _install_fakes(monkeypatch, trace)
+    _install_fakes(monkeypatch, trace, persistence_engine)
 
     with pytest.raises(ValueError, match="checkpointer setup failed") as raised:
-        await _persistence().__aenter__()
+        await _persistence(persistence_engine).__aenter__()
 
     assert raised.value is setup_error
     assert isinstance(raised.value.__cause__, ExceptionGroup)
@@ -254,6 +257,7 @@ async def test_setup_failure_remains_primary_when_both_cleanups_fail(
 @pytest.mark.parametrize("failure_stage", ["redis", "saver"])
 async def test_construction_failure_closes_an_already_open_store(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
     failure_stage: str,
 ) -> None:
     construction_error = ConnectionError(f"{failure_stage} construction failed")
@@ -261,10 +265,10 @@ async def test_construction_failure_closes_an_already_open_store(
         redis_create_error=(construction_error if failure_stage == "redis" else None),
         saver_create_error=(construction_error if failure_stage == "saver" else None),
     )
-    _install_fakes(monkeypatch, trace)
+    _install_fakes(monkeypatch, trace, persistence_engine)
 
     with pytest.raises(ConnectionError, match="construction failed") as raised:
-        await _persistence().__aenter__()
+        await _persistence(persistence_engine).__aenter__()
 
     assert raised.value is construction_error
     assert trace.events[-1] == "store.close"
@@ -275,10 +279,11 @@ async def test_construction_failure_closes_an_already_open_store(
 @pytest.mark.asyncio
 async def test_cleanup_cancellation_propagates_after_store_close(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     trace = _LifecycleTrace(redis_close_error=asyncio.CancelledError())
-    _install_fakes(monkeypatch, trace)
-    persistence = await _persistence().__aenter__()
+    _install_fakes(monkeypatch, trace, persistence_engine)
+    persistence = await _persistence(persistence_engine).__aenter__()
 
     with pytest.raises(asyncio.CancelledError):
         await persistence.__aexit__(None, None, None)
@@ -289,14 +294,15 @@ async def test_cleanup_cancellation_propagates_after_store_close(
 @pytest.mark.asyncio
 async def test_body_failure_remains_primary_when_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     body_error = KeyError("body failed")
     close_error = RuntimeError("redis close failed")
     trace = _LifecycleTrace(redis_close_error=close_error)
-    _install_fakes(monkeypatch, trace)
+    _install_fakes(monkeypatch, trace, persistence_engine)
 
     with pytest.raises(KeyError, match="body failed") as raised:
-        async with _persistence():
+        async with _persistence(persistence_engine):
             raise body_error
 
     assert raised.value is body_error
@@ -307,14 +313,15 @@ async def test_body_failure_remains_primary_when_cleanup_fails(
 @pytest.mark.asyncio
 async def test_cleanup_cancellation_outranks_body_failure_and_preserves_cause(
     monkeypatch: pytest.MonkeyPatch,
+    persistence_engine: AsyncEngine,
 ) -> None:
     body_error = ValueError("body failed")
     cancellation = asyncio.CancelledError()
     trace = _LifecycleTrace(redis_close_error=cancellation)
-    _install_fakes(monkeypatch, trace)
+    _install_fakes(monkeypatch, trace, persistence_engine)
 
     with pytest.raises(asyncio.CancelledError) as raised:
-        async with _persistence():
+        async with _persistence(persistence_engine):
             raise body_error
 
     assert raised.value is cancellation
@@ -327,23 +334,21 @@ async def test_real_store_and_checkpointer_complete_one_owned_lifecycle(
     mysql_sandbox_url: str,
     redis_test_service: RedisTestService,
 ) -> None:
-    token = f"agent-persistence:{uuid4().hex}"
+    engine = create_async_engine(mysql_sandbox_url)
     persistence = AgentPersistence(
-        DatabaseSettings(
-            url=mysql_sandbox_url,
-            connection_budget=21,
-            management_connection_reserve=10,
-        ),
+        engine,
         _redis_settings(
             host=redis_test_service.host,
             port=redis_test_service.port,
-            prefix=token,
         ),
     )
 
-    async with persistence:
-        assert persistence.store is not None
-        assert persistence.checkpointer is not None
+    try:
+        async with persistence:
+            assert persistence.store is not None
+            assert persistence.checkpointer is not None
+    finally:
+        await engine.dispose()
 
     with pytest.raises(RuntimeError, match="尚未启动"):
         _ = persistence.store

@@ -362,8 +362,8 @@ def _process_task_start(
             )
             provenance = create_subagent_provenance(
                 identity=self._identity,
-                namespace=child_namespace,
-                parent_namespace=parent_namespace,
+                graph_namespace=child_namespace,
+                parent_graph_namespace=parent_namespace,
                 graph_task_id=payload.id,
                 agent_name=descriptor.subagent_type,
                 parent_tool_call_id=parent_tool_call_id,

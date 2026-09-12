@@ -5,6 +5,7 @@ import inspect
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextvars import ContextVar
+from types import ModuleType
 
 import pytest
 from ag_ui.core import (
@@ -18,10 +19,9 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
 from tinkerfin import (
-    AgUiEventStream,
-    DeepAgentDefinition,
+    AgentRuntime,
+    AgUiRunStream,
     RunIdentity,
-    TinkerFin,
     TinkerFinStreamProtocolError,
 )
 from tinkerfin_native_stream import NativeStreamContractError
@@ -32,7 +32,7 @@ def _identity(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 class _SourceGraph:
@@ -53,14 +53,14 @@ setattr(
     inspect.signature(CompiledStateGraph.astream),
 )
 
-_DEFINITION_FACTORY: ContextVar[Callable[..., DeepAgentDefinition[None]] | None] = (
-    ContextVar("tinkerfin_test_definition_factory", default=None)
+_DEFINITION_FACTORY: ContextVar[Callable[..., AgentRuntime[None]] | None] = ContextVar(
+    "tinkerfin_test_definition_factory", default=None
 )
 
 
 @pytest.fixture(autouse=True)
 def _bind_definition_factory(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> Iterator[None]:
     token = _DEFINITION_FACTORY.set(definition_factory)
     try:
@@ -78,18 +78,33 @@ def _agui_stream(
     expose_reasoning_events: bool = False,
     expose_subagent_events: bool = True,
     on_event: Callable[[BaseEvent], Awaitable[None]] | None = None,
-) -> AgUiEventStream:
+) -> AgUiRunStream:
     definition_factory = _DEFINITION_FACTORY.get()
     assert definition_factory is not None
-    runtime = definition_factory(_SourceGraph(source_factory)).new_agui(
-        identity=_identity() if identity is None else identity,
-        timeout=timeout,
-        settlement_timeout=settlement_timeout,
-        expose_reasoning_events=expose_reasoning_events,
-        expose_subagent_events=expose_subagent_events,
-        on_event=on_event,
+    runtime = definition_factory(_SourceGraph(source_factory))
+    return runtime.open_agui_run(
+        thread_id=(_identity() if identity is None else identity).thread_id,
+        run_id=(_identity() if identity is None else identity).run_id,
+        stream_timeout=timeout,
+        cleanup_timeout=settlement_timeout,
+        include_reasoning_events=expose_reasoning_events,
+        include_subagent_events=expose_subagent_events,
+        on_agui_event=on_event,
+        input=InputAgentState(messages=[]),
     )
-    return runtime.astream(InputAgentState(messages=[]))
+
+
+def _initialization_failure(
+    error: Exception, *, identity: RunIdentity, parent_run_id: str | None = None
+) -> AgUiRunStream:
+    build = _DEFINITION_FACTORY.get()
+    assert build is not None
+    return build(error).open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        input=InputAgentState(messages=[]),
+        parent_run_id=parent_run_id,
+    )
 
 
 def test_agui_rejects_noncanonical_identity_at_construction() -> None:
@@ -118,7 +133,7 @@ async def test_agui_stream_publishes_its_idempotent_cancel_callback() -> None:
     identity = _identity()
     stream = _agui_stream(parts, identity=identity)
 
-    assert stream.messaging_identity is identity
+    assert stream.messaging_identity == identity
     assert stream.messaging_cancel_callback == stream.abort
     assert (await anext(stream)).type.value == "RUN_STARTED"
     tail = await stream.messaging_cancel_callback()
@@ -139,7 +154,7 @@ async def test_agui_stream_keeps_its_immutable_identity() -> None:
     started = await anext(stream)
 
     assert isinstance(started, RunStartedEvent)
-    assert stream.messaging_identity is identity
+    assert stream.messaging_identity == identity
     assert started.input is None
     await stream.aclose()
 
@@ -148,7 +163,7 @@ async def test_agui_stream_keeps_its_immutable_identity() -> None:
 async def test_initialization_failure_uses_the_standard_complete_lifecycle() -> None:
     identity = _identity()
 
-    stream = TinkerFin().failed_agui_run(
+    stream = _initialization_failure(
         RuntimeError("cannot initialize runtime"),
         identity=identity,
     )
@@ -173,7 +188,7 @@ async def test_initialization_failure_marker_uses_canonical_identity_and_parent(
     None
 ):
     identity = _identity(thread_id="thread-1")
-    stream = TinkerFin().failed_agui_run(
+    stream = _initialization_failure(
         RuntimeError("cannot initialize runtime"),
         identity=identity,
         parent_run_id="run-parent",
@@ -192,7 +207,7 @@ async def test_initialization_failure_marker_uses_canonical_identity_and_parent(
 
 @pytest.mark.asyncio
 async def test_initialization_failure_cancel_tail_keeps_release_marker() -> None:
-    stream = TinkerFin().failed_agui_run(
+    stream = _initialization_failure(
         RuntimeError("cannot initialize runtime"),
         identity=_identity(),
     )
@@ -263,7 +278,7 @@ async def test_agui_abort_rejects_reentry_from_its_event_observer() -> None:
         if False:  # pragma: no cover - only supplies the asynchronous source shape
             yield None
 
-    stream: AgUiEventStream | None = None
+    stream: AgUiRunStream | None = None
 
     async def on_event(_: BaseEvent) -> None:
         assert stream is not None
@@ -271,7 +286,7 @@ async def test_agui_abort_rejects_reentry_from_its_event_observer() -> None:
 
     stream = _agui_stream(parts, on_event=on_event)
 
-    with pytest.raises(RuntimeError, match="from its on_event callback"):
+    with pytest.raises(RuntimeError, match="from a run callback"):
         await anext(stream)
 
 
@@ -281,7 +296,7 @@ async def test_agui_abort_rejects_child_task_reentry_from_event_observer() -> No
         if False:  # pragma: no cover - only supplies the asynchronous source shape
             yield None
 
-    stream: AgUiEventStream | None = None
+    stream: AgUiRunStream | None = None
     abort_task: asyncio.Task[list[BaseEvent]] | None = None
 
     async def on_event(_: BaseEvent) -> None:
@@ -300,7 +315,7 @@ async def test_agui_abort_rejects_child_task_reentry_from_event_observer() -> No
 
         assert isinstance(consumer_outcome, BaseEvent)
         assert isinstance(abort_outcome, RuntimeError)
-        assert "from its on_event callback" in str(abort_outcome)
+        assert "from a run callback" in str(abort_outcome)
     finally:
         await asyncio.gather(consumer, return_exceptions=True)
         if abort_task is not None:
@@ -343,7 +358,7 @@ async def test_agui_aclose_from_observer_child_task_preserves_current_event() ->
         if False:  # pragma: no cover - only supplies the asynchronous source shape
             yield None
 
-    stream: AgUiEventStream | None = None
+    stream: AgUiRunStream | None = None
     close_task: asyncio.Task[None] | None = None
 
     async def on_event(_: BaseEvent) -> None:
@@ -375,7 +390,7 @@ async def test_agui_abort_from_terminal_observer_is_an_idempotent_noop() -> None
         if False:  # pragma: no cover - only supplies the asynchronous source shape
             yield None
 
-    stream: AgUiEventStream | None = None
+    stream: AgUiRunStream | None = None
     abort_tail: list[BaseEvent] | None = None
 
     async def on_event(event: BaseEvent) -> None:
@@ -489,7 +504,7 @@ def _message_part(message: object) -> dict[str, object]:
     }
 
 
-async def _collect_events(stream: AgUiEventStream) -> list[BaseEvent]:
+async def _collect_events(stream: AsyncIterator[BaseEvent]) -> list[BaseEvent]:
     return [event async for event in stream]
 
 
@@ -620,6 +635,8 @@ class _BudgetedClosingParts:
 @pytest.mark.asyncio
 async def test_agui_conversion_error_survives_two_upstream_close_failures() -> None:
     parts = _TwoStageFailingCloseParts()
+    from tinkerfin.runtime import AgUiEventStream
+
     stream = AgUiEventStream(
         parts=parts,
         identity=_identity(),
@@ -682,16 +699,33 @@ def test_agui_rejects_invalid_settlement_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agui_settlement_timeout_retains_close_for_a_second_waiter() -> None:
+async def test_agui_settlement_timeout_retains_close_for_a_second_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadlines: dict[int, asyncio.Timeout] = {}
+
+    def timeout(delay: float | None) -> asyncio.Timeout:
+        deadline = asyncio.Timeout(None)
+        deadlines[id(asyncio.current_task())] = deadline
+        return deadline
+
+    controlled = ModuleType("controlled_asyncio")
+    controlled.__dict__.update(vars(asyncio))
+    setattr(controlled, "timeout", timeout)
+    monkeypatch.setattr("tinkerfin._runtime_agui.asyncio", controlled)
     parts = _BudgetedClosingParts()
-    stream = _agui_stream(lambda: parts, settlement_timeout=0.01)
+    stream = _agui_stream(lambda: parts, settlement_timeout=30)
     assert (await anext(stream)).type.value == "RUN_STARTED"
     active_pull = asyncio.create_task(anext(stream))
     await parts.pull_started.wait()
+    closing = asyncio.create_task(stream.aclose())
 
     try:
+        await parts.close_started.wait()
+        # Expire only this caller's wait once native cleanup is demonstrably active.
+        deadlines[id(closing)].reschedule(0)
         with pytest.raises(TimeoutError, match="settlement timed out") as raised:
-            await stream.aclose()
+            await closing
         assert type(raised.value).__name__ == "AgUiSettlementTimeoutError"
         assert parts.close_started.is_set()
         assert not parts.close_cancelled.is_set()
@@ -701,7 +735,7 @@ async def test_agui_settlement_timeout_retains_close_for_a_second_waiter() -> No
         await stream.aclose()
     finally:
         parts.release_close.set()
-        await asyncio.gather(active_pull, return_exceptions=True)
+        await asyncio.gather(active_pull, closing, return_exceptions=True)
         await asyncio.gather(stream.aclose(), return_exceptions=True)
 
     assert parts.closed.is_set()

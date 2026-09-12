@@ -21,9 +21,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
-Repository = "https://github.com/tinkerfin-ai/tinkerfin"
-Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin-harness/issues"
 
 [build-system]
 requires = ["setuptools>=77"]

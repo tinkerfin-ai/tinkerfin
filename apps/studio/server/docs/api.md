@@ -11,16 +11,13 @@
 
 ## 认证会话
 
-`AUTH_TOKEN_EXPIRE_SECONDS` 控制访问令牌从签发时刻起的固定有效期，默认值为 `86400`。
-请求和用户操作不会延长到期时间。`POST /api/auth/login` 返回访问令牌、UTC `expires_at`
+访问令牌从签发时刻起使用固定有效期，请求和用户操作不会延长到期时间。`POST /api/auth/login` 返回访问令牌、UTC `expires_at`
 和用户信息；`GET /api/auth/me` 返回同一 `expires_at` 和当前用户。后端在每个认证请求上以
-Redis Control 记录及其固定到期时间为准，过期、撤销或无效令牌统一返回 401。
+Redis 记录及其固定到期时间为准，过期、撤销或无效令牌统一返回 401。
 
 登录、`/api/auth/me` 和用户查询响应中的 `avatar_url` 为可空 HTTPS 头像地址。
 `PATCH /api/user/me` 修改当前登录用户资料：`display_name` 必须是 1～128 个字符，
 `avatar_url` 最大 2048 个字符且必须使用 HTTPS，传入 `null` 可清空头像。
-
-配置只作用于服务重新加载后签发的令牌，已有令牌保持签发时确定的到期时间。
 
 ## 对话请求边界
 
@@ -44,7 +41,7 @@ Redis Control 记录及其固定到期时间为准，过期、撤销或无效令
 
 会话标题最多 32 个 Unicode 字符，临时标题截取用户输入前 16 个字符。首条有效文本使用当前会话模型并行总结一次，关闭标题调用的推理和自动重试。标题保存成功后通过原会话 SSE 发送 `CUSTOM` 事件 `studio.conversation.title.updated`，值包含 `threadId`、`title`、`titleSource`、`titleGenerationStatus`、`titleSeq`。手动命名包括同名保存都会固定标题，自动生成不能覆盖。
 
-标题任务属于发起运行的原响应，响应结束或断连时取消未完成任务；主回复不等待标题。超时和失败不自动重试。通知未送达时，已经保存的标题通过历史查询或 Trace 初始快照读取。
+标题任务随发起运行的响应消费；响应流关闭时取消未完成任务，主回复不等待标题。超时和失败不自动重试。通知未送达时，已经保存的标题通过历史查询或 Trace 初始快照读取。
 
 `forwardedProps.command.plan` 必须为 `on` 或 `off`，用于开启或关闭计划模式。
 不接受 `forwardedProps.mode`；`command` 中的其他字段会保留，但当前服务端只处理 `plan`。
@@ -87,17 +84,17 @@ Studio 使用框架默认的 Sandbox Runtime 镜像，预装 Playwright 和无�
   `historyCursor` 只扩展同一固定前缀的 Turn 窗口；`includeTaskTrace=true` 会从同一 Trace 前缀
   查询重建根 Agent 任务轨迹，`false` 跳过该投影
 - `GET /api/conversation/{threadId}/trace` 先发送完整 Trace snapshot，再按提交顺序发送语义增量；
-  `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；断连或取消会停止本次订阅
+  `includeTaskTrace=true` 时只在任务轨迹实际变化后发送完整 replacement；关闭订阅会停止本次跟随
 - Trace 视图和增量携带 `generation`、`asOfSeq`、`observedAt`。同一代按事件序号和存储 UTC
   观测时间排序，保留微秒；writer 失活或有效接管可以在同一序号更新运行状态。列表摘要用相同
   规则拒绝迟到快照；相同观测发生内容冲突时重新读取 Trace。历史分页保留固定前缀的原始观测，
   补充历史内容时保留前端已收到的较新运行状态
-- `GET /api/conversation/{threadId}/trace/graph` 在校验用户归属后筛选链路节点，支持 `kind`、`status`、`modelCallId`、`agent`、`provider`、`model`、`namespace`、
+- `GET /api/conversation/{threadId}/trace/graph` 在校验用户归属后筛选链路节点，支持 `kind`、`status`、`modelCallId`、`agent`、`provider`、`model`、`graph_namespace`、
   `query`、`startedAfter`、`startedBefore`、opaque `cursor` 与 `limit`；响应中的 Turn 是容器，
   `matchedNodeIds` 只包含直接命中，响应会补入直接命中所属的 Subagent 链
 - `GET /api/conversation/{threadId}/trace/graph/follow` 先发送同一筛选首页，再持续发送节点
   和 Turn 的 upsert/remove、完整 `orderedNodeIds`、`matchedNodeIds`、`nextCursor`、`asOfSeq`
-  与 `completeness`；断连或取消会停止本次订阅
+  与 `completeness`；关闭订阅会停止本次跟随
 - `POST /api/conversation/chat` 返回当前运行的 AG-UI 事件；终态会话正文仍以 Trace 为准
 
 会话详情和 Trace 初始快照必须包含 `runFailures`；实时更新事件在外层携带同名数组，
@@ -114,7 +111,7 @@ Studio 使用框架默认的 Sandbox Runtime 镜像，预装 Playwright 和无�
 Trace Graph 中，同一 Turn 作用域的节点按真实开始序号平级排列，只有 Subagent 形成嵌套。
 `parentSubagentId` 是唯一展示嵌套关系；`modelCallId` 只关联 Assistant、Tool、Subagent 与产生它的
 Model。Assistant 没有可见正文但对应 Model 确实发出 Tool 调用时，`toolCallOnly` 为 `true`，且不受
-API 查询是否返回 Tool 节点影响。非空 `namespace` 只表示 Graph 作用域，必须有经过校验的 Subagent 来源才能形成嵌套。
+API 查询是否返回 Tool 节点影响。非空 `graphNamespace` 只表示 Graph 作用域，必须有经过校验的 Subagent 来源才能形成嵌套。
 节点以深度优先顺序返回，子智能体嵌套最多 64 层。
 
 Studio 把 Graph kind 固定映射为六类：

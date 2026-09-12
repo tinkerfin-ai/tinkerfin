@@ -1,6 +1,8 @@
 """Agent 模型目录业务服务"""
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import anyio
@@ -151,7 +153,7 @@ class AgentModelService:
                 ModelErrorCode.INVALID_CONFIGURATION,
                 message="附加参数不能覆盖模型、提示词、数量或认证字段",
             )
-        try:
+        async with self._write_transaction():
             await self._repository.lock_owner()
             if await self._repository.in_use(value.model_id):
                 raise BusinessException(ModelErrorCode.IN_USE)
@@ -163,10 +165,6 @@ class AgentModelService:
                 await self._repository.clear_default(write.purpose)
             await self._repository.upsert(write)
             await self._repository.commit()
-        except BaseException:
-            with anyio.CancelScope(shield=True):
-                await self._repository.rollback()
-            raise
 
     async def set_default(self, model_id: str) -> None:
         """启用本人模型并设为同用途默认项，仅影响后续选择
@@ -180,7 +178,7 @@ class AgentModelService:
         Raises:
             BusinessException: 模型不存在或尚未配置密钥
         """
-        try:
+        async with self._write_transaction():
             await self._repository.lock_owner()
             model = await self._repository.get_for_update(model_id)
             if model is None:
@@ -192,33 +190,70 @@ class AgentModelService:
                 )
             await self._repository.set_default(model_id, purpose=model.purpose)
             await self._repository.commit()
-        except BaseException:
-            # 回滚任务由本次操作收回，重复的原生取消也不能提前释放事务所有权
-            rollback = asyncio.create_task(self._repository.rollback())
-            cancelled = False
-            with anyio.CancelScope(shield=True):
-                while not rollback.done():
-                    try:
-                        await asyncio.shield(rollback)
-                    except asyncio.CancelledError:
-                        cancelled = True
-            rollback.result()
-            if cancelled:
-                raise asyncio.CancelledError() from None
-            raise
 
     async def delete_settings(self, model_id: str) -> None:
         """删除本人模型配置，事务失败或取消时回滚，会话历史保持不变"""
-        try:
+        async with self._write_transaction():
             await self._repository.lock_owner()
             if await self._repository.in_use(model_id):
                 raise BusinessException(ModelErrorCode.IN_USE)
             await self._repository.delete(model_id)
             await self._repository.commit()
-        except BaseException:
+
+    @asynccontextmanager
+    async def _write_transaction(self) -> AsyncIterator[None]:
+        """模型写命令失败时完成一次回滚，保留原始失败与重复取消"""
+
+        try:
+            yield
+        except BaseException as primary:  # noqa: BLE001 - 完成回滚后继续交付原始失败
+
+            async def rollback() -> BaseException | None:
+                try:
+                    await self._repository.rollback()
+                except BaseException as error:  # noqa: BLE001 - 控制异常由写命令所有者交付
+                    return error
+                return None
+
+            task = asyncio.create_task(rollback(), name="studio-model-rollback")
+            failures: list[BaseException] = [primary]
+            cancellation = (
+                primary if isinstance(primary, asyncio.CancelledError) else None
+            )
             with anyio.CancelScope(shield=True):
-                await self._repository.rollback()
-            raise
+                while True:
+                    try:
+                        await asyncio.wait((task,))
+                    except asyncio.CancelledError as error:
+                        if cancellation is None:
+                            cancellation = error
+                            failures.append(error)
+                        if not task.done():
+                            continue
+                    break
+            rollback_failure = task.result()
+            if rollback_failure is not None:
+                failures.append(rollback_failure)
+            chosen = next(
+                (
+                    error
+                    for error in failures
+                    if not isinstance(error, (Exception, asyncio.CancelledError))
+                ),
+                cancellation or primary,
+            )
+            remaining = [error for error in failures if error is not chosen]
+            if remaining:
+                secondary = (
+                    remaining[0]
+                    if len(remaining) == 1
+                    else BaseExceptionGroup("模型写入和回滚同时失败", remaining)
+                )
+                try:
+                    raise secondary
+                except BaseException:  # noqa: BLE001 - 保留各异常既有cause，以context交付另一项失败
+                    raise chosen
+            raise chosen
 
     async def resolve_image_model(self) -> AgentModelConfig | None:
         """返回本人启用的默认生图服务，未设置默认项时不调用其他服务"""

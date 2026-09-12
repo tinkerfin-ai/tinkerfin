@@ -5,6 +5,12 @@ from __future__ import annotations
 from tinkerfin_contracts import RunIdentity
 
 
+def thread_key(identity: RunIdentity) -> str:
+    """Encode a complete thread identity for internal storage and cleanup."""
+
+    return identity.thread.model_dump_json(by_alias=True)
+
+
 def required_canonical_text(name: str, value: str) -> str:
     """Validate non-blank text without changing its persisted identity."""
 

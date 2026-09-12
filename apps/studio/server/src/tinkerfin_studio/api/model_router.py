@@ -3,6 +3,7 @@
 import asyncio
 from typing import Annotated
 
+import anyio
 from fastapi import APIRouter, Depends, Request
 
 from tinkerfin_studio.api.dependencies import (
@@ -15,6 +16,7 @@ from tinkerfin_studio.api.dependencies import (
 from tinkerfin_studio.api.errors import BusinessException, ModelErrorCode
 from tinkerfin_studio.api.responses import ApiResponse
 from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.infrastructure._failures import _cleanup_failure_priority
 from tinkerfin_studio.models.schemas import (
     AgentModelCatalog,
     AgentModelSave,
@@ -107,6 +109,7 @@ async def test_model_configuration(
         )
     )
     disconnected = asyncio.create_task(watch_disconnect())
+    primary: BaseException | None = None
     try:
         done, _ = await asyncio.wait(
             (test, disconnected), return_when=asyncio.FIRST_COMPLETED
@@ -114,7 +117,47 @@ async def test_model_configuration(
         if test not in done:
             raise asyncio.CancelledError()
         return ApiResponse.success(await test)
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        test.cancel()
-        disconnected.cancel()
-        await asyncio.gather(test, disconnected, return_exceptions=True)
+        tasks = (test, disconnected)
+        for task in tasks:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        cancellation = primary if isinstance(primary, asyncio.CancelledError) else None
+        with anyio.CancelScope(shield=True):
+            while True:
+                try:
+                    await asyncio.wait(tasks)
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+                    if any(not task.done() for task in tasks):
+                        continue
+                break
+        failures: list[BaseException] = [] if primary is None else [primary]
+        if cancellation is not None and cancellation is not primary:
+            failures.append(cancellation)
+        for task in tasks:
+            try:
+                task.result()
+            except BaseException as error:  # noqa: BLE001 - 收齐后一次性交付原始失败
+                if error is not primary and _cleanup_failure_priority(error):
+                    failures.append(error)
+        if failures:
+            chosen = next(
+                (error for error in failures if _cleanup_failure_priority(error) == 2),
+                cancellation or primary or failures[0],
+            )
+            remaining = [error for error in failures if error is not chosen]
+            if remaining:
+                secondary = (
+                    remaining[0]
+                    if len(remaining) == 1
+                    else BaseExceptionGroup("模型测试与客户端清理同时失败", remaining)
+                )
+                try:
+                    raise secondary
+                except BaseException:  # noqa: BLE001 - 保留取消及各异常原始cause
+                    raise chosen
+            raise chosen

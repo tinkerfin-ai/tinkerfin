@@ -32,8 +32,9 @@ from tinkerfin_tracing import (
 )
 
 _IDENTITY = RunIdentity(
-    threadId="thread:first-success",
-    runId="run-1",
+    namespace="test",
+    thread_id="thread:first-success",
+    run_id="run-1",
 )
 _OCCURRED_AT = datetime(2026, 8, 30, 12, tzinfo=UTC)
 
@@ -482,7 +483,7 @@ def test_projector_ignores_omitted_subgraph_state() -> None:
             StateRevisionFact(
                 source_observation_id="observation:subgraph-state",
                 identity=_IDENTITY,
-                namespace=("tools:subagent",),
+                graph_namespace=("tools:subagent",),
                 occurred_at=_OCCURRED_AT + timedelta(seconds=8),
                 monotonic_ns=7,
                 revision_id="revision:subgraph",
@@ -518,8 +519,9 @@ def test_projector_streams_one_hundred_thousand_events_without_retaining_input()
                 fact=NativeExtraFact(
                     source_observation_id=f"observation:smoke:{trace_seq}",
                     identity=RunIdentity(
-                        threadId="thread:first-success",
-                        runId="run-1",
+                        namespace="test",
+                        thread_id="thread:first-success",
+                        run_id="run-1",
                     ),
                     occurred_at=occurred_at,
                     monotonic_ns=trace_seq,

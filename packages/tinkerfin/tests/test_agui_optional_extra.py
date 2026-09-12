@@ -32,8 +32,8 @@ class Blocker(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, Blocker())
 import tinkerfin
 
-configured = tinkerfin.TinkerFin().plan(default_mode="plan")
-definition = configured.create_deep_agent(model="provider:model", tools=[])
+configured = tinkerfin.TinkerFin().with_namespace("test").with_plan(default_mode="plan")
+definition = configured.build(model="provider:model", tools=[])
 assert definition
 assert not any(
     name == "ag_ui"
@@ -45,9 +45,7 @@ assert not any(
 
 for operation in (
     lambda: tinkerfin.AgUiResumeBinding,
-    lambda: definition.new_agui(
-        identity=tinkerfin.RunIdentity(threadId="thread-core", runId="run-core")
-    ),
+    lambda: definition.open_agui_run(thread_id="thread-core", run_id="run-core", input={"messages": []}),
 ):
     try:
         operation()
@@ -92,9 +90,9 @@ def test_distribution_metadata_declares_current_optional_dependency_graph() -> N
     )
     assert tinkerfin_project["optional-dependencies"]["agui"] == [
         "ag-ui-protocol==0.1.19",
-        "tinkerfin-agui-adapter>=0.1.0,<0.9.0",
+        "tinkerfin-agui-adapter==0.1.0",
     ]
     assert messaging_project["optional-dependencies"]["native"] == [
-        "tinkerfin-native-stream>=0.1.0,<0.9.0"
+        "tinkerfin-native-stream==0.1.0"
     ]
-    assert "tinkerfin[agui,redis]>=0.1.0,<0.9.0" in studio_project["dependencies"]
+    assert "tinkerfin[agui,redis]==0.1.0" in studio_project["dependencies"]

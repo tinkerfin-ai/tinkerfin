@@ -54,13 +54,14 @@ class SubagentProvenance(BaseModel):
         min_length=1,
         description="Logical invocation ID stable across checkpoint resume",
     )
-    namespace: tuple[str, ...] = Field(
+    graph_namespace: tuple[str, ...] = Field(
+        alias="graphNamespace",
         min_length=1,
         description="Complete native child graph namespace",
     )
-    parent_namespace: tuple[str, ...] = Field(
-        alias="parentNamespace",
-        description="Complete namespace that issued the parent task Tool",
+    parent_graph_namespace: tuple[str, ...] = Field(
+        alias="parentGraphNamespace",
+        description="Complete graph namespace that issued the parent task Tool",
     )
     graph_task_id: str = Field(
         alias="graphTaskId",
@@ -87,13 +88,13 @@ class SubagentProvenance(BaseModel):
         description="Main AG-UI request currently carrying this event",
     )
 
-    @field_validator("namespace", "parent_namespace")
+    @field_validator("graph_namespace", "parent_graph_namespace")
     @classmethod
     def namespace_parts_are_canonical(
         cls,
         value: tuple[str, ...],
     ) -> tuple[str, ...]:
-        """Reject empty or whitespace-padded namespace components."""
+        """Reject empty or whitespace-padded graph namespace components."""
 
         if any(not part or part != part.strip() for part in value):
             raise ValueError("subagent namespaces require canonical components")
@@ -101,19 +102,20 @@ class SubagentProvenance(BaseModel):
 
     @model_validator(mode="after")
     def native_relationships_are_consistent(self) -> SubagentProvenance:
-        """Cross-check parent Tool scope and the complete child namespace."""
+        """Cross-check parent Tool scope and the complete child graph namespace."""
 
         kind, parent_tool_namespace, _raw_id = ScopedIdCodec().decode(
             self.parent_tool_call_id
         )
-        if kind != "tool" or parent_tool_namespace != self.parent_namespace:
-            raise ValueError("parentToolCallId does not match parentNamespace")
+        if kind != "tool" or parent_tool_namespace != self.parent_graph_namespace:
+            raise ValueError("parentToolCallId does not match parentGraphNamespace")
         if (
-            len(self.namespace) != len(self.parent_namespace) + 1
-            or self.namespace[: len(self.parent_namespace)] != self.parent_namespace
-            or not self.namespace[-1].startswith(f"tools:{self.graph_task_id}")
+            len(self.graph_namespace) != len(self.parent_graph_namespace) + 1
+            or self.graph_namespace[: len(self.parent_graph_namespace)]
+            != self.parent_graph_namespace
+            or not self.graph_namespace[-1].startswith(f"tools:{self.graph_task_id}")
         ):
-            raise ValueError("namespace does not match the native graph task")
+            raise ValueError("graph namespace does not match the native graph task")
         return self
 
 
@@ -157,8 +159,8 @@ def subagent_invocation_id(
 def create_subagent_provenance(
     *,
     identity: RunIdentity,
-    namespace: tuple[str, ...],
-    parent_namespace: tuple[str, ...],
+    graph_namespace: tuple[str, ...],
+    parent_graph_namespace: tuple[str, ...],
     graph_task_id: str,
     agent_name: str,
     parent_tool_call_id: str,
@@ -172,8 +174,8 @@ def create_subagent_provenance(
             identity=identity,
             parent_tool_call_id=parent_tool_call_id,
         ),
-        namespace=namespace,
-        parentNamespace=parent_namespace,
+        graphNamespace=graph_namespace,
+        parentGraphNamespace=parent_graph_namespace,
         graphTaskId=graph_task_id,
         agentName=agent_name,
         parentToolCallId=parent_tool_call_id,

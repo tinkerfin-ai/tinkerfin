@@ -95,7 +95,7 @@ fi
 
 printf '启动服务并等待就绪\n'
 STARTED=1
-compose up -d --force-recreate --no-build --pull never --wait --wait-timeout "$wait_timeout"
+compose up -d --force-recreate --remove-orphans --no-build --pull never --wait --wait-timeout "$wait_timeout"
 case "$bind_address" in 0.0.0.0|::) bind_address=127.0.0.1 ;; esac
 [[ "$bind_address" != *:* || "$bind_address" == \[*\] ]] || bind_address="[$bind_address]"
 printf '\nStudio 后端已就绪\n镜像：%s\nAPI：http://%s:%s/api\n健康检查：http://%s:%s/health/ready\n' \

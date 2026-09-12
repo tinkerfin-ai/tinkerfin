@@ -25,7 +25,9 @@ def _adapter(
     private_state_keys: frozenset[str] = frozenset(),
 ) -> DeepAgentAgUiAdapter:
     return DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-json", runId="run-json"),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-json", run_id="run-json"
+        ),
         private_state_keys=private_state_keys,
     )
 

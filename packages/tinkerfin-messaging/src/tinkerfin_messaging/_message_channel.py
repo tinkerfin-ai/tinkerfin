@@ -15,7 +15,7 @@ __all__ = [
 
 import asyncio
 import inspect
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generic, NoReturn, TypeAlias, TypeVar, cast
 from uuid import uuid4
@@ -31,6 +31,7 @@ from ._messaging_boundary import (
 )
 from ._messaging_ledger import BackendRunHandle, PreparedRun
 from ._producer_runtime import _open_recoverable_source, _OwnerLease
+from ._tasks import capture, join_owned_task, retain_failure, select_failure
 from .backend import (
     RunStatus,
     is_active_run_status,
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
         CommittedCallback,
         MessageChannel,
         MessageSubscription,
+        _PreflightRegistration,
     )
 
 SourceT = TypeVar("SourceT")
@@ -148,6 +150,7 @@ async def _await_retained_preflight(
     await asyncio.gather(started_waiter, return_exceptions=True)
     outcome = task.result()
     if caller_cancellation is not None:
+        failure: BaseException = caller_cancellation
         if outcome.result is not None:
 
             async def close_late() -> _RetainedPreflightOutcome[None]:
@@ -174,18 +177,20 @@ async def _await_retained_preflight(
             close_outcome = close_task.result()
             close_error = close_outcome.error
             if close_error is not None:
+                failure = select_failure(failure, close_error)
                 caller_cancellation.add_note(
                     "Late Messaging delivery cleanup also failed: "
                     f"{type(close_error).__name__}: {close_error}"
                 )
         if outcome.error is not None:
+            failure = select_failure(failure, outcome.error)
             caller_cancellation.add_note(
                 "Messaging preflight also failed: "
                 f"{type(outcome.error).__name__}: {outcome.error}"
             )
             for note in getattr(outcome.error, "__notes__", ()):
                 caller_cancellation.add_note(note)
-        raise caller_cancellation.with_traceback(caller_cancellation.__traceback__)
+        raise failure
     if outcome.error is not None:
         raise outcome.error.with_traceback(outcome.error.__traceback__)
     if outcome.result is None:  # pragma: no cover - every operation returns delivery
@@ -201,83 +206,104 @@ def _validate_delivery_callback(
         raise TypeError(f"{name} must be an async callable or None")
 
 
+async def _settle_delivery_step(
+    operation: Awaitable[PreflightT],
+    *,
+    preflight: _PreflightRegistration | None = None,
+) -> PreflightT:
+    """Complete accepted delivery work without abandoning it on caller cancellation."""
+
+    task = asyncio.create_task(
+        capture(operation), name="tinkerfin-messaging-delivery-step"
+    )
+    previous_owner = None if preflight is None else preflight.owner
+    if preflight is not None:
+        # The callback may close Messaging itself. Shutdown must recognize its
+        # effective preflight owner rather than wait for the parent joining it.
+        preflight.owner = cast(asyncio.Task[object], task)
+    try:
+        return await join_owned_task(task)
+    finally:
+        if preflight is not None and previous_owner is not None:
+            preflight.owner = previous_owner
+
+
 async def _invoke_delivery_callback(
     name: str,
     callback: _DeliveryCallback | None,
+    *,
+    preflight: _PreflightRegistration | None = None,
 ) -> None:
     if callback is None:
         return
-    result = callback()
-    if not inspect.isawaitable(result):
-        raise TypeError(f"{name} must return an awaitable")
-    await result
 
+    async def invoke() -> None:
+        result = callback()
+        if not inspect.isawaitable(result):
+            raise TypeError(f"{name} must return an awaitable")
+        await result
 
-def _add_secondary_failure(primary: BaseException, secondary: BaseException) -> None:
-    primary.add_note(
-        "Messaging preflight settlement also failed: "
-        f"{type(secondary).__name__}: {secondary}"
-    )
+    await _settle_delivery_step(invoke(), preflight=preflight)
 
 
 def _retain_settlement_failure(
     primary: BaseException,
     secondary: BaseException,
 ) -> BaseException:
-    """Retain failure order without suppressing later process control.
+    """Preserve setup and cleanup failures, with control ahead of cancellation.
 
-    Cleanup continues after this function returns. Cancellation, keyboard interrupt,
-    and system exit outrank only an ordinary primary. Once process control is primary,
-    all later failures remain secondary evidence.
+    Notes aid diagnostics, but the original objects and causes remain in the
+    exception graph. Source-preparation contracts cover combined failures.
     """
 
-    if isinstance(primary, Exception) and not isinstance(secondary, Exception):
-        secondary.add_note(
-            f"Messaging preflight also failed: {type(primary).__name__}: {primary}"
-        )
-        return secondary
-    _add_secondary_failure(primary, secondary)
-    return primary
+    outcome = select_failure(primary, secondary)
+    additional = secondary if outcome is primary else primary
+    outcome.add_note(
+        "Messaging preflight settlement also failed: "
+        f"{type(additional).__name__}: {additional}"
+    )
+    return outcome
 
 
-async def _settle_unregistered_delivery(
+def _settle_unregistered_delivery(
     primary: BaseException,
     *,
     source: MessageSource[object] | None,
     on_delivery_not_started: _DeliveryCallback | None,
-) -> NoReturn:
-    """Release delivery inputs when shutdown rejects preflight registration.
+) -> Coroutine[object, object, NoReturn]:
+    """Settle delivery inputs rejected before preflight registration.
 
     A closed Messaging facade cannot retain a preflight task, but it still owns the
     unused ordinary source and the host's not-started outcome. Recoverable factories are
     never opened at this boundary, so only their host callback requires settlement.
     """
 
-    outcome = primary
+    async def settle() -> NoReturn:
+        outcome = primary
 
-    def retain(error: BaseException) -> None:
-        nonlocal outcome
-        outcome = _retain_settlement_failure(outcome, error)
+        def retain(error: BaseException) -> None:
+            nonlocal outcome
+            outcome = _retain_settlement_failure(outcome, error)
 
-    if source is not None:
+        if source is not None:
+            try:
+                await source.aclose()
+            except BaseException as close_error:  # noqa: BLE001 - settle remaining callback
+                retain(close_error)
         try:
-            await source.aclose()
-        except BaseException as close_error:  # noqa: BLE001 - settle remaining callback
-            retain(close_error)
-    try:
-        _validate_delivery_callback(
-            "on_delivery_not_started",
-            on_delivery_not_started,
-        )
-        await _invoke_delivery_callback(
-            "on_delivery_not_started",
-            on_delivery_not_started,
-        )
-    except BaseException as callback_error:  # noqa: BLE001 - preserve failure priority
-        retain(callback_error)
-    if outcome is not primary:
-        raise outcome.with_traceback(outcome.__traceback__) from primary
-    raise primary.with_traceback(primary.__traceback__)
+            _validate_delivery_callback(
+                "on_delivery_not_started",
+                on_delivery_not_started,
+            )
+            await _invoke_delivery_callback(
+                "on_delivery_not_started",
+                on_delivery_not_started,
+            )
+        except BaseException as callback_error:  # noqa: BLE001 - preserve failure priority
+            retain(callback_error)
+        raise outcome
+
+    return _settle_delivery_step(settle())
 
 
 def _raise_if_start_cancelled(cancel_requested: asyncio.Event) -> None:
@@ -804,6 +830,7 @@ async def _wrap(
                 on_source_ready=on_source_ready,
                 on_delivery_not_started=on_delivery_not_started,
                 cancel_requested=cancel_requested,
+                preflight=preflight,
             )
 
         task = asyncio.create_task(
@@ -839,6 +866,7 @@ async def _wrap_once(
     on_source_ready: _DeliveryCallback | None,
     on_delivery_not_started: _DeliveryCallback | None,
     cancel_requested: asyncio.Event,
+    preflight: _PreflightRegistration,
 ) -> MessageSubscription[object]:
     """Settle one complete ordinary start-or-attach decision."""
 
@@ -926,7 +954,9 @@ async def _wrap_once(
             # Runtime sources have committed their ready observations. Later failures
             # retain the host registration so it can reconcile against that Run.
             delivery_started = True
-            await _invoke_delivery_callback("on_source_ready", on_source_ready)
+            await _invoke_delivery_callback(
+                "on_source_ready", on_source_ready, preflight=preflight
+            )
             self._messaging._require_open()
             _raise_if_start_cancelled(cancel_requested)
         self._commit_inferred_binding(
@@ -963,49 +993,54 @@ async def _wrap_once(
         )
     # Preflight settlement must cover cancellation and process-control outcomes while
     # preserving the initiating failure after owned cleanup.
-    except BaseException as error:
-        if lease is not None and not producer_started:
-            lease.protect(None)
-        primary = (
-            lease.error if lease is not None and lease.error is not None else error
-        )
-        if not producer_started and not source_released:
-            try:
-                await source.aclose()
-            except BaseException as close_error:  # noqa: BLE001 - cleanup continues
-                primary = _retain_settlement_failure(primary, close_error)
-            if prepared is not None and prepared.is_owner:
+    except BaseException as error:  # noqa: BLE001 - deliver the combined failure after cleanup
+
+        async def settle_failure(error: BaseException) -> NoReturn:
+            if lease is not None and not producer_started:
+                lease.protect(None)
+            primary = (
+                lease.error if lease is not None and lease.error is not None else error
+            )
+            if not producer_started and not source_released:
                 try:
-                    await _await_backend(
-                        "finish",
-                        self._messaging._runtime_backend.finish(
-                            prepared.handle,
-                            status="failed",
-                            error=primary,
-                        ),
+                    await source.aclose()
+                except BaseException as close_error:  # noqa: BLE001 - cleanup continues
+                    primary = _retain_settlement_failure(primary, close_error)
+                if prepared is not None and prepared.is_owner:
+                    try:
+                        await _await_backend(
+                            "finish",
+                            self._messaging._runtime_backend.finish(
+                                prepared.handle,
+                                status="failed",
+                                error=primary,
+                            ),
+                        )
+                    except BackendOwnershipLost:
+                        pass
+                    except BaseException as finish_error:  # noqa: BLE001 - cleanup continues
+                        primary = _retain_settlement_failure(primary, finish_error)
+            if not delivery_started:
+                try:
+                    await _invoke_delivery_callback(
+                        "on_delivery_not_started",
+                        on_delivery_not_started,
+                        preflight=preflight,
                     )
-                except BackendOwnershipLost:
-                    pass
-                except BaseException as finish_error:  # noqa: BLE001 - cleanup continues
-                    primary = _retain_settlement_failure(primary, finish_error)
-        if not delivery_started:
-            try:
-                await _invoke_delivery_callback(
-                    "on_delivery_not_started",
-                    on_delivery_not_started,
-                )
-            except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
-                primary = _retain_settlement_failure(primary, callback_error)
-        if primary is not error:
-            raise primary.with_traceback(primary.__traceback__) from error
-        raise error.with_traceback(error.__traceback__)
+                except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
+                    primary = _retain_settlement_failure(primary, callback_error)
+            if primary is not error:
+                retain_failure(primary, error)
+            raise primary
+
+        return await _settle_delivery_step(settle_failure(error), preflight=preflight)
 
     finally:
         if lease is not None and not producer_started:
             await lease.aclose()
 
 
-async def sse(
+async def open_sse(
     self: MessageChannel[SourceT, ReplayT],
     source: MessageSource[object],
     *,
@@ -1043,26 +1078,10 @@ async def sse(
         resolved_after = after() if callable(after) else after
     # Cursor resolution happens before delivery; every failure category still owns the
     # unused candidate source and host not-started settlement.
-    except BaseException as error:
-        primary = error
-        try:
-            await source.aclose()
-        except BaseException as close_error:  # noqa: BLE001 - cleanup continues
-            primary = _retain_settlement_failure(primary, close_error)
-        try:
-            _validate_delivery_callback(
-                "on_delivery_not_started",
-                on_delivery_not_started,
-            )
-            await _invoke_delivery_callback(
-                "on_delivery_not_started",
-                on_delivery_not_started,
-            )
-        except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
-            primary = _retain_settlement_failure(primary, callback_error)
-        if primary is not error:
-            raise primary.with_traceback(primary.__traceback__) from error
-        raise error.with_traceback(error.__traceback__)
+    except BaseException as error:  # noqa: BLE001 - deliver the combined failure after cleanup
+        await _settle_unregistered_delivery(
+            error, source=source, on_delivery_not_started=on_delivery_not_started
+        )
 
     subscription = await self._wrap(
         source,
@@ -1074,7 +1093,7 @@ async def sse(
         on_delivery_not_started=on_delivery_not_started,
     )
     try:
-        return subscription.sse()
+        return subscription.to_sse()
     except BaseException:
         await subscription.aclose()
         raise
@@ -1139,6 +1158,7 @@ async def wrap_recoverable(
                 on_source_ready=on_source_ready,
                 on_delivery_not_started=on_delivery_not_started,
                 cancel_requested=cancel_requested,
+                preflight=preflight,
             )
 
         task = asyncio.create_task(
@@ -1174,6 +1194,7 @@ async def _wrap_recoverable_once(
     on_source_ready: _DeliveryCallback | None,
     on_delivery_not_started: _DeliveryCallback | None,
     cancel_requested: asyncio.Event,
+    preflight: _PreflightRegistration,
 ) -> MessageSubscription[ReplayT]:
     """Settle one complete recoverable start-or-attach decision."""
 
@@ -1248,7 +1269,9 @@ async def _wrap_recoverable_once(
             self._messaging._require_open()
             _raise_if_start_cancelled(cancel_requested)
             delivery_started = True
-            await _invoke_delivery_callback("on_source_ready", on_source_ready)
+            await _invoke_delivery_callback(
+                "on_source_ready", on_source_ready, preflight=preflight
+            )
             self._messaging._require_open()
             _raise_if_start_cancelled(cancel_requested)
         self._commit_inferred_binding(
@@ -1281,42 +1304,47 @@ async def _wrap_recoverable_once(
         )
     # Recoverable preparation owns opened sources and backend settlement for every
     # failure category, including cancellation and process control.
-    except BaseException as error:
-        if lease is not None and not producer_started:
-            lease.protect(None)
-        primary = (
-            lease.error if lease is not None and lease.error is not None else error
-        )
-        if prepared is not None and prepared.is_owner and not producer_started:
-            if opened is not None:
+    except BaseException as error:  # noqa: BLE001 - deliver the combined failure after cleanup
+
+        async def settle_failure(error: BaseException) -> NoReturn:
+            if lease is not None and not producer_started:
+                lease.protect(None)
+            primary = (
+                lease.error if lease is not None and lease.error is not None else error
+            )
+            if prepared is not None and prepared.is_owner and not producer_started:
+                if opened is not None:
+                    try:
+                        await opened.aclose()
+                    except BaseException as close_error:  # noqa: BLE001 - cleanup continues
+                        primary = _retain_settlement_failure(primary, close_error)
                 try:
-                    await opened.aclose()
-                except BaseException as close_error:  # noqa: BLE001 - cleanup continues
-                    primary = _retain_settlement_failure(primary, close_error)
-            try:
-                await _await_backend(
-                    "finish",
-                    self._messaging._runtime_backend.finish(
-                        prepared.handle,
-                        status="failed",
-                        error=primary,
-                    ),
-                )
-            except BackendOwnershipLost:
-                pass
-            except BaseException as finish_error:  # noqa: BLE001 - cleanup continues
-                primary = _retain_settlement_failure(primary, finish_error)
-        if not delivery_started:
-            try:
-                await _invoke_delivery_callback(
-                    "on_delivery_not_started",
-                    on_delivery_not_started,
-                )
-            except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
-                primary = _retain_settlement_failure(primary, callback_error)
-        if primary is not error:
-            raise primary.with_traceback(primary.__traceback__) from error
-        raise error.with_traceback(error.__traceback__)
+                    await _await_backend(
+                        "finish",
+                        self._messaging._runtime_backend.finish(
+                            prepared.handle,
+                            status="failed",
+                            error=primary,
+                        ),
+                    )
+                except BackendOwnershipLost:
+                    pass
+                except BaseException as finish_error:  # noqa: BLE001 - cleanup continues
+                    primary = _retain_settlement_failure(primary, finish_error)
+            if not delivery_started:
+                try:
+                    await _invoke_delivery_callback(
+                        "on_delivery_not_started",
+                        on_delivery_not_started,
+                        preflight=preflight,
+                    )
+                except BaseException as callback_error:  # noqa: BLE001 - cleanup continues
+                    primary = _retain_settlement_failure(primary, callback_error)
+            if primary is not error:
+                retain_failure(primary, error)
+            raise primary
+
+        return await _settle_delivery_step(settle_failure(error), preflight=preflight)
 
     finally:
         if lease is not None and not producer_started:

@@ -34,7 +34,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from tinkerfin_contracts import RunIdentity
 
-from ._identity import required_identifier, required_identity
+from ._identity import required_identifier, required_identity, thread_key
 from ._messaging_boundary import _join_owned_task
 from ._messaging_ledger import BackendRunHandle
 from ._redis_scripts import (
@@ -601,8 +601,9 @@ async def _claim_generation_cleanup(
                 channel=channel,
                 identity=identity,
                 active_identity=RunIdentity(
-                    threadId=identity.thread_id,
-                    runId=self._text(response[1]),
+                    namespace=identity.namespace,
+                    thread_id=identity.thread_id,
+                    run_id=self._text(response[1]),
                 ),
             )
         if code == "WAIT":
@@ -717,8 +718,9 @@ async def _purge_stream_generation(
                 channel=purge.channel,
                 identity=purge.identity,
                 active_identity=RunIdentity(
-                    threadId=purge.identity.thread_id,
-                    runId=(
+                    namespace=purge.identity.namespace,
+                    thread_id=purge.identity.thread_id,
+                    run_id=(
                         purge.identity.run_id
                         if active_run is None
                         else self._text(active_run)
@@ -917,7 +919,7 @@ def _scope(
 ) -> _RedisStreamScope:
     channel_scope = self._digest(channel)
     base = f"{self._namespace}:channel:{channel_scope}"
-    stream_digest = self._digest(identity.thread_id)
+    stream_digest = self._digest(thread_key(identity))
     stream_base = f"{base}:stream:{stream_digest}"
     return _RedisStreamScope(
         channel_meta=f"{base}:channel",

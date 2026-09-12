@@ -81,7 +81,7 @@ def _interrupt(
         ),
         metadata={
             "langgraphValue": native,
-            "source": {"namespace": list(namespace)},
+            "source": {"graphNamespace": list(namespace)},
             "deepagents": {
                 "schema": TOOL_REVIEW_SCHEMA,
                 "nativeInterruptId": "native-review",

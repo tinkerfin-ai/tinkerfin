@@ -29,7 +29,9 @@ def _parent_tool_id(namespace: tuple[str, ...] = ("tools:parent",)) -> str:
 
 
 def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
-    identity = RunIdentity(threadId="thread-known", runId="run-known")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-known", run_id="run-known"
+    )
     parent_tool_call_id = _parent_tool_id()
 
     assert parent_tool_call_id == ("tf:tool:W1sidG9vbHM6cGFyZW50Il0sImNhbGwtdGFzayJd")
@@ -41,9 +43,11 @@ def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
         == "subagent-2594398b-b209-5a61-a9f0-8a4d6100bbcd"
     )
     resumed = create_subagent_provenance(
-        identity=RunIdentity(threadId="thread-known", runId="run-resumed"),
-        namespace=("tools:parent", "tools:graph-task"),
-        parent_namespace=("tools:parent",),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-known", run_id="run-resumed"
+        ),
+        graph_namespace=("tools:parent", "tools:graph-task"),
+        parent_graph_namespace=("tools:parent",),
         graph_task_id="graph-task",
         agent_name="researcher",
         parent_tool_call_id=parent_tool_call_id,
@@ -55,7 +59,9 @@ def test_subagent_invocation_id_has_a_frozen_known_vector() -> None:
     assert resumed.request_run_id == "run-resumed"
     assert (
         subagent_invocation_id(
-            identity=RunIdentity(threadId="other-thread", runId="run-known"),
+            identity=RunIdentity(
+                namespace="test", thread_id="other-thread", run_id="run-known"
+            ),
             parent_tool_call_id=parent_tool_call_id,
         )
         != resumed.subagent_invocation_id
@@ -68,7 +74,7 @@ def _converted_invocation(
     extra_task_args: dict[str, object] | None = None,
 ) -> tuple[DeepAgentAgUiAdapter, RawEvent, SubagentProvenance]:
     adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId=run_id)
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
     )
     task_args = {
         "description": "Research",
@@ -152,7 +158,7 @@ def test_adapter_publishes_stable_identity_without_rewriting_main_run() -> None:
     assert descriptor.request_run_id == "run-before"
     assert descriptor.parent_tool_call_id == parent_tool_call_id
 
-    child_namespace = tuple(descriptor.namespace)
+    child_namespace = tuple(descriptor.graph_namespace)
     child_text = adapter.process(
         {
             "type": "messages",
@@ -202,7 +208,7 @@ def test_adapter_publishes_stable_identity_without_rewriting_main_run() -> None:
     assert isinstance(result_raw, dict)
     assert result_raw["runId"] == "run-before"
     assert result_raw["relatedSubagentInvocationId"] == invocation_id
-    assert result_raw["relatedNamespace"] == list(child_namespace)
+    assert result_raw["relatedGraphNamespace"] == list(child_namespace)
 
     _, _resumed_task, resumed_descriptor = _converted_invocation(run_id="run-after")
     assert resumed_descriptor.subagent_invocation_id == invocation_id
@@ -212,9 +218,9 @@ def test_adapter_publishes_stable_identity_without_rewriting_main_run() -> None:
 
 def test_subagent_provenance_is_frozen_and_strict() -> None:
     value = create_subagent_provenance(
-        identity=RunIdentity(threadId="thread-1", runId="run-1"),
-        namespace=("tools:parent", "tools:graph-task"),
-        parent_namespace=("tools:parent",),
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1"),
+        graph_namespace=("tools:parent", "tools:graph-task"),
+        parent_graph_namespace=("tools:parent",),
         graph_task_id="graph-task",
         agent_name="researcher",
         parent_tool_call_id=_parent_tool_id(),
@@ -231,7 +237,9 @@ def test_subagent_provenance_is_frozen_and_strict() -> None:
         )
     with pytest.raises(ValueError, match="scoped Tool"):
         subagent_invocation_id(
-            identity=RunIdentity(threadId="thread-1", runId="run-1"),
+            identity=RunIdentity(
+                namespace="test", thread_id="thread-1", run_id="run-1"
+            ),
             parent_tool_call_id="not-scoped",
         )
 

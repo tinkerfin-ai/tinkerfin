@@ -105,7 +105,7 @@ async def test_manager_reports_key_resolver_contract_in_english() -> None:
     with pytest.raises(TypeError, match="key_resolver must be callable"):
         OpenSandboxManager(
             client=client,
-            key_resolver=cast(Callable[[str], str], None),
+            key_resolver=cast(Callable[[str], str], 42),
         )
 
     manager = OpenSandboxManager[str](

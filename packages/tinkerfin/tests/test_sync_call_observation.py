@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from deepagents.middleware.subagents import SubAgent
 from langchain.tools import tool
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
@@ -20,13 +19,16 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 
 from tinkerfin import (
-    DeepAgentsV2RuntimeProfile,
-    DeepAgentsV3RuntimeProfile,
     RunIdentity,
     RunObservationError,
     TinkerFin,
     trace_contribution,
 )
+from tinkerfin.runtime_profile import (
+    DeepAgentsV2RuntimeProfile,
+    DeepAgentsV3RuntimeProfile,
+)
+from tinkerfin.subagents import SubAgent
 from tinkerfin_contracts import (
     ContextContributionObservation,
     ObservationBoundary,
@@ -65,7 +67,7 @@ class _Session:
             if observation.tool_name.startswith("echo_"):
                 self.phases.append(observation.phase)
                 self.call_ids.append(observation.execution_id)
-                self.namespaces.append(observation.namespace)
+                self.namespaces.append(observation.graph_namespace)
         if isinstance(observation, ContextContributionObservation):
             self.contribution_parents.append(observation.parent_call_id)
 
@@ -140,17 +142,15 @@ async def _case(profile_name: str, scenario: str) -> dict[str, object]:
         )
     session = _Session(fail_start=scenario == "failure")
     runtime = TinkerFin(
-        runtime_profile=(
-            DeepAgentsV2RuntimeProfile()
-            if profile_name == "v2"
-            else DeepAgentsV3RuntimeProfile()
-        )
-    )
+        runtime_profile=DeepAgentsV2RuntimeProfile()
+        if profile_name == "v2"
+        else DeepAgentsV3RuntimeProfile()
+    ).with_namespace("test")
     tracer = Tracer()
     if scenario != "no_observer":
-        runtime = runtime.observe(tracer).observe(_Observer(session))
+        runtime = runtime.with_observer(tracer).with_observer(_Observer(session))
     if scenario == "subagent":
-        subagent: SubAgent = {
+        subagent: SubAgent[None] = {
             "name": "worker",
             "description": "Echo a value",
             "system_prompt": "Use the echo Tool.",
@@ -175,14 +175,22 @@ async def _case(profile_name: str, scenario: str) -> dict[str, object]:
                 AIMessage(content="done"),
             ]
         )
-        agent = runtime.create_deep_agent(model=parent, tools=[], subagents=[subagent])
+        agent = runtime.build(model=parent, tools=[], subagents=[subagent])
     else:
-        agent = runtime.create_deep_agent(model=model, tools=[selected])
+        agent = runtime.build(model=model, tools=[selected])
 
     async def invoke() -> None:
-        await runtime.ainvoke(
-            RunIdentity(threadId="thread-sync-callback", runId="run-sync-callback"),
-            agent=agent,
+        await agent.ainvoke(
+            thread_id=RunIdentity(
+                namespace="test",
+                thread_id="thread-sync-callback",
+                run_id="run-sync-callback",
+            ).thread_id,
+            run_id=RunIdentity(
+                namespace="test",
+                thread_id="thread-sync-callback",
+                run_id="run-sync-callback",
+            ).run_id,
             input={"messages": [HumanMessage(content="echo")]},
         )
 

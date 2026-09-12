@@ -79,7 +79,7 @@ async def parts():
     yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
 
 async def main():
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     events = [
         event
         async for event in astream_events(

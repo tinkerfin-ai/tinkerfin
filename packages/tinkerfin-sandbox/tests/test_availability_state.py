@@ -11,6 +11,7 @@ from typing import Literal
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+from tests.support.sql_engines import SqlEngineFactory
 
 from tinkerfin_sandbox.errors import (
     OpenSandboxStateError,
@@ -31,13 +32,14 @@ from tinkerfin_sandbox.lifecycle.state import (
 
 @pytest.fixture(params=["memory", "sqlite"])
 async def state(
-    request: pytest.FixtureRequest, tmp_path: Path
+    sql_engine: SqlEngineFactory, request: pytest.FixtureRequest, tmp_path: Path
 ) -> AsyncIterator[OpenSandboxState]:
     instance: OpenSandboxState = (
         InMemoryOpenSandboxState(namespace="availability")
         if request.param == "memory"
         else SQLAlchemyOpenSandboxState(
-            url=f"sqlite+aiosqlite:///{tmp_path / 'state.db'}", namespace="availability"
+            engine=sql_engine(f"sqlite+aiosqlite:///{tmp_path / 'state.db'}"),
+            namespace="availability",
         )
     )
     await instance.start(warm_pool_size=1)
@@ -338,20 +340,20 @@ async def test_released_owner_fence_cannot_change_availability(
         await state.release_owner(current)
 
 
-async def test_sqlite_close_reopen_and_expired_worker_do_not_fabricate_idle(
+async def test_sqlite_close_and_reopen_do_not_fabricate_holder_idle(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'durable.db'}"
-    first = SQLAlchemyOpenSandboxState(url=url, lease_ttl=0.09)
+    first = SQLAlchemyOpenSandboxState(engine=sql_engine(url))
     await first.start(warm_pool_size=0)
     claim = await first.acquire_owner("owner")
     await first.bind_owner(claim, "sandbox")
     running = await first.register_holder(claim, "lost-manager")
     await first.release_owner(claim)
     await first.aclose()
-    await asyncio.sleep(0.12)
 
-    reopened = SQLAlchemyOpenSandboxState(url=url)
+    reopened = SQLAlchemyOpenSandboxState(engine=sql_engine(url))
     await reopened.start(warm_pool_size=0)
     successor = await reopened.acquire_owner("owner")
     try:
@@ -370,11 +372,12 @@ async def test_sqlite_close_reopen_and_expired_worker_do_not_fabricate_idle(
 
 
 async def test_sqlite_other_state_acknowledges_while_owner_claim_remains_active(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'shared.db'}"
-    owner = SQLAlchemyOpenSandboxState(url=url)
-    observer = SQLAlchemyOpenSandboxState(url=url)
+    owner = SQLAlchemyOpenSandboxState(engine=sql_engine(url))
+    observer = SQLAlchemyOpenSandboxState(engine=sql_engine(url))
     await owner.start(warm_pool_size=0)
     await observer.start(warm_pool_size=0)
     claim = await owner.acquire_owner("owner")

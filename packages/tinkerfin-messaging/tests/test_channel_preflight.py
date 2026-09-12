@@ -15,13 +15,13 @@ from tinkerfin_messaging import (
     MessageSource,
     MessageSubscription,
     Messaging,
-    MessagingBackend,
     MessagingClosed,
     RecoverableMessage,
     RecoveryCheckpoint,
     RunAlreadyActive,
     SseRenderingUnsupported,
 )
+from tinkerfin_messaging.backend_contract import MessagingBackend
 
 
 def _identity(
@@ -29,7 +29,7 @@ def _identity(
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 class _TextCodec:
@@ -150,7 +150,7 @@ async def test_closed_messaging_settles_an_unregistered_ordinary_delivery(
 
     with pytest.raises(MessagingClosed):
         if render_sse:
-            await channel.sse(
+            await channel.open_sse(
                 source,
                 identity=_identity(),
                 on_delivery_not_started=delivery_not_started,
@@ -269,7 +269,7 @@ async def test_sse_cursor_failure_propagates_cleanup_process_control(
             renderer=_TextSseRenderer(),
         )
         with pytest.raises(error_type) as captured:
-            await channel.sse(
+            await channel.open_sse(
                 source,
                 identity=_identity(),
                 after=resolve_after,
@@ -440,7 +440,7 @@ async def test_sse_requires_a_renderer_without_affecting_async_replay(
         )
 
         with pytest.raises(SseRenderingUnsupported, match="no SSE renderer"):
-            subscription.sse()
+            subscription.to_sse()
         assert await _collect_data(subscription) == ["message"]
 
 
@@ -641,7 +641,7 @@ async def test_sse_renderer_uses_the_durable_sequence(
             after=0,
         )
 
-        frames = [frame async for frame in subscription.sse()]
+        frames = [frame async for frame in subscription.to_sse()]
 
     assert frames == [
         b"id: 1\ndata: one\n\n",
@@ -666,7 +666,7 @@ async def test_channel_sse_resolves_cursor_callback_once(
             codec=_TextCodec(),
             renderer=_TextSseRenderer(),
         )
-        body = await channel.sse(
+        body = await channel.open_sse(
             source,
             identity=_identity(),
             after=resolve_after,
@@ -697,7 +697,7 @@ async def test_channel_sse_cursor_callback_can_follow_from_current_tail(
             codec=_TextCodec(),
             renderer=_TextSseRenderer(),
         )
-        body = await channel.sse(
+        body = await channel.open_sse(
             source,
             identity=_identity(),
             after=resolve_after,
@@ -722,7 +722,7 @@ async def test_channel_sse_rejects_invalid_resolved_cursor_before_iteration(
             renderer=_TextSseRenderer(),
         )
         with pytest.raises(TypeError, match="after must be an integer or None"):
-            await channel.sse(
+            await channel.open_sse(
                 source,
                 identity=_identity(),
                 after=invalid_resolver,
@@ -756,7 +756,7 @@ async def test_channel_sse_closes_source_when_cursor_callback_fails(
             renderer=_TextSseRenderer(),
         )
         with pytest.raises(RuntimeError, match="cursor lookup failed"):
-            await channel.sse(
+            await channel.open_sse(
                 source,
                 identity=_identity(),
                 after=resolve_after,

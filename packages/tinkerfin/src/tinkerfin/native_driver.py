@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Literal, Protocol, cast, runtime_checkable
 
 from langchain_core.messages import AIMessageChunk, BaseMessage
-from langgraph.types import StreamMode
+from langgraph.types import Command, StreamMode
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from tinkerfin_contracts import (
@@ -31,7 +31,7 @@ from tinkerfin_native_stream import (
     validate_native_stream_part,
 )
 
-from ._agui_lineage_state import RUNTIME_PROFILE_METADATA_KEY
+from ._agui_lineage_state import RESUME_METADATA_KEY, RUNTIME_PROFILE_METADATA_KEY
 from ._observation import native_observation
 from .errors import TinkerFinStreamProtocolError
 
@@ -41,6 +41,26 @@ _REQUIRED_MODES: tuple[StreamMode, ...] = ("messages", "tasks", "values")
 _SUPPORTED_EXTRA_MODES: frozenset[StreamMode] = frozenset(
     {"updates", "checkpoints", "debug", "custom"}
 )
+
+
+def _validate_run_state(value: object) -> None:
+    # Recovery evidence is saver-owned. Reject host state and Command updates that
+    # try to introduce a same-named Graph channel, before any execution or I/O.
+    if isinstance(value, Command):
+        value = cast(Command[object], value).update
+    if isinstance(value, Mapping):
+        keys = list(cast(Mapping[object, object], value))
+    elif isinstance(value, (list, tuple)):
+        keys: list[object] = []
+        for raw_item in cast(Sequence[object], value):
+            if isinstance(raw_item, (list, tuple)):
+                pair = cast(Sequence[object], raw_item)
+                if len(pair) == 2:
+                    keys.append(pair[0])
+    else:
+        return
+    if RESUME_METADATA_KEY in keys:
+        raise ValueError("input cannot replace framework-owned resume evidence")
 
 
 def _bind_deep_agents_invocation(
@@ -61,6 +81,7 @@ def _bind_deep_agents_invocation(
         raise TypeError("identity and runtime_profile must be supplied together")
     label = f"Deep Agents {version}"
     bound = signature.bind(*args, **dict(options))
+    _validate_run_state(bound.arguments.get("input"))
     parameters = signature.parameters
     variable_keyword = next(
         (
@@ -130,6 +151,12 @@ def _bind_deep_agents_invocation(
         configurable = dict(cast(Mapping[str, object], raw_configurable))
     else:
         raise TypeError("config.configurable must be a mapping")
+    if any(
+        isinstance(key, str) and key.startswith("__pregel_")
+        for values in (config, configurable)
+        for key in values
+    ):
+        raise ValueError("config cannot replace framework-owned execution resources")
     if identity is not None:
         configured_thread = configurable.get("thread_id")
         if configured_thread is not None and configured_thread != identity.thread_id:
@@ -222,7 +249,7 @@ def _canonical_replay(
                     "identity",
                     "kind",
                     "monotonic_ns",
-                    "namespace",
+                    "graph_namespace",
                     "observed_at",
                 },
             ),
@@ -559,7 +586,7 @@ class DeepAgentsV2StreamDriver:
             observations.append(
                 NativeReasoningObservation(
                     identity=context.identity,
-                    namespace=part.ns,
+                    graph_namespace=part.ns,
                     message_id=message_id,
                     extractor=extractor_name,
                     content=content,

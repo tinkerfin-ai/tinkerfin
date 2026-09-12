@@ -8,17 +8,21 @@ from typing import Annotated, Any, cast
 
 import pytest
 from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from ag_ui.core.types import ResumeEntry
 from langchain.agents.middleware.types import InputAgentState
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.base import CheckpointTuple
+from langgraph.checkpoint.base import CheckpointTuple, empty_checkpoint
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from tinkerfin import (
+    AgentRuntime,
     AgUiResumeBinding,
-    DeepAgentsV2RuntimeProfile,
+    AgUiResumeBindingError,
+    AgUiResumeRequest,
     RunIdentity,
     TinkerFin,
 )
@@ -27,27 +31,36 @@ from tinkerfin._agui_lineage import (
     NATIVE_CHECKPOINT_ROLE,
     PARENT_RUN_ID_METADATA_KEY,
     RUN_ID_METADATA_KEY,
-    RUNTIME_PROFILE_METADATA_KEY,
-    _resume_stage_and_source,
+    _validate_resume_head,
 )
 from tinkerfin._agui_lineage_state import (
+    LINEAGE_METADATA_KEY,
     PLANNING_CHECKPOINT_RUN_ID,
-    RESUME_MARKER_STATE_KEY,
-    lineage_state_update,
+    RESUME_METADATA_KEY,
+    LineageMarker,
+    ResumeAnchor,
+    ResumeIntent,
+    bind_checkpoint_run,
 )
+from tinkerfin._checkpoint import NamespaceCheckpointer
+from tinkerfin.deep_agent import create_graph
 from tinkerfin.errors import TinkerFinLifecycleError
+from tinkerfin.runtime_profile import DeepAgentsV2RuntimeProfile
 
 
 def test_lineage_marker_uses_the_current_unversioned_contract() -> None:
-    payload = lineage_state_update(
-        identity=RunIdentity(threadId="thread-1", runId="run-1"),
+    payload = LineageMarker(
+        namespace="test",
+        thread_id="thread-1",
+        run_id="run-1",
         parent_run_id=None,
         runtime_profile="deepagents-v2",
         role="native",
-    )["_tinkerfin_lineage"]
+    ).model_dump(mode="json", by_alias=True)
 
     assert PLANNING_CHECKPOINT_RUN_ID == "tinkerfin-plan"
     assert set(payload) == {
+        "namespace",
         "threadId",
         "runId",
         "parentRunId",
@@ -58,8 +71,6 @@ def test_lineage_marker_uses_the_current_unversioned_contract() -> None:
 
 class _BranchState(InputAgentState, total=False):
     history: Annotated[list[str], add]
-    _tinkerfin_lineage: dict[str, object]
-    _tinkerfin_resume: dict[str, object]
 
 
 def _install_branch_graph(
@@ -78,14 +89,35 @@ def _install_branch_graph(
             if latest == "fail":
                 raise RuntimeError("branch fixture failure")
             if latest == "pause":
-                interrupt({"kind": "branch-fixture"})
+                interrupt(
+                    {
+                        "action_requests": [
+                            {
+                                "name": "branch",
+                                "args": {},
+                                "description": "Approve continuation",
+                            }
+                        ],
+                        "review_configs": [
+                            {
+                                "action_name": "branch",
+                                "allowed_decisions": ["approve", "reject"],
+                            }
+                        ],
+                    }
+                )
+                return {
+                    "messages": [
+                        ToolMessage(content="continued", tool_call_id="branch-tool")
+                    ]
+                }
             return {}
 
         builder = StateGraph(_BranchState)
         builder.add_node("record", record)
         builder.add_edge(START, "record")
         builder.add_edge("record", END)
-        graph = builder.compile(checkpointer=saver)
+        graph = builder.compile(checkpointer=NamespaceCheckpointer(saver, "test"))
         graphs.append(graph)
         return graph
 
@@ -97,7 +129,17 @@ def _install_branch_graph(
 
 
 def _branch_input(value: str) -> _BranchState:
-    return {"messages": [], "history": [value]}
+    return {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "branch", "args": {}, "id": "branch-tool"}],
+            )
+        ]
+        if value == "pause"
+        else [],
+        "history": [value],
+    }
 
 
 class _DifferentFixtureProfile(DeepAgentsV2RuntimeProfile):
@@ -140,28 +182,68 @@ def _committed_resume_checkpoint(
     checkpoint_id: str,
     *,
     parent_id: str | None,
-    marker: object,
+    marker: ResumeIntent,
 ) -> CheckpointTuple:
+    checkpoint = empty_checkpoint()
+    checkpoint["id"] = checkpoint_id
     return CheckpointTuple(
         config=_checkpoint_config(checkpoint_id),
-        checkpoint=cast(
+        checkpoint=checkpoint,
+        metadata=cast(
             Any,
-            {"channel_values": {RESUME_MARKER_STATE_KEY: marker}},
+            {
+                RESUME_METADATA_KEY: marker.canonical_json(),
+                LINEAGE_METADATA_KEY: LineageMarker.model_validate(
+                    {
+                        key: value
+                        for key, value in marker.model_dump().items()
+                        if key in LineageMarker.model_fields
+                    }
+                ).canonical_json(),
+            },
         ),
-        metadata=cast(Any, {}),
         parent_config=(None if parent_id is None else _checkpoint_config(parent_id)),
         pending_writes=[],
     )
 
 
-def _resume_marker_fixture() -> tuple[RunIdentity, object]:
-    identity = RunIdentity(threadId="thread-cycle", runId="run-resume")
+def _resume_marker_fixture() -> tuple[RunIdentity, ResumeIntent]:
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-cycle", run_id="run-resume"
+    )
     binding = AgUiResumeBinding(
         mode="resume",
         resume_data={"answer": "continue"},
         native_interrupt_ids=("interrupt-1",),
     )
-    marker = binding._marker(identity=identity, parent_run_id="run-parent")
+    marker = binding._marker(
+        identity=identity,
+        parent_run_id="run-parent",
+        runtime_profile="deepagents-v2",
+        role="native",
+        source_checkpoint_id="source",
+        source_checkpoint_ns="",
+        storage_checkpoint_id="source",
+        storage_checkpoint_ns="",
+        anchors=(
+            ResumeAnchor(
+                source=LineageMarker(
+                    namespace="test",
+                    thread_id="thread-cycle",
+                    run_id="run-parent",
+                    runtime_profile="deepagents-v2",
+                    role="native",
+                ),
+                graph_namespace="",
+                checkpoint_id="source",
+                task_id="task",
+                interrupt_id="interrupt-1",
+                interrupt_json='{"id":"interrupt-1","value":{}}',
+                tool_calls_json="[]",
+                cancellation_supported=False,
+            ),
+        ),
+    )
     return identity, marker
 
 
@@ -182,64 +264,72 @@ async def test_resume_ancestry_rejects_checkpoint_cycles(
         checkpoint_id: _committed_resume_checkpoint(
             checkpoint_id,
             parent_id=parent_id,
-            marker=cast(Any, marker).model_dump(mode="json", by_alias=True),
+            marker=marker,
         )
         for checkpoint_id, parent_id in parents.items()
     }
     saver = _MappedCheckpointSaver(rows)
 
     with pytest.raises(TinkerFinLifecycleError, match="checkpoint cycle"):
-        await _resume_stage_and_source(
+        await _validate_resume_head(
             saver,
-            head=rows[head_id],
-            identity=identity,
-            marker=cast(Any, marker),
-            runtime_profile=DeepAgentsV2RuntimeProfile(),
+            rows[head_id],
+            source=_committed_resume_checkpoint(
+                "source", parent_id=None, marker=marker
+            ),
+            marker=marker,
         )
 
 
 @pytest.mark.asyncio
 async def test_resume_ancestry_rejects_an_unbounded_checkpoint_chain() -> None:
-    identity, marker = _resume_marker_fixture()
-    serialized = cast(Any, marker).model_dump(mode="json", by_alias=True)
+    _identity, marker = _resume_marker_fixture()
     rows = {
         f"checkpoint-{index}": _committed_resume_checkpoint(
             f"checkpoint-{index}",
             parent_id=(None if index == 4096 else f"checkpoint-{index + 1}"),
-            marker=serialized,
+            marker=marker,
         )
         for index in range(4097)
     }
     saver = _MappedCheckpointSaver(rows)
 
     with pytest.raises(TinkerFinLifecycleError, match="safe checkpoint depth"):
-        await _resume_stage_and_source(
+        await _validate_resume_head(
             saver,
-            head=rows["checkpoint-0"],
-            identity=identity,
-            marker=cast(Any, marker),
-            runtime_profile=DeepAgentsV2RuntimeProfile(),
+            rows["checkpoint-0"],
+            source=_committed_resume_checkpoint(
+                "source", parent_id=None, marker=marker
+            ),
+            marker=marker,
         )
 
 
 async def _run(
-    definition: object,
+    definition: AgentRuntime[None],
     *,
     run_id: str,
     value: str | None,
     parent_run_id: str | None = None,
-    resume: AgUiResumeBinding | None = None,
+    resume: AgUiResumeRequest | None = None,
 ) -> tuple[list[BaseEvent], object]:
-    identity = RunIdentity(threadId="thread-1", runId=run_id)
-    runtime = cast(Any, definition).new_agui(
-        identity=identity,
-        parent_run_id=parent_run_id,
-        resume=resume,
-    )
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
+    runtime = definition
     stream = (
-        runtime.astream()
+        runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id=parent_run_id,
+            resume=resume,
+        )
         if resume is not None
-        else runtime.astream(_branch_input(cast(str, value)))
+        else runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            parent_run_id=parent_run_id,
+            resume=resume,
+            input=_branch_input(cast(str, value)),
+        )
     )
     return [event async for event in stream], stream
 
@@ -251,7 +341,7 @@ async def _run_head(
 ):
     rows = [
         row
-        async for row in saver.alist(
+        async for row in NamespaceCheckpointer(saver, "test").alist(
             {
                 "configurable": {
                     "thread_id": "thread-1",
@@ -270,7 +360,9 @@ async def test_parent_run_id_creates_a_real_branch_with_one_canonical_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, graphs = _install_branch_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
 
     await _run(definition, run_id="run-a", value="A")
     await _run(definition, run_id="run-b", value="B")
@@ -299,11 +391,13 @@ async def test_parent_run_id_creates_a_real_branch_with_one_canonical_identity(
 
 
 @pytest.mark.asyncio
-async def test_lineage_uses_portable_run_index_without_private_metadata_filter(
+async def test_lineage_uses_scoped_history_without_private_metadata_filter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, _graphs = _install_branch_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     await _run(definition, run_id="run-parent", value="parent")
     original_alist = MemorySaver.alist
     indexed_run_ids: list[object] = []
@@ -338,7 +432,7 @@ async def test_lineage_uses_portable_run_index_without_private_metadata_filter(
 
     assert events[-1].type.value == "RUN_FINISHED"
     assert cast(Any, stream).error is None
-    assert indexed_run_ids == ["run-parent", PLANNING_CHECKPOINT_RUN_ID]
+    assert indexed_run_ids == [None]
 
 
 @pytest.mark.asyncio
@@ -348,9 +442,11 @@ async def test_missing_or_cross_execution_parent_fails_before_graph_invocation(
     parent_run_id: str,
 ) -> None:
     saver, _graphs = _install_branch_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     if parent_run_id == "run-other-thread":
-        graph = await definition.create_graph()
+        graph = await create_graph(definition)
         async for _part in graph.astream(
             _branch_input("other"),
             config={
@@ -377,7 +473,7 @@ async def test_missing_or_cross_execution_parent_fails_before_graph_invocation(
     assert isinstance(cast(Any, stream).error, TinkerFinLifecycleError)
     child_rows = [
         row
-        async for row in saver.alist(
+        async for row in NamespaceCheckpointer(saver, "test").alist(
             {"configurable": {"thread_id": "thread-1"}},
             filter={RUN_ID_METADATA_KEY: "run-child"},
         )
@@ -390,7 +486,9 @@ async def test_failed_and_ambiguous_parents_are_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _saver, _graphs = _install_branch_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
 
     failed_events, _failed_stream = await _run(
         definition,
@@ -435,7 +533,9 @@ async def test_interrupted_parent_requires_the_exact_resume_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     saver, _graphs = _install_branch_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
     interrupted_events, _stream = await _run(
         definition,
         run_id="run-paused",
@@ -452,10 +552,13 @@ async def test_interrupted_parent_requires_the_exact_resume_binding(
     )
     assert native_ids
 
-    wrong = AgUiResumeBinding(
-        mode="resume",
-        resume_data={"answer": "continue"},
-        native_interrupt_ids=("wrong-interrupt",),
+    wrong = AgUiResumeRequest(
+        entries=tuple(
+            ResumeEntry(
+                interrupt_id=identifier, status="resolved", payload={"type": "approve"}
+            )
+            for identifier in ("wrong-interrupt",)
+        )
     )
     wrong_events, wrong_stream = await _run(
         definition,
@@ -465,12 +568,15 @@ async def test_interrupted_parent_requires_the_exact_resume_binding(
         resume=wrong,
     )
     assert wrong_events[-1].type.value == "RUN_ERROR"
-    assert "exact interrupts" in str(cast(Any, wrong_stream).error)
+    assert isinstance(cast(Any, wrong_stream).error, AgUiResumeBindingError)
 
-    binding = AgUiResumeBinding(
-        mode="resume",
-        resume_data={"answer": "continue"},
-        native_interrupt_ids=tuple(native_ids),
+    binding = AgUiResumeRequest(
+        entries=tuple(
+            ResumeEntry(
+                interrupt_id=identifier, status="resolved", payload={"type": "approve"}
+            )
+            for identifier in tuple(native_ids)
+        )
     )
     resumed_events, resumed_stream = await _run(
         definition,
@@ -489,12 +595,14 @@ async def test_branch_rejects_a_checkpoint_from_another_runtime_profile(
 ) -> None:
     executions: list[str] = []
     saver, _graphs = _install_branch_graph(monkeypatch, executions=executions)
-    source = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    source = TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
     await _run(source, run_id="run-profile-source", value="source")
 
-    mismatched = TinkerFin(
-        runtime_profile=_DifferentFixtureProfile(),
-    ).create_deep_agent(model="provider:model", tools=[])
+    mismatched = (
+        TinkerFin(runtime_profile=_DifferentFixtureProfile())
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
+    )
     events, stream = await _run(
         mismatched,
         run_id="run-profile-child",
@@ -508,7 +616,7 @@ async def test_branch_rejects_a_checkpoint_from_another_runtime_profile(
     assert executions == ["source"]
     child_rows = [
         row
-        async for row in saver.alist(
+        async for row in NamespaceCheckpointer(saver, "test").alist(
             {"configurable": {"thread_id": "thread-1"}},
             filter={RUN_ID_METADATA_KEY: "run-profile-child"},
         )
@@ -522,7 +630,7 @@ async def test_resume_rejects_a_checkpoint_from_another_runtime_profile(
 ) -> None:
     executions: list[str] = []
     saver, _graphs = _install_branch_graph(monkeypatch, executions=executions)
-    source = TinkerFin().create_deep_agent(model="provider:model", tools=[])
+    source = TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
     interrupted_events, _source_stream = await _run(
         source,
         run_id="run-profile-paused",
@@ -539,13 +647,18 @@ async def test_resume_rejects_a_checkpoint_from_another_runtime_profile(
     )
     assert native_ids
 
-    mismatched = TinkerFin(
-        runtime_profile=_DifferentFixtureProfile(),
-    ).create_deep_agent(model="provider:model", tools=[])
-    binding = AgUiResumeBinding(
-        mode="resume",
-        resume_data={"answer": "continue"},
-        native_interrupt_ids=native_ids,
+    mismatched = (
+        TinkerFin(runtime_profile=_DifferentFixtureProfile())
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
+    )
+    binding = AgUiResumeRequest(
+        entries=tuple(
+            ResumeEntry(
+                interrupt_id=identifier, status="resolved", payload={"type": "approve"}
+            )
+            for identifier in native_ids
+        )
     )
     events, stream = await _run(
         mismatched,
@@ -561,7 +674,7 @@ async def test_resume_rejects_a_checkpoint_from_another_runtime_profile(
     assert executions == ["pause"]
     resumed_rows = [
         row
-        async for row in saver.alist(
+        async for row in NamespaceCheckpointer(saver, "test").alist(
             {"configurable": {"thread_id": "thread-1"}},
             filter={RUN_ID_METADATA_KEY: "run-profile-resume"},
         )
@@ -574,28 +687,22 @@ async def test_active_parent_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _saver, graphs = _install_branch_graph(monkeypatch)
-    definition = TinkerFin().create_deep_agent(model="provider:model", tools=[])
-    await definition.create_graph()
+    definition = (
+        TinkerFin().with_namespace("test").build(model="provider:model", tools=[])
+    )
+    await create_graph(definition)
     active_graph = graphs[-1]
-    active_identity = RunIdentity(threadId="thread-1", runId="run-active")
+    active_identity = RunIdentity(
+        namespace="test", thread_id="thread-1", run_id="run-active"
+    )
     active_stream = active_graph.astream(
-        {
-            "history": ["active"],
-            **lineage_state_update(
-                identity=active_identity,
-                parent_run_id=None,
-                runtime_profile="deepagents-v2",
-                role="native",
-            ),
-        },
-        config={
-            "configurable": {
-                "thread_id": "thread-1",
-                RUN_ID_METADATA_KEY: "run-active",
-                RUNTIME_PROFILE_METADATA_KEY: "deepagents-v2",
-                CHECKPOINT_ROLE_METADATA_KEY: NATIVE_CHECKPOINT_ROLE,
-            }
-        },
+        {"history": ["active"]},
+        config=bind_checkpoint_run(
+            {"configurable": {"thread_id": "thread-1"}},
+            identity=active_identity,
+            parent_run_id=None,
+            runtime_profile="deepagents-v2",
+        ),
         stream_mode="values",
         version="v2",
         durability="sync",

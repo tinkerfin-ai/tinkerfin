@@ -16,17 +16,19 @@ from tinkerfin_messaging import (
     MemoryBackend,
     MessageEnvelope,
     Messaging,
-    MessagingBackend,
     MessagingClosed,
+    RunNotFound,
+    StreamDeleted,
+)
+from tinkerfin_messaging._messaging_ledger import BackendRunHandle, PreparedRun
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackend,
     MessagingStateQuery,
     MessagingTransition,
     MessagingTransitionResult,
-    RunNotFound,
-    StreamDeleted,
     StreamGenerationPurge,
     StreamGenerationPurgeResult,
 )
-from tinkerfin_messaging._messaging_ledger import BackendRunHandle, PreparedRun
 
 
 def _identity(
@@ -34,7 +36,7 @@ def _identity(
     thread_id: str = "conversation-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 async def _prepare_memory(

@@ -1,4 +1,4 @@
-"""Deterministic SQLite/MySQL Trace DDL ownership and index contracts."""
+"""Deterministic SQL Trace DDL ownership and index contracts."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ import pytest
 from tinkerfin_tracing.sql_schema import TRACE_TABLE_NAMES, get_trace_store_schema
 
 
-@pytest.mark.parametrize("dialect", ["sqlite", "mysql"])
+@pytest.mark.parametrize("dialect", ["sqlite", "mysql", "postgresql"])
 def test_trace_schema_contains_exact_owned_tables_without_foreign_keys(
-    dialect: Literal["sqlite", "mysql"],
+    dialect: Literal["sqlite", "mysql", "postgresql"],
 ) -> None:
     schema = get_trace_store_schema(dialect=dialect)
 
@@ -36,11 +36,27 @@ def test_mysql_schema_preserves_comments_and_uses_digest_keys_for_long_ids() -> 
     assert "closed_committed" in schema.ddl
 
 
-@pytest.mark.parametrize("dialect", ["sqlite", "mysql"])
+@pytest.mark.parametrize("dialect", ["sqlite", "mysql", "postgresql"])
 def test_trace_schema_compilation_is_byte_deterministic(
-    dialect: Literal["sqlite", "mysql"],
+    dialect: Literal["sqlite", "mysql", "postgresql"],
 ) -> None:
     assert (
         get_trace_store_schema(dialect=dialect).ddl
         == get_trace_store_schema(dialect=dialect).ddl
     )
+
+
+def test_postgresql_ddl_includes_every_metadata_comment() -> None:
+    from tinkerfin_tracing.sql_schema import metadata
+
+    ddl = get_trace_store_schema(dialect="postgresql").ddl
+    assert ddl.count("COMMENT ON TABLE") == sum(
+        table.comment is not None for table in metadata.tables.values()
+    )
+    assert ddl.count("COMMENT ON COLUMN") == sum(
+        column.comment is not None
+        for table in metadata.tables.values()
+        for column in table.columns
+    )
+    assert "BYTEA" in ddl
+    assert "TIMESTAMP WITHOUT TIME ZONE" in ddl

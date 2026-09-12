@@ -22,10 +22,10 @@ from tinkerfin_studio.conversation.models import TitleGenerationStatus, TitleSou
 from tinkerfin_studio.conversation.request import ChatRequest
 
 
-def conversation_identity(thread_id: str, run_id: str) -> RunIdentity:
+def conversation_identity(thread_id: str, run_id: str, *, user_id: int) -> RunIdentity:
     """创建公开生命周期与持久执行共用的会话身份"""
 
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace=f"ns_{user_id}", thread_id=thread_id, run_id=run_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +107,7 @@ def prepare_run_request(
         thread_id=thread_id,
         message_ids=message_ids,
     )
-    identity = conversation_identity(thread_id, request.run_id)
+    identity = conversation_identity(thread_id, request.run_id, user_id=user_id)
     graph_config: RunnableConfig = {
         "configurable": {
             "forwarded_props": request.forwarded_props.model_dump(

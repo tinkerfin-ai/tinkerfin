@@ -16,16 +16,18 @@ from tinkerfin_messaging import (
     MemoryBackend,
     MessageChannel,
     Messaging,
-    MessagingBackend,
     MessagingBackendProtocolError,
     MessagingClosed,
     MessagingErrorCode,
-    MessagingTransition,
-    MessagingTransitionResult,
     RunNotFound,
     RunProducerFailed,
     RunStatus,
     StreamDeleted,
+)
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackend,
+    MessagingTransition,
+    MessagingTransitionResult,
 )
 
 
@@ -34,7 +36,7 @@ def _identity(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 class _TextCodec:

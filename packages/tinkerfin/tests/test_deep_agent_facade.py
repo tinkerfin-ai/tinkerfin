@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, TypedDict, cast
+from typing import Any, TypedDict, cast, get_origin
 
 import pytest
-from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
+from ag_ui.core import BaseEvent, RunStartedEvent
 from deepagents.graph import create_deep_agent as upstream_create_deep_agent
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.callbacks import AsyncCallbackHandler
@@ -18,24 +19,54 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.base import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
 from tinkerfin import (
-    AgUiEventStream,
-    AgUiResumeBinding,
+    AgentRuntime,
     AgUiResumeRequest,
-    DeepAgentAgUiResumeRuntime,
-    DeepAgentAgUiRuntime,
-    DeepAgentDefinition,
-    DeepAgentRuntime,
-    NativeGraphRunStream,
+    AgUiRunStream,
+    NativeRunStream,
     RunIdentity,
     TinkerFin,
     TinkerFinLifecycleError,
 )
-from tinkerfin.deep_agent import DeepAgentGraph
+from tinkerfin.deep_agent import DeepAgentGraph, create_graph
+from tinkerfin.native_driver import DeepAgentsV2StreamDriver
+
+
+async def test_direct_stream_close_waits_for_borrowed_resource_cleanup() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def source(
+        input: object, config: RunnableConfig | None = None, **options: object
+    ) -> AsyncIterator[Mapping[str, object]]:
+        del input, config, options
+        try:
+            yield {"type": "values", "ns": (), "data": {"messages": []}}
+        finally:
+            entered.set()
+            await release.wait()
+            finished.set()
+
+    graph = DeepAgentGraph(astream=source, driver=DeepAgentsV2StreamDriver())
+    stream = graph.astream({"messages": []})
+    assert (await anext(stream))["type"] == "values"
+    closing = asyncio.create_task(stream.aclose())
+    cleanup_entered = asyncio.create_task(entered.wait())
+    try:
+        await asyncio.wait(
+            {closing, cleanup_entered}, return_when=asyncio.FIRST_COMPLETED
+        )
+        assert not closing.done()
+        release.set()
+        await closing
+        assert finished.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(closing, cleanup_entered, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -126,17 +157,10 @@ def _install_builder(
     return calls, graphs
 
 
-def _call_with_positional_input(
-    operation: Callable[..., object],
-    graph_input: object,
-) -> object:
-    return operation(graph_input)
-
-
 def _definition(
     tinkerfin: TinkerFin,
-) -> DeepAgentDefinition[_RuntimeContext]:
-    return tinkerfin.create_deep_agent(
+) -> AgentRuntime[_RuntimeContext]:
+    return tinkerfin.build(
         model="provider:model",
         tools=[],
         system_prompt="system",
@@ -157,19 +181,11 @@ def _identity(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 def _resume_identity(*, run_id: str = "run-resume") -> RunIdentity:
     return _identity(run_id=run_id)
-
-
-def _resume_binding() -> AgUiResumeBinding:
-    return AgUiResumeBinding(
-        mode="resume",
-        resume_data={"decisions": [{"type": "approve"}]},
-        native_interrupt_ids=("interrupt-1",),
-    )
 
 
 def _state_part(value: int = 1) -> Mapping[str, object]:
@@ -181,20 +197,23 @@ def _state_part(value: int = 1) -> Mapping[str, object]:
     }
 
 
-def _real_definition() -> DeepAgentDefinition[None]:
-    return TinkerFin().create_deep_agent(
-        model=_FakeModel(responses=[AIMessage(content="ok")]),
-        tools=[],
+def _real_definition() -> AgentRuntime[None]:
+    return (
+        TinkerFin()
+        .with_namespace("test")
+        .build(model=_FakeModel(responses=[AIMessage(content="ok")]), tools=[])
     )
 
 
 @pytest.mark.asyncio
 async def test_native_facade_streams_a_real_deep_agent_graph() -> None:
-    runtime = _real_definition().new(identity=_identity())
+    runtime = _real_definition()
     parts = [
         cast(Mapping[str, object], part)
-        async for part in runtime.astream(
-            InputAgentState(messages=[HumanMessage(content="hello")]),
+        async for part in runtime.open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=InputAgentState(messages=[HumanMessage(content="hello")]),
         )
     ]
     state_part = next(
@@ -228,7 +247,7 @@ async def test_definition_creates_one_reusable_direct_graph(
             _state_part(7),
         ),
     )
-    graph = await _definition(TinkerFin()).create_graph()
+    graph = await create_graph(_definition(TinkerFin().with_namespace("test")))
 
     assert isinstance(graph, DeepAgentGraph)
     assert len(calls) == 1
@@ -258,7 +277,7 @@ async def test_direct_graph_reuses_runnable_config_and_async_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, graphs = _install_builder(monkeypatch, parts=(_state_part(9),))
-    graph = await _definition(TinkerFin()).create_graph()
+    graph = await create_graph(_definition(TinkerFin().with_namespace("test")))
     configured = graph.with_config({"configurable": {"thread_id": "configured-thread"}})
 
     configured_result = await configured.ainvoke(_graph_input())
@@ -287,34 +306,34 @@ async def test_direct_graph_reuses_runnable_config_and_async_batch(
 
 
 @pytest.mark.asyncio
-async def test_tinkerfin_lends_its_default_checkpointer_to_new_definitions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls, _graphs = _install_builder(monkeypatch, parts=(_state_part(),))
+async def test_tinkerfin_uses_its_default_checkpointer() -> None:
     checkpointer = MemorySaver()
-    definition = _definition(TinkerFin(checkpointer=checkpointer))
-
-    await definition.create_graph()
-
-    assert calls[0][1]["checkpointer"] is checkpointer
+    runtime = (
+        TinkerFin(checkpointer=checkpointer)
+        .with_namespace("test")
+        .build(
+            model=_FakeModel(responses=[AIMessage(content="saved")]),
+        )
+    )
+    await runtime.ainvoke(thread_id="thread-1", run_id="run-1", input=_graph_input())
+    assert [row async for row in checkpointer.alist(None)]
 
 
 @pytest.mark.asyncio
-async def test_definition_explicit_checkpointer_overrides_the_factory_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls, _graphs = _install_builder(monkeypatch, parts=(_state_part(),))
+async def test_explicit_checkpointer_overrides_the_builder_default() -> None:
     default = MemorySaver()
     explicit = MemorySaver()
-    definition = TinkerFin(checkpointer=default).create_deep_agent(
-        model="provider:model",
-        tools=[],
-        checkpointer=explicit,
+    runtime = (
+        TinkerFin(checkpointer=default)
+        .with_namespace("test")
+        .build(
+            model=_FakeModel(responses=[AIMessage(content="saved")]),
+            checkpointer=explicit,
+        )
     )
-
-    await definition.create_graph()
-
-    assert calls[0][1]["checkpointer"] is explicit
+    await runtime.ainvoke(thread_id="thread-1", run_id="run-1", input=_graph_input())
+    assert [row async for row in explicit.alist(None)]
+    assert [row async for row in default.alist(None)] == []
 
 
 def test_direct_graph_rejects_synchronous_execution() -> None:
@@ -336,7 +355,7 @@ def test_direct_graph_rejects_synchronous_execution() -> None:
 
 @pytest.mark.asyncio
 async def test_direct_graph_ainvoke_runs_a_real_deep_agent() -> None:
-    graph = await _real_definition().create_graph()
+    graph = await create_graph(_real_definition())
     result = await graph.ainvoke(
         InputAgentState(messages=[HumanMessage(content="hello")]),
         _graph_config(),
@@ -349,15 +368,14 @@ async def test_direct_graph_ainvoke_runs_a_real_deep_agent() -> None:
 
 @pytest.mark.asyncio
 async def test_open_run_manages_a_prebuilt_definition() -> None:
-    tinkerfin = TinkerFin()
-    agent = tinkerfin.create_deep_agent(
-        model=_FakeModel(responses=[AIMessage(content="managed")]),
-        tools=[],
+    tinkerfin = TinkerFin().with_namespace("test")
+    agent = tinkerfin.build(
+        model=_FakeModel(responses=[AIMessage(content="managed")]), tools=[]
     )
 
-    stream = await tinkerfin.open_run(
-        _identity(),
-        agent=agent,
+    stream = agent.open_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
         input=InputAgentState(messages=[HumanMessage(content="hello")]),
         config=_graph_config(),
     )
@@ -383,13 +401,13 @@ async def test_managed_ainvoke_closes_a_source_without_root_values(
     """A final-result caller must retain the managed stream's cleanup semantics."""
 
     _, graphs = _install_builder(monkeypatch)
-    tinkerfin = TinkerFin()
+    tinkerfin = TinkerFin().with_namespace("test")
     agent = _definition(tinkerfin)
 
     with pytest.raises(TinkerFinLifecycleError, match="without a root values"):
-        await tinkerfin.ainvoke(
-            _identity(),
-            agent=agent,
+        await agent.ainvoke(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
             input=_graph_input(),
         )
 
@@ -397,42 +415,28 @@ async def test_managed_ainvoke_closes_a_source_without_root_values(
 
 
 @pytest.mark.asyncio
-async def test_open_run_resolves_an_async_agent_factory_once() -> None:
-    tinkerfin = TinkerFin()
-    created = 0
-
-    async def create_agent() -> DeepAgentDefinition[None]:
-        nonlocal created
-        created += 1
-        return tinkerfin.create_deep_agent(
-            model=_FakeModel(responses=[AIMessage(content="async")]),
-            tools=[],
-        )
-
-    stream = await tinkerfin.open_run(
-        _identity(),
-        agent=create_agent,
-        input=InputAgentState(messages=[HumanMessage(content="hello")]),
+async def test_open_run_constructs_one_graph_after_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _ = _install_builder(monkeypatch, parts=(_state_part(),))
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    stream = runtime.open_run(
+        thread_id="thread-1", run_id="run-1", input=_graph_input()
     )
+    assert calls == []
+    await stream.messaging_owner_preflight()
+    await stream.messaging_owner_preflight()
     await anext(stream)
     await stream.aclose()
-
-    assert created == 1
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_open_run_turns_agent_setup_failure_into_an_observed_stream() -> None:
-    tinkerfin = TinkerFin()
-
-    async def create_agent() -> DeepAgentDefinition[None]:
-        raise RuntimeError("model setup failed")
-
-    stream = await tinkerfin.open_run(
-        _identity(),
-        agent=create_agent,
-        input=_graph_input(),
+async def test_open_run_retains_graph_preparation_failure(definition_factory) -> None:
+    runtime = definition_factory(RuntimeError("model setup failed"))
+    stream = runtime.open_run(
+        thread_id="thread-1", run_id="run-1", input=_graph_input()
     )
-
     with pytest.raises(RuntimeError, match="model setup failed"):
         await anext(stream)
     assert isinstance(stream.error, RuntimeError)
@@ -441,21 +445,20 @@ async def test_open_run_turns_agent_setup_failure_into_an_observed_stream() -> N
 @pytest.mark.asyncio
 async def test_open_agui_run_manages_a_prebuilt_definition() -> None:
     identity = _identity()
-    tinkerfin = TinkerFin()
-    agent = tinkerfin.create_deep_agent(
-        model=_FakeModel(responses=[AIMessage(content="managed")]),
-        tools=[],
+    tinkerfin = TinkerFin().with_namespace("test")
+    agent = tinkerfin.build(
+        model=_FakeModel(responses=[AIMessage(content="managed")]), tools=[]
     )
 
-    stream = await tinkerfin.open_agui_run(
-        identity,
-        agent=agent,
+    stream = agent.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
         input=InputAgentState(messages=[HumanMessage(content="hello")]),
     )
     events = [event async for event in stream]
 
     event_types = [event.type.value for event in events]
-    assert stream.messaging_identity is identity
+    assert stream.messaging_identity == identity
     assert event_types.count("RUN_STARTED") == 1
     assert event_types.count("RUN_FINISHED") == 1
     assert "RUN_ERROR" not in event_types
@@ -463,50 +466,38 @@ async def test_open_agui_run_manages_a_prebuilt_definition() -> None:
 
 
 @pytest.mark.asyncio
-async def test_open_agui_run_resolves_an_async_agent_factory_once() -> None:
-    tinkerfin = TinkerFin()
-    created = 0
-
-    async def create_agent() -> DeepAgentDefinition[None]:
-        nonlocal created
-        created += 1
-        return tinkerfin.create_deep_agent(
-            model=_FakeModel(responses=[AIMessage(content="async")]),
-            tools=[],
-        )
-
-    stream = await tinkerfin.open_agui_run(
-        _identity(),
-        agent=create_agent,
-        input=InputAgentState(messages=[HumanMessage(content="hello")]),
+async def test_open_agui_run_constructs_one_graph_after_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, _ = _install_builder(monkeypatch, parts=(_state_part(),))
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    stream = runtime.open_agui_run(
+        thread_id="thread-1", run_id="run-1", input=_graph_input()
     )
-    events = [event async for event in stream]
-
-    assert created == 1
-    assert events[-1].type.value == "RUN_FINISHED"
+    assert calls == []
+    await stream.messaging_owner_preflight()
+    await stream.messaging_owner_preflight()
+    await anext(stream)
+    await stream.aclose()
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_open_agui_run_turns_agent_setup_failure_into_one_lifecycle() -> None:
-    tinkerfin = TinkerFin()
-
-    async def create_agent() -> DeepAgentDefinition[None]:
-        raise RuntimeError("model setup failed")
-
-    stream = await tinkerfin.open_agui_run(
-        _identity(),
-        agent=create_agent,
-        input=_graph_input(),
+async def test_open_agui_run_emits_one_lifecycle_for_preparation_failure(
+    definition_factory,
+) -> None:
+    runtime = definition_factory(RuntimeError("model setup failed"))
+    stream = runtime.open_agui_run(
+        thread_id="thread-1", run_id="run-1", input=_graph_input()
     )
     events = [event async for event in stream]
-
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
     assert isinstance(stream.error, RuntimeError)
 
 
 @pytest.mark.asyncio
 async def test_open_agui_run_requires_exactly_one_input_or_resume() -> None:
-    tinkerfin = TinkerFin()
+    tinkerfin = TinkerFin().with_namespace("test")
     definition = _definition(tinkerfin)
     resume = AgUiResumeRequest.model_validate(
         {
@@ -520,14 +511,13 @@ async def test_open_agui_run_requires_exactly_one_input_or_resume() -> None:
     )
 
     with pytest.raises(ValueError, match="exactly one"):
-        await tinkerfin.open_agui_run(
-            _identity(),
-            agent=definition,
+        cast(Callable[..., object], definition.open_agui_run)(
+            thread_id=_identity().thread_id, run_id=_identity().run_id
         )
     with pytest.raises(ValueError, match="exactly one"):
-        await tinkerfin.open_agui_run(
-            _identity(),
-            agent=definition,
+        cast(Callable[..., object], definition.open_agui_run)(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
             input=_graph_input(),
             resume=resume,
         )
@@ -536,11 +526,13 @@ async def test_open_agui_run_requires_exactly_one_input_or_resume() -> None:
 @pytest.mark.asyncio
 async def test_agui_facade_streams_a_real_deep_agent_graph() -> None:
     identity = _identity()
-    runtime = _real_definition().new_agui(identity=identity)
+    runtime = _real_definition()
     events = [
         event
-        async for event in runtime.astream(
-            InputAgentState(messages=[HumanMessage(content="hello")])
+        async for event in runtime.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=InputAgentState(messages=[HumanMessage(content="hello")]),
         )
     ]
 
@@ -553,107 +545,53 @@ async def test_agui_facade_streams_a_real_deep_agent_graph() -> None:
     assert events[0].input is None
 
 
-def test_new_agui_rejects_invalid_identity_before_building_graph(
+def test_open_agui_rejects_invalid_identity_before_building_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, _ = _install_builder(monkeypatch)
-    definition = _definition(TinkerFin())
+    definition = _definition(TinkerFin().with_namespace("test"))
 
     with pytest.raises(ValueError, match="surrounding whitespace"):
-        definition.new_agui(
-            identity=_identity(thread_id=" thread-1"),
+        definition.open_agui_run(
+            thread_id=" thread-1",
+            run_id="run-1",
+            input=_graph_input(),
         )
 
     assert calls == []
 
 
-def test_new_agui_rejects_self_parent_before_building_graph(
+def test_open_agui_rejects_self_parent_before_building_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, _ = _install_builder(monkeypatch)
-    definition = _definition(TinkerFin())
+    definition = _definition(TinkerFin().with_namespace("test"))
     identity = _resume_identity()
 
     with pytest.raises(ValueError, match="must differ"):
-        definition.new_agui(
-            identity=identity,
+        definition.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=_graph_input(),
             parent_run_id=identity.run_id,
         )
 
     assert calls == []
 
 
-@pytest.mark.asyncio
-async def test_resume_runtime_rejects_graph_input_without_consuming_runtime(
+def test_resume_requires_public_decisions_before_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
-    observed: list[Mapping[str, object]] = []
-
-    async def on_part(part: Mapping[str, object]) -> None:
-        observed.append(part)
-
-    identity = _resume_identity()
-    binding = _resume_binding()
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=identity,
-        resume=binding,
-        on_part=on_part,
-    )
-    with pytest.raises(TypeError):
-        _call_with_positional_input(
-            runtime.astream,
-            Command(resume={"decisions": [{"type": "reject"}]}),
+    calls, _ = _install_builder(monkeypatch)
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    open_events = cast(Callable[..., AgUiRunStream], runtime.open_agui_run)
+    with pytest.raises(TypeError, match="AgUiResumeRequest"):
+        open_events(
+            thread_id="thread-1",
+            run_id="run-1",
+            resume=Command(resume={"decisions": []}),
         )
-
-    assert graphs == []
-    assert observed == []
-
-    stream = runtime.astream()
-    events = [event async for event in stream]
-
-    assert graphs[0].calls == []
-    assert observed == []
-    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    assert isinstance(stream.error, TinkerFinLifecycleError)
-
-
-@pytest.mark.asyncio
-async def test_all_cancelled_resume_uses_a_finite_runtime_without_building_graph(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls, _graphs = _install_builder(monkeypatch)
-    observed_checkpoints: list[object] = []
-
-    async def checkpointed(value: object) -> None:
-        observed_checkpoints.append(value)
-
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=_resume_identity(),
-        parent_run_id="run-parent",
-        resume=AgUiResumeBinding(
-            mode="abandon",
-            native_interrupt_ids=("interrupt-1",),
-        ),
-        on_resume_checkpointed=checkpointed,
-    )
-
-    assert isinstance(runtime, DeepAgentAgUiResumeRuntime)
     assert calls == []
-    invalid_astream = cast(Callable[..., object], runtime.astream)
-    with pytest.raises(ValueError, match="version"):
-        invalid_astream(version="v1")
-    events = [event async for event in runtime.astream(config=_graph_config())]
-
-    assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    started = cast(RunStartedEvent, events[0])
-    assert started.thread_id == "thread-1"
-    assert started.parent_run_id == "run-parent"
-    assert started.input is None
-    terminal = events[-1]
-    assert isinstance(terminal, RunErrorEvent)
-    assert terminal.code == "resume_cancelled"
-    assert observed_checkpoints == []
 
 
 @pytest.mark.asyncio
@@ -662,55 +600,62 @@ async def test_agui_runtime_keeps_identity_before_graph_stream_creation(
 ) -> None:
     _install_builder(monkeypatch, parts=(_state_part(),))
     identity = _identity(thread_id="public-thread")
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=identity,
-    )
+    runtime = _definition(TinkerFin().with_namespace("test"))
 
-    stream = runtime.astream(_graph_input())
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id, run_id=identity.run_id, input=_graph_input()
+    )
     started = await anext(stream)
 
     assert isinstance(started, RunStartedEvent)
-    assert stream.messaging_identity is identity
+    assert stream.messaging_identity == identity
     assert started.thread_id == "public-thread"
     assert started.input is None
     await stream.aclose()
 
 
 @pytest.mark.asyncio
-async def test_create_deep_agent_defers_fresh_builds_until_stream_consumption(
+async def test_build_defers_fresh_builds_until_stream_consumption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, graphs = _install_builder(monkeypatch)
     tools: list[Callable[..., object]] = []
-    tinkerfin = TinkerFin()
+    tinkerfin = TinkerFin().with_namespace("test")
 
-    definition = tinkerfin.create_deep_agent(
-        model="provider:model",
-        tools=tools,
-        system_prompt="system",
+    definition = tinkerfin.build(
+        model="provider:model", tools=tools, system_prompt="system"
     )
     tools.append(lambda: "borrowed-after-definition")
 
-    assert isinstance(definition, DeepAgentDefinition)
+    assert isinstance(definition, AgentRuntime)
     assert calls == []
 
-    native = definition.new(identity=_identity(run_id="native-run"))
+    native = definition
     agui_identity = _identity(run_id="agui-run")
-    agui = definition.new_agui(
-        identity=agui_identity,
-    )
+    agui = definition
 
-    assert isinstance(native, DeepAgentRuntime)
-    assert isinstance(agui, DeepAgentAgUiRuntime)
+    assert isinstance(native, AgentRuntime)
+    assert isinstance(agui, AgentRuntime)
     assert calls == []
 
-    native_stream = native.astream(_graph_input())
+    native_stream = native.open_run(
+        thread_id=_identity(run_id="native-run").thread_id,
+        run_id=_identity(run_id="native-run").run_id,
+        input=_graph_input(),
+    )
     with pytest.raises(StopAsyncIteration):
         await anext(native_stream)
     await native_stream.aclose()
     assert len(calls) == 1
 
-    events = [event async for event in agui.astream(_graph_input())]
+    events = [
+        event
+        async for event in agui.open_agui_run(
+            thread_id=agui_identity.thread_id,
+            run_id=agui_identity.run_id,
+            input=_graph_input(),
+        )
+    ]
     assert [event.type.value for event in events] == [
         "RUN_STARTED",
         "RUN_FINISHED",
@@ -718,15 +663,16 @@ async def test_create_deep_agent_defers_fresh_builds_until_stream_consumption(
     assert len(calls) == 2
     assert len(graphs) == 2
     assert graphs[0] is not graphs[1]
-    assert calls[0][1]["tools"] is tools
-    assert calls[1][1]["tools"] is tools
+    assert calls[0][1]["tools"] == []
+    assert calls[1][1]["tools"] == []
+    assert calls[0][1]["tools"] is not calls[1][1]["tools"]
 
 
 def test_factory_parameter_binding_fails_without_building_a_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, _ = _install_builder(monkeypatch)
-    create = cast(Callable[..., object], TinkerFin().create_deep_agent)
+    create = cast(Callable[..., object], TinkerFin().with_namespace("test").build)
 
     with pytest.raises(TypeError):
         create(unknown_option=True)
@@ -734,21 +680,23 @@ def test_factory_parameter_binding_fails_without_building_a_graph(
     assert calls == []
 
 
-def test_new_requires_identity_before_building_graph(
+def test_open_run_requires_identity_before_building_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls, _ = _install_builder(monkeypatch)
-    definition = _definition(TinkerFin(run_coordinator=_coordinate))
-    untyped_new = cast(Callable[..., object], definition.new)
+    definition = _definition(
+        TinkerFin(run_coordinator=_coordinate).with_namespace("test")
+    )
+    untyped_new = cast(Callable[..., object], definition.open_run)
 
-    with pytest.raises(TypeError, match="identity"):
+    with pytest.raises(TypeError, match="thread_id"):
         untyped_new()
 
     assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
+async def test_native_run_forwards_settings_lazily_and_has_one_consumer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     native_part = {"type": "custom", "ns": (), "data": {"value": "native"}}
@@ -759,60 +707,52 @@ async def test_native_runtime_forwards_the_bound_call_lazily_and_is_single_use(
         observed.append(part)
 
     identity = _identity()
-    runtime = _definition(TinkerFin()).new(identity=identity, on_part=on_part)
+    runtime = _definition(TinkerFin().with_namespace("test"))
     graph_input = _graph_input()
     config = _graph_config()
-    stream = runtime.astream(
-        graph_input,
-        config,
+    stream = runtime.open_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        on_native_part=on_part,
+        input=graph_input,
+        config=config,
         context={"tenant": "tenant-1"},
         stream_mode=("custom", "values", "messages", "tasks"),
         print_mode="debug",
-        output_keys=None,
         interrupt_before=("model",),
         interrupt_after=("tools",),
         durability="sync",
         control=None,
-        subgraphs=True,
         debug=True,
     )
 
-    assert isinstance(stream, NativeGraphRunStream)
-    assert stream.messaging_identity is identity
+    assert isinstance(stream, NativeRunStream)
+    assert stream.messaging_identity == identity
     assert graphs == []
     assert observed == []
     assert await anext(stream) is native_part
     assert len(graphs) == 1
     assert observed == [native_part]
     assert config == {"configurable": {"thread_id": "thread-1"}}
-    assert graphs[0].calls == [
-        (
-            (
-                graph_input,
-                {
-                    "configurable": {
-                        "thread_id": "thread-1",
-                        "_tinkerfin_runtime_profile": "deepagents-v2",
-                    }
-                },
-            ),
-            {
-                "context": {"tenant": "tenant-1"},
-                "stream_mode": ("messages", "tasks", "values", "custom"),
-                "print_mode": "debug",
-                "output_keys": None,
-                "interrupt_before": ("model",),
-                "interrupt_after": ("tools",),
-                "durability": "sync",
-                "control": None,
-                "subgraphs": True,
-                "debug": True,
-                "version": "v2",
-            },
-        )
-    ]
-    with pytest.raises(RuntimeError, match="only one object stream"):
-        runtime.astream(graph_input, config)
+    assert len(graphs[0].calls) == 1
+    args, options = graphs[0].calls[0]
+    assert args[0] == graph_input
+    forwarded = cast(RunnableConfig, args[1])
+    assert forwarded.get("configurable", {}).get("thread_id") == identity.thread_id
+    assert options == {
+        "context": {"tenant": "tenant-1"},
+        "stream_mode": ("messages", "tasks", "values", "custom"),
+        "print_mode": "debug",
+        "interrupt_before": ("model",),
+        "interrupt_after": ("tools",),
+        "durability": "sync",
+        "subgraphs": True,
+        "debug": True,
+        "version": "v2",
+    }
+    assert aiter(stream) is stream
+    with pytest.raises(TinkerFinLifecycleError, match="only be consumed once"):
+        aiter(stream)
     await stream.aclose()
     assert graphs[0].closed == 1
 
@@ -823,22 +763,20 @@ async def test_native_invalid_binding_does_not_claim_the_runtime(
 ) -> None:
     part = {"type": "custom", "ns": (), "data": {"value": "native"}}
     _, graphs = _install_builder(monkeypatch, parts=(part,))
-    runtime = _definition(TinkerFin()).new(identity=_identity())
-    invalid_astream = cast(Callable[..., object], runtime.astream)
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    invalid_astream = cast(Callable[..., object], runtime.open_run)
 
     with pytest.raises(TypeError):
         invalid_astream()
 
-    stream = runtime.astream(_graph_input())
+    stream = runtime.open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_graph_input()
+    )
     assert await anext(stream) is part
     await stream.aclose()
     assert len(graphs[0].calls) == 1
-    assert graphs[0].calls[0][0][1] == {
-        "configurable": {
-            "thread_id": "thread-1",
-            "_tinkerfin_runtime_profile": "deepagents-v2",
-        }
-    }
+    forwarded = cast(RunnableConfig, graphs[0].calls[0][0][1])
+    assert forwarded.get("configurable", {}).get("thread_id") == _identity().thread_id
     assert graphs[0].calls[0][1]["version"] == "v2"
     assert graphs[0].calls[0][1]["stream_mode"] == (
         "messages",
@@ -849,32 +787,44 @@ async def test_native_invalid_binding_does_not_claim_the_runtime(
 
 
 @pytest.mark.asyncio
-async def test_native_v1_and_conflicting_thread_fail_before_side_effects(
+async def test_native_invalid_options_and_conflicting_thread_fail_before_preparation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     part = _state_part()
     _, graphs = _install_builder(monkeypatch, parts=(part,))
-    runtime = _definition(TinkerFin()).new(identity=_identity())
-    invalid_astream = cast(Callable[..., object], runtime.astream)
-
-    with pytest.raises(ValueError, match="requires version='v2'"):
-        invalid_astream(_graph_input(), version="v1")
-    with pytest.raises(ValueError, match="stream_mode"):
-        invalid_astream(_graph_input(), stream_mode="messages")
-    with pytest.raises(ValueError, match="stream_mode"):
-        invalid_astream(_graph_input(), stream_mode=())
-    with pytest.raises(ValueError, match="subgraphs"):
-        invalid_astream(_graph_input(), subgraphs=False)
-    with pytest.raises(ValueError, match="output_keys"):
-        invalid_astream(_graph_input(), output_keys="messages")
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    open_run = cast(Callable[..., NativeRunStream], runtime.open_run)
+    for name, value in (
+        ("version", "v1"),
+        ("subgraphs", False),
+        ("output_keys", "messages"),
+    ):
+        with pytest.raises(TypeError, match=name):
+            open_run(
+                thread_id="thread-1",
+                run_id="run-1",
+                input=_graph_input(),
+                **{name: value},
+            )
+    for modes in ("messages", ()):
+        with pytest.raises(ValueError, match="stream_mode"):
+            open_run(
+                thread_id="thread-1",
+                run_id="run-1",
+                input=_graph_input(),
+                stream_mode=modes,
+            )
     with pytest.raises(ValueError, match="must equal identity.thread_id"):
-        invalid_astream(
-            _graph_input(),
-            {"configurable": {"thread_id": "thread-other"}},
+        open_run(
+            thread_id="thread-1",
+            run_id="run-1",
+            input=_graph_input(),
+            config={"configurable": {"thread_id": "other"}},
         )
-
     assert graphs == []
-    stream = runtime.astream(_graph_input(), _graph_config())
+    stream = runtime.open_run(
+        thread_id="thread-1", run_id="run-1", input=_graph_input()
+    )
     assert await anext(stream) == part
     assert len(graphs) == 1
     await stream.aclose()
@@ -886,26 +836,28 @@ async def test_agui_runtime_defaults_reserved_options_and_stays_lazy(
 ) -> None:
     _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
     identity = _identity()
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=identity,
-    )
-    stream = runtime.astream(
-        _graph_input(),
-        _graph_config(),
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        input=_graph_input(),
+        config=_graph_config(),
     )
 
-    assert isinstance(stream, AgUiEventStream)
+    assert isinstance(stream, AgUiRunStream)
     assert graphs == []
     assert (await anext(stream)).type.value == "RUN_STARTED"
     assert len(graphs) == 1
     assert graphs[0].calls == []
     assert (await anext(stream)).type.value == "STATE_SNAPSHOT"
     assert graphs[0].calls[0][1] == {
+        "context": None,
         "stream_mode": ("messages", "tasks", "values"),
         "version": "v2",
         "subgraphs": True,
     }
     assert (await anext(stream)).type.value == "RUN_FINISHED"
+    await stream.aclose()
 
 
 @pytest.mark.asyncio
@@ -914,16 +866,14 @@ async def test_agui_runtime_normalizes_explicit_modes_and_forwards_other_options
 ) -> None:
     _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
     identity = _identity()
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=identity,
-    )
-    stream = runtime.astream(
-        _graph_input(),
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        input=_graph_input(),
         stream_mode=("custom", "values", "messages", "debug", "tasks"),
         print_mode="updates",
         context={"tenant": "tenant-1"},
-        version="v2",
-        subgraphs=True,
     )
 
     assert (await anext(stream)).type.value == "RUN_STARTED"
@@ -941,7 +891,6 @@ async def test_agui_runtime_normalizes_explicit_modes_and_forwards_other_options
 @pytest.mark.parametrize(
     ("options", "expected"),
     [
-        ({"stream_mode": None}, "stream_mode"),
         ({"stream_mode": "messages"}, "missing required"),
         (
             {"stream_mode": ("messages", "tasks", "values", "messages")},
@@ -974,21 +923,27 @@ def test_invalid_agui_reserved_options_fail_before_every_stream_side_effect(
 
     _, graphs = _install_builder(monkeypatch, parts=(_state_part(),))
     identity = _identity()
-    runtime = _definition(TinkerFin(run_coordinator=coordinate)).new_agui(
-        identity=identity,
-        on_part=on_part,
-    )
-    invalid_astream = cast(Callable[..., object], runtime.astream)
+    runtime = _definition(TinkerFin(run_coordinator=coordinate).with_namespace("test"))
 
     with pytest.raises((TypeError, ValueError), match=expected):
-        invalid_astream(_graph_input(), **options)
+        cast(Callable[..., AgUiRunStream], runtime.open_agui_run)(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=_graph_input(),
+            **options,
+        )
 
     assert graphs == []
     assert coordination == []
     assert observed == []
 
-    valid = runtime.astream(_graph_input())
-    assert isinstance(valid, AgUiEventStream)
+    valid = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        on_native_part=on_part,
+        input=_graph_input(),
+    )
+    assert isinstance(valid, AgUiRunStream)
 
 
 @pytest.mark.asyncio
@@ -1010,12 +965,14 @@ async def test_agui_runtime_preserves_observer_order_and_error_terminal(
         source_error=RuntimeError("native failed"),
     )
     identity = _identity()
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=identity,
-        on_part=on_part,
-        on_event=on_event,
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        on_native_part=on_part,
+        on_agui_event=on_event,
+        input=_graph_input(),
     )
-    stream = runtime.astream(_graph_input())
     events = [event async for event in stream]
 
     assert [event.type.value for event in events] == [
@@ -1033,53 +990,50 @@ async def test_agui_runtime_preserves_observer_order_and_error_terminal(
     assert graphs[0].closed == 1
 
 
-def test_runtime_wrappers_preserve_upstream_parameter_information(
+def test_builder_signature_retains_model_configuration_and_names_its_result() -> None:
+    build = inspect.signature(TinkerFin().build)
+    upstream = inspect.signature(upstream_create_deep_agent)
+    assert set(build.parameters) == set(upstream.parameters) | {"prepare_tools"}
+    assert all(
+        build.parameters[name].replace(annotation=parameter.annotation) == parameter
+        for name, parameter in upstream.parameters.items()
+    )
+    assert all(
+        build.parameters[name].annotation == parameter.annotation
+        for name, parameter in upstream.parameters.items()
+        if name not in {"backend", "subagents", "tools", "checkpointer", "cache"}
+    )
+    assert get_origin(build.return_annotation) is AgentRuntime
+    runtime = _real_definition()
+    for operation in (runtime.open_run, runtime.open_agui_run, runtime.ainvoke):
+        parameters = inspect.signature(operation).parameters
+        assert {"thread_id", "run_id", "context"} <= parameters.keys()
+        assert all(
+            parameter.kind is not inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        assert not {"agent", "version", "subgraphs", "output_keys"} & parameters.keys()
+
+
+@pytest.mark.asyncio
+async def test_runtime_creates_independent_single_consumer_agui_streams(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class State(TypedDict):
-        value: int
-
-    builder = StateGraph(State)
-    builder.add_node("identity", lambda state: state)
-    builder.add_edge(START, "identity")
-    builder.add_edge("identity", END)
-    graph = builder.compile()
-    monkeypatch.setattr(
-        "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
-        lambda *_args, **_kwargs: graph,
+    calls, _ = _install_builder(monkeypatch)
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    first = runtime.open_agui_run(
+        thread_id="thread-1", run_id="run-1", input=_graph_input()
     )
-    tinkerfin = TinkerFin()
-    definition = _definition(tinkerfin)
-    native = definition.new(identity=_identity(run_id="native-run"))
-    agui_identity = _identity(run_id="agui-run")
-    agui = definition.new_agui(
-        identity=agui_identity,
+    second = runtime.open_agui_run(
+        thread_id="thread-1", run_id="run-2", input=_graph_input()
     )
-    upstream = inspect.signature(CompiledStateGraph.astream)
-    bound_upstream = upstream.replace(
-        parameters=tuple(upstream.parameters.values())[1:]
-    )
-
-    assert inspect.signature(tinkerfin.create_deep_agent) == inspect.signature(
-        upstream_create_deep_agent
-    )
-    assert inspect.signature(native.astream) == bound_upstream
-    assert inspect.signature(agui.astream) == bound_upstream
-
-
-def test_runtime_astream_is_single_use_for_agui(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_builder(monkeypatch)
-    identity = _identity()
-    runtime = _definition(TinkerFin()).new_agui(
-        identity=identity,
-    )
-    stream = runtime.astream(_graph_input())
-
-    assert isinstance(stream, AgUiEventStream)
-    with pytest.raises(RuntimeError, match="only one object stream"):
-        runtime.astream(_graph_input())
+    assert first is not second
+    assert aiter(first) is first
+    with pytest.raises(TinkerFinLifecycleError, match="only be consumed once"):
+        aiter(first)
+    await first.aclose()
+    await second.aclose()
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -1090,16 +1044,16 @@ async def test_agui_user_messages_preserve_authoritative_ids_and_content() -> No
         async def on_chat_model_start(self, serialized, messages, **kwargs):
             seen.extend(messages[0])
 
-    tinkerfin = TinkerFin()
-    agent = tinkerfin.create_deep_agent(
+    tinkerfin = TinkerFin().with_namespace("test")
+    agent = tinkerfin.build(
         model=_FakeModel(
             responses=[AIMessage(content="received")], callbacks=[CaptureMessages()]
         ),
         tools=[],
     )
-    stream = await tinkerfin.open_agui_run(
-        _identity(),
-        agent=agent,
+    stream = agent.open_agui_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
         messages=[
             {"id": "user-one", "role": "user", "name": "reader", "content": "hello"},
             {"id": "user-two", "role": "user", "content": "follow up"},
@@ -1125,36 +1079,35 @@ async def test_agui_user_messages_preserve_authoritative_ids_and_content() -> No
         [{"id": "m", "content": "one"}, {"id": "m", "content": "two"}],
     ],
 )
-async def test_invalid_agui_messages_fail_before_agent_creation(messages) -> None:
-    tinkerfin = TinkerFin()
-    created = False
-
-    async def create_agent() -> DeepAgentDefinition[None]:
-        nonlocal created
-        created = True
-        return _real_definition()
-
-    stream = await tinkerfin.open_agui_run(
-        _identity(), agent=create_agent, messages=messages
+async def test_invalid_agui_messages_fail_before_graph_preparation(
+    monkeypatch: pytest.MonkeyPatch, messages
+) -> None:
+    calls, _ = _install_builder(monkeypatch)
+    runtime = _definition(TinkerFin().with_namespace("test"))
+    stream = runtime.open_agui_run(
+        thread_id="thread-1", run_id="run-1", messages=messages
     )
     events = [event async for event in stream]
     assert [event.type.value for event in events] == ["RUN_STARTED", "RUN_ERROR"]
-    assert not created
+    assert calls == []
 
 
 @pytest.mark.asyncio
 async def test_agui_messages_cannot_be_combined_with_native_input_or_resume() -> None:
-    tinkerfin = TinkerFin()
+    tinkerfin = TinkerFin().with_namespace("test")
     agent = _definition(tinkerfin)
     messages = [{"id": "m", "content": "hello"}]
     with pytest.raises(ValueError, match="exactly one"):
-        await tinkerfin.open_agui_run(
-            _identity(), agent=agent, messages=messages, input=_graph_input()
+        cast(Callable[..., object], agent.open_agui_run)(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            messages=messages,
+            input=_graph_input(),
         )
     with pytest.raises(ValueError, match="exactly one"):
-        await tinkerfin.open_agui_run(
-            _identity(),
-            agent=agent,
+        cast(Callable[..., object], agent.open_agui_run)(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
             messages=messages,
             resume=AgUiResumeRequest.model_validate(
                 {"entries": [{"interruptId": "i", "status": "cancelled"}]}

@@ -26,7 +26,6 @@ class MySQLConnectionBudget:
     """记录启动时已由数据库证明的连接容量边界"""
 
     sqlalchemy_pool_capacity: int
-    dedicated_agent_store_connections: int
     configured_budget: int
     management_reserve: int
     server_max_connections: int
@@ -126,21 +125,18 @@ class Database:
         *,
         configured_budget: int,
         management_reserve: int,
-        dedicated_agent_store_connections: int = 1,
     ) -> MySQLConnectionBudget:
-        """用 `@@max_connections` 验证共享池与独立 Store 连接上限
+        """用数据库连接上限验证共享池容量
 
-        Studio 业务、Trace 与 Sandbox State 共用同一个 SQLAlchemy Engine，因此只计算一次
-        `pool_size + max_overflow`。锁定版本 `AsyncMyStore.from_conn_string()` 另持有一条
-        asyncmy connection，必须单独计入。管理保留连接不能被应用预算占用。
+        Studio 业务、长期记忆、运行记录与沙箱状态共用连接池，
+        连接容量按 `pool_size + max_overflow` 计算。管理保留量不计入应用预算。
 
         Args:
             configured_budget: Studio 进程允许占用的 MySQL 连接总上限
             management_reserve: 必须留给数据库管理与故障处理的连接数
-            dedicated_agent_store_connections: SQLAlchemy 池外的 Agent Store 连接数
 
         Returns:
-            已验证的数据库、共享池与独立连接容量证据
+            已验证的数据库上限、共享池容量和管理保留量
 
         Raises:
             RuntimeError: 配置预算不足或服务器无法同时容纳预算与管理保留量
@@ -149,9 +145,8 @@ class Database:
         if self._pool_size is None or self._max_overflow is None:
             raise RuntimeError("MySQL 连接预算要求显式配置 pool_size 与 max_overflow")
         pool_capacity = self._pool_size + self._max_overflow
-        required = pool_capacity + dedicated_agent_store_connections
-        if required > configured_budget:
-            raise RuntimeError("MySQL 连接预算无法覆盖共享池与 Agent Store connection")
+        if pool_capacity > configured_budget:
+            raise RuntimeError("MySQL 连接预算无法覆盖共享池容量")
         async with self.engine.connect() as connection:
             server_limit = await connection.scalar(text("SELECT @@max_connections"))
         if not isinstance(server_limit, int) or server_limit < 1:
@@ -160,7 +155,6 @@ class Database:
             raise RuntimeError("MySQL max_connections 无法容纳应用预算与管理保留量")
         return MySQLConnectionBudget(
             sqlalchemy_pool_capacity=pool_capacity,
-            dedicated_agent_store_connections=dedicated_agent_store_connections,
             configured_budget=configured_budget,
             management_reserve=management_reserve,
             server_max_connections=server_limit,

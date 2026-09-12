@@ -727,6 +727,11 @@ class MessagingBackend(Protocol):
         ...
 
 
+from ._messaging_transition import (  # noqa: E402, I001 - avoid import cycle
+    resolve_messaging_transition as resolve_messaging_transition,
+)
+
+
 __all__ = [
     "CommittedMessagePage",
     "CommittedMessageQuery",
@@ -751,4 +756,5 @@ __all__ = [
     "StoredMessagingStream",
     "StreamGenerationPurge",
     "StreamGenerationPurgeResult",
+    "resolve_messaging_transition",
 ]

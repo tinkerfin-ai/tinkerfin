@@ -21,6 +21,7 @@ from tests.support.docker_services import (
     _opensandbox_config,
     _stop_owned_container,
 )
+from tests.support.sql_engines import SqlEngineFactory
 
 from tinkerfin_sandbox import (
     OpenSandboxBackendProtocolError,
@@ -370,6 +371,7 @@ async def test_real_rooted_descriptor_transfers_reject_symlink_races(
 
 @pytest.mark.opensandbox_e2e
 async def test_real_manual_cleanup_sandbox_preserves_files_across_manager_restart(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     tmp_path: Path,
@@ -395,7 +397,9 @@ async def test_real_manual_cleanup_sandbox_preserves_files_across_manager_restar
     first = OpenSandboxManager[str](
         client=first_client,
         key_resolver=lambda value: value,
-        state=SQLAlchemyOpenSandboxState(url=state_url, namespace=purpose),
+        state=SQLAlchemyOpenSandboxState(
+            engine=sql_engine(state_url), namespace=purpose
+        ),
         fail_on_startup_warmup_error=True,
     )
     second: OpenSandboxManager[str] | None = None
@@ -423,7 +427,9 @@ async def test_real_manual_cleanup_sandbox_preserves_files_across_manager_restar
         second = OpenSandboxManager[str](
             client=second_client,
             key_resolver=lambda value: value,
-            state=SQLAlchemyOpenSandboxState(url=state_url, namespace=purpose),
+            state=SQLAlchemyOpenSandboxState(
+                engine=sql_engine(state_url), namespace=purpose
+            ),
             fail_on_startup_warmup_error=True,
         )
         await second.start()
@@ -461,6 +467,7 @@ async def test_real_manual_cleanup_sandbox_preserves_files_across_manager_restar
 
 @pytest.mark.opensandbox_e2e
 async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     tmp_path: Path,
@@ -491,7 +498,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
         client=first_client,
         key_resolver=lambda value: value,
         state=SQLAlchemyOpenSandboxState(
-            url=state_url,
+            engine=sql_engine(state_url),
             namespace=purpose,
             lease_ttl=1.0,
             poll_interval=0.02,
@@ -543,7 +550,7 @@ async def test_real_manager_renews_warm_ttl_and_replaces_it_after_restart(
             client=second_client,
             key_resolver=lambda value: value,
             state=SQLAlchemyOpenSandboxState(
-                url=state_url,
+                engine=sql_engine(state_url),
                 namespace=purpose,
                 lease_ttl=1.0,
                 poll_interval=0.02,
@@ -674,6 +681,7 @@ async def test_recreated_server_restores_persisted_expiration_override(
 
 @pytest.mark.opensandbox_e2e
 async def test_real_recovery_preserves_files_and_requires_opt_in_for_recreation(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     tmp_path: Path,
@@ -705,7 +713,7 @@ async def test_real_recovery_preserves_files_and_requires_opt_in_for_recreation(
     )
     async with OpenSandboxManager[str](
         client=OpenSandboxClient(connection_config=connection, config=config),
-        state=SQLAlchemyOpenSandboxState(url=url, namespace=namespace),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace=namespace),
         key_resolver=lambda key: key,
         observers=(observer,),
     ) as preserving:
@@ -730,7 +738,9 @@ async def test_real_recovery_preserves_files_and_requires_opt_in_for_recreation(
         await backend.aexecute("touch /workspace/.probe-down")
         async with OpenSandboxManager[str](
             client=OpenSandboxClient(connection_config=connection, config=config),
-            state=SQLAlchemyOpenSandboxState(url=url, namespace=namespace),
+            state=SQLAlchemyOpenSandboxState(
+                engine=sql_engine(url), namespace=namespace
+            ),
             key_resolver=lambda key: key,
             recovery_policy=OpenSandboxRecoveryPolicy(
                 max_attempts=1, on_failure="recreate"

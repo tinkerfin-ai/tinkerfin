@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, cast
 
 from ag_ui.core import BaseEvent, RunErrorEvent, RunStartedEvent
 
+from ._failure_evidence import retain_failure, select_failure
+from ._run_callbacks import callback_scope
 from ._runtime_streams import _map_sse_item, _resolve_sse_event_id
 from ._tasks import join_task
 from .errors import AgUiSettlementTimeoutError, TinkerFinLifecycleError
@@ -22,6 +24,7 @@ from .sse import (
 )
 
 if TYPE_CHECKING:
+    from ._lazy_run import AgUiRunStream
     from .runtime import AgUiEventStream
 
 __all__ = [
@@ -68,9 +71,8 @@ async def __anext__(self: AgUiEventStream) -> BaseEvent:
         except asyncio.CancelledError as cancellation:
             conversion_error = self.error
             if conversion_error is not None:
-                cancellation.add_note(
-                    "AG-UI conversion also failed: "
-                    f"{type(conversion_error).__name__}: {conversion_error}"
+                retain_failure(
+                    cancellation, conversion_error, label="AG-UI conversion also failed"
                 )
             for note in self._secondary_error_notes:
                 cancellation.add_note(note)
@@ -123,6 +125,11 @@ async def abort(self: AgUiEventStream) -> list[BaseEvent]:
     )
     await self._close(None, active=active_to_cancel)
 
+    # A competing abort may have delivered the tail while both callers awaited
+    # the same close task. Claim delivery after that await, before another yield.
+    if self._completed or self._abort_events_delivered:
+        return []
+    self._abort_events_delivered = True
     tail = self._adapter.abort()
     if self._main_started:
         tail.append(
@@ -135,7 +142,6 @@ async def abort(self: AgUiEventStream) -> list[BaseEvent]:
                 )
             )
         )
-    self._abort_events_delivered = True
     for event in tail:
         await self._observe(event)
     return tail
@@ -166,14 +172,14 @@ async def aclose(self: AgUiEventStream) -> None:
 
 
 def to_sse(
-    self: AgUiEventStream,
+    self: AgUiEventStream | AgUiRunStream,
     *,
     mapper: SseMapper[BaseEvent] | None = None,
     event_id_resolver: SseEventIdResolver[BaseEvent] | None = None,
-) -> SseBody[str]:
-    """Consume this AG-UI object stream as safely framed SSE text."""
+) -> SseBody[bytes]:
+    """Consume this AG-UI object stream as UTF-8 SSE bytes."""
 
-    async def frames() -> AsyncGenerator[str, None]:
+    async def frames() -> AsyncGenerator[bytes, None]:
         try:
             async for event in self:
                 payload = await _map_sse_item(
@@ -208,8 +214,9 @@ async def _close(
     """Join one retained cleanup task under the caller's settlement budget.
 
     The timeout limits only this caller's wait and never cancels the owned cleanup.
-    A processing failure remains primary; cleanup failures become notes unless caller
-    cancellation outranks both outcomes.
+    Process control and caller cancellation retain priority. A source cancelling its
+    own close preserves an existing conversion failure. Other failures keep their
+    notes and original causes without abandoning the retained cleanup.
     """
 
     task = self._close_task
@@ -244,17 +251,23 @@ async def _close(
             current is not None and current.cancelling()
         ):
             if primary is not None and not isinstance(primary, GeneratorExit):
-                cleanup_error.add_note(
-                    f"AG-UI processing also failed: {type(primary).__name__}: {primary}"
-                )
+                selected = select_failure(cleanup_error, primary)
+                if selected is not cleanup_error:
+                    raise selected
             for note in getattr(cleanup_error, "__notes__", ()):
                 self._record_secondary_error_note(note)
             raise
         if primary is not None and not isinstance(primary, GeneratorExit):
-            primary.add_note(
-                "AG-UI cleanup also failed: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
-            )
+            if isinstance(cleanup_error, asyncio.CancelledError):
+                # A source cancelling its own close is cleanup failure evidence;
+                # it does not cancel an already failed conversion's caller.
+                retain_failure(
+                    primary, cleanup_error, label="AG-UI cleanup also failed"
+                )
+            else:
+                selected = select_failure(primary, cleanup_error)
+                if selected is not primary:
+                    raise selected
             return
         raise
 
@@ -271,8 +284,7 @@ async def _close_once(
     active: asyncio.Task[object] | None,
 ) -> None:
     if active is not None and not active.done():
-        active.cancel()
-        await asyncio.gather(active, return_exceptions=True)
+        await join_task(active, cancel=True, suppress_task_cancellation=True)
     primary: BaseException | None = None
     close = getattr(self._source, "aclose", None)
     try:
@@ -294,10 +306,11 @@ async def _observe(self: AgUiEventStream, event: BaseEvent) -> None:
     self._active_observers += 1
     token = self._observer_lineage.set(True)
     try:
-        observed = observer(event)
-        if not inspect.isawaitable(observed):
-            raise TypeError("on_event must return an awaitable")
-        await observed
+        with callback_scope():
+            observed = observer(event)
+            if not inspect.isawaitable(observed):
+                raise TypeError("on_event must return an awaitable")
+            await observed
     finally:
         self._observer_lineage.reset(token)
         self._active_observers -= 1
@@ -326,24 +339,25 @@ async def _close_upstream(self: AgUiEventStream, primary: BaseException | None) 
         next_cancel_count = current.cancelling() if current is not None else 0
         caller_cancelled = next_cancel_count > cancel_count
         if caller_cancelled and isinstance(primary, asyncio.CancelledError):
-            primary.add_note(
-                "native parts cleanup also received caller cancellation: "
-                f"{cleanup_error}"
+            retain_failure(
+                primary,
+                cleanup_error,
+                label="native parts cleanup also received caller cancellation",
             )
-            for note in getattr(cleanup_error, "__notes__", ()):
-                primary.add_note(note)
             return
         if caller_cancelled:
             if primary is not None and not isinstance(primary, GeneratorExit):
-                cleanup_error.add_note(
-                    f"AG-UI processing also failed: {type(primary).__name__}: {primary}"
-                )
+                selected = select_failure(cleanup_error, primary)
+                if selected is not cleanup_error:
+                    raise selected
             for note in getattr(cleanup_error, "__notes__", ()):
                 self._record_secondary_error_note(note)
             raise
         if primary is not None and not isinstance(primary, GeneratorExit):
             note = f"native parts cleanup also failed: CancelledError: {cleanup_error}"
-            primary.add_note(note)
+            retain_failure(
+                primary, cleanup_error, label="native parts cleanup also failed"
+            )
             self._record_secondary_error_note(note)
             return
         raise
@@ -354,8 +368,10 @@ async def _close_upstream(self: AgUiEventStream, primary: BaseException | None) 
                 "native parts cleanup also failed: "
                 f"{type(cleanup_error).__name__}: {cleanup_error}"
             )
-            primary.add_note(note)
+            selected = select_failure(primary, cleanup_error)
             self._record_secondary_error_note(note)
+            if selected is not primary:
+                raise selected
             return
         raise
     else:
@@ -365,9 +381,8 @@ async def _close_upstream(self: AgUiEventStream, primary: BaseException | None) 
             upstream_error, Exception
         ):
             self.error = upstream_error
-            primary.add_note(
-                "AG-UI processing also failed: "
-                f"{type(upstream_error).__name__}: {upstream_error}"
+            retain_failure(
+                primary, upstream_error, label="AG-UI processing also failed"
             )
             for note in getattr(upstream_error, "__notes__", ()):
                 primary.add_note(note)

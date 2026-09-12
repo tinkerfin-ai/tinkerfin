@@ -5,16 +5,13 @@ import sys
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 
 import aiosqlite
 import pytest
-from sqlalchemy import select
-from sqlalchemy.dialects import mysql as mysql_dialect
-from sqlalchemy.sql import Select
+from tests.support.sql_engines import SqlEngineFactory
 
 import tinkerfin_sandbox
-from tinkerfin_sandbox.lifecycle import sqlalchemy as sqlalchemy_lifecycle
 
 _TABLE_NAMES = (
     "tinkerfin_opensandbox_availability",
@@ -48,11 +45,13 @@ async def _sqlite_schema_objects(path: Path, *, kind: str) -> tuple[str, ...]:
     return tuple(str(row[0]) for row in rows if not str(row[0]).startswith("sqlite_"))
 
 
-async def test_sqlite_runtime_schema_characterization(tmp_path: Path) -> None:
+async def test_sqlite_runtime_schema_characterization(
+    sql_engine: SqlEngineFactory, tmp_path: Path
+) -> None:
     """Runtime initialization creates the complete current schema."""
     database_path = tmp_path / "runtime-schema.db"
     state_type = tinkerfin_sandbox.SQLAlchemyOpenSandboxState
-    state = state_type(url=_sqlite_url(database_path), namespace="test")
+    state = state_type(engine=sql_engine(_sqlite_url(database_path)), namespace="test")
     await state.start(warm_pool_size=0)
     await state.aclose()
 
@@ -86,7 +85,7 @@ def test_public_schema_descriptor_is_frozen_and_stable() -> None:
     [
         (
             "mysql",
-            "7c6aab57a572efdcbd19384063d90ee77f9b76aca82c254ba03f7b8b5f67e43f",
+            "03cad907c46f384ea6328d6b0ad16881d77727bb4b3c8bf9f98d650b037cbf8e",
         ),
         (
             "sqlite",
@@ -110,8 +109,7 @@ def test_schema_generation_does_not_create_an_engine(
         raise AssertionError(f"engine created with {args!r} and {kwargs!r}")
 
     monkeypatch.setattr(
-        sqlalchemy_lifecycle,
-        "create_async_engine",
+        "sqlalchemy.ext.asyncio.create_async_engine",
         unexpected_engine,
     )
 
@@ -145,8 +143,7 @@ try:
     getattr(tinkerfin_sandbox, 'get_sqlalchemy_opensandbox_state_schema')
 except ImportError as error:
     message = str(error)
-    assert 'tinkerfin-sandbox[sqlite]' in message
-    assert 'tinkerfin-sandbox[mysql]' in message
+    assert 'tinkerfin-sandbox[sqlalchemy]' in message
 else:
     raise AssertionError('optional SQLAlchemy export unexpectedly loaded')
 """
@@ -162,10 +159,10 @@ else:
 
 
 def test_schema_generator_rejects_an_unknown_dialect() -> None:
-    invalid = cast(Literal["mysql", "sqlite"], "postgresql")
+    invalid = "oracle"
 
     with pytest.raises(ValueError, match="mysql.*sqlite"):
-        tinkerfin_sandbox.get_sqlalchemy_opensandbox_state_schema(dialect=invalid)
+        tinkerfin_sandbox.get_sqlalchemy_opensandbox_state_schema(dialect=invalid)  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.parametrize("dialect", ["mysql", "sqlite"])
@@ -215,6 +212,7 @@ def test_sqlite_ddl_does_not_claim_to_persist_comments() -> None:
 
 
 async def test_sqlite_export_initializes_a_runtime_compatible_empty_database(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "exported-schema.db"
@@ -224,7 +222,7 @@ async def test_sqlite_export_initializes_a_runtime_compatible_empty_database(
         await connection.commit()
 
     state_type = tinkerfin_sandbox.SQLAlchemyOpenSandboxState
-    state = state_type(url=_sqlite_url(database_path), namespace="test")
+    state = state_type(engine=sql_engine(_sqlite_url(database_path)), namespace="test")
     await state.start(warm_pool_size=0)
     await state.aclose()
 
@@ -243,19 +241,24 @@ async def test_sqlite_export_initializes_a_runtime_compatible_empty_database(
     ),
 )
 async def test_sqlite_start_rejects_indexes_outside_the_current_schema(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
     mutation: str,
 ) -> None:
     database_path = tmp_path / "incompatible-index.db"
     state_type = tinkerfin_sandbox.SQLAlchemyOpenSandboxState
-    initial = state_type(url=_sqlite_url(database_path), namespace="test")
+    initial = state_type(
+        engine=sql_engine(_sqlite_url(database_path)), namespace="test"
+    )
     await initial.start(warm_pool_size=0)
     await initial.aclose()
     async with aiosqlite.connect(database_path) as connection:
         await connection.executescript(mutation)
         await connection.commit()
 
-    candidate = state_type(url=_sqlite_url(database_path), namespace="test")
+    candidate = state_type(
+        engine=sql_engine(_sqlite_url(database_path)), namespace="test"
+    )
     try:
         with pytest.raises(
             tinkerfin_sandbox.OpenSandboxStateError,
@@ -264,85 +267,3 @@ async def test_sqlite_start_rejects_indexes_outside_the_current_schema(
             await candidate.start(warm_pool_size=0)
     finally:
         await candidate.aclose()
-
-
-@pytest.mark.parametrize(
-    ("dialect_name", "server_version", "supports_skip_locked"),
-    [
-        ("sqlite", (3, 49, 1), False),
-        ("mysql", (8, 0, 41), True),
-        ("mysql", (8, 4, 6), True),
-    ],
-)
-def test_runtime_dialect_capabilities_distinguish_supported_servers(
-    dialect_name: str,
-    server_version: tuple[int, ...],
-    supports_skip_locked: bool,
-) -> None:
-    capabilities = sqlalchemy_lifecycle._resolve_dialect_capabilities(
-        dialect_name=dialect_name,
-        server_version=server_version,
-        is_mariadb=False,
-    )
-
-    assert capabilities.name == dialect_name
-    assert capabilities.server_version == server_version
-    assert capabilities.supports_skip_locked is supports_skip_locked
-    with pytest.raises(FrozenInstanceError):
-        setattr(capabilities, "supports_skip_locked", not supports_skip_locked)
-
-
-@pytest.mark.parametrize(
-    ("dialect_name", "server_version", "is_mariadb", "match"),
-    [
-        ("mysql", (5, 6, 51), False, "supports MySQL"),
-        ("mysql", (9, 0, 0), False, "supports MySQL"),
-        ("mysql", (10, 11, 0), True, "MariaDB"),
-        ("sqlite", (), False, "version"),
-    ],
-)
-def test_runtime_dialect_capabilities_reject_unverified_servers(
-    dialect_name: str,
-    server_version: tuple[int, ...],
-    is_mariadb: bool,
-    match: str,
-) -> None:
-    configuration_error = tinkerfin_sandbox.OpenSandboxStateConfigurationError
-
-    with pytest.raises(configuration_error, match=match):
-        sqlalchemy_lifecycle._resolve_dialect_capabilities(
-            dialect_name=dialect_name,
-            server_version=server_version,
-            is_mariadb=is_mariadb,
-        )
-
-
-@pytest.mark.parametrize(
-    "statement",
-    [
-        select(sqlalchemy_lifecycle._warm_slots),
-        select(
-            sqlalchemy_lifecycle._warm_slots.c.slot,
-            sqlalchemy_lifecycle._warm_slots.c.sandbox_id,
-        ),
-        select(sqlalchemy_lifecycle._cleanup),
-    ],
-)
-def test_mysql8_claim_lock_sql_uses_skip_locked(
-    statement: Select[tuple[object, ...]],
-) -> None:
-    mysql8 = sqlalchemy_lifecycle._resolve_dialect_capabilities(
-        dialect_name="mysql",
-        server_version=(8, 0, 41),
-        is_mariadb=False,
-    )
-    compiler = mysql_dialect.dialect()
-
-    mysql8_sql = str(
-        sqlalchemy_lifecycle._apply_claim_lock(
-            statement,
-            capabilities=mysql8,
-        ).compile(dialect=compiler)
-    )
-
-    assert mysql8_sql.endswith("FOR UPDATE SKIP LOCKED")

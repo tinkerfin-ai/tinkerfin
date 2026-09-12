@@ -22,7 +22,7 @@ def _identity(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 class _GateParts:
@@ -224,18 +224,24 @@ async def test_non_identity_fails_before_pulling_parts() -> None:
 
 
 def test_identity_is_strict_frozen_and_serializes_protocol_aliases() -> None:
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
     assert identity.model_dump(by_alias=True) == {
+        "namespace": "test",
         "threadId": "thread-1",
         "runId": "run-1",
     }
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         RunIdentity.model_validate(
-            {"threadId": "thread-1", "runId": "run-1", "parentRunId": "parent"}
+            {
+                "namespace": "test",
+                "threadId": "thread-1",
+                "runId": "run-1",
+                "parentRunId": "parent",
+            }
         )
     with pytest.raises(ValidationError, match="surrounding whitespace"):
-        RunIdentity(threadId=" thread-1", runId="run-1")
+        RunIdentity(namespace="test", thread_id=" thread-1", run_id="run-1")
     with pytest.raises(ValidationError, match="frozen"):
         setattr(identity, "thread_id", "thread-2")
 

@@ -23,7 +23,7 @@ manager = OpenSandboxManager(
 | Parameter | Default | Purpose |
 | --- | --- | --- |
 | `client` | required | Async creation, connection, inspection, and destruction |
-| `key_resolver` | required | Converts application keys to stable non-empty strings |
+| `key_resolver` | `None` | Converts custom keys to stable non-empty strings; string keys work directly |
 | `state` | `None` | Binding and lease state; defaults to in-memory |
 | `warm_pool_size` | `None` | Overrides the configured warm capacity |
 | `fail_on_startup_warmup_error` | `False` | Makes `start()` fail if initial warmup fails |
@@ -153,18 +153,13 @@ finally:
 
 `start()` is idempotent. A closed manager cannot be restarted.
 
-Startup fences every published warm slot, reconnects it, runs the data-plane health
-command, and renews its remote expiry when `ttl` is finite. Missing instances are replaced before startup
-returns. With `fail_on_startup_warmup_error=True`, any authentication, reconnect,
-health, renewal, creation, or State publication failure propagates and the host must
-not report ready.
+Startup verifies warm capacity by reconnecting instances, checking health, renewing
+finite expiry, and replacing missing instances. With `fail_on_startup_warmup_error=True`,
+any failure or incomplete capacity verification fails startup.
 
-Before first reporting ready, this manager must establish verification for the full
-configured capacity. A pool being checked by another worker can leave startup
-verification incomplete: strict warmup fails, while ordinary startup remains
-degraded and completes verification through the existing maintenance loop. Progress
-is retained across rounds; established managers do not need to verify the whole
-pool again merely because a peer holds a routine check.
+Before first reporting ready, the manager must verify all configured capacity.
+Checks by another worker can delay this: ordinary startup remains degraded until
+verification completes. Routine checks do not invalidate previously verified capacity.
 
 While open, the manager periodically checks warm health, renews finite expiry, and
 replaces unusable capacity. Health maintenance continues with `ttl=None`. A failed
@@ -281,13 +276,12 @@ First creation does not report replacement; a cancelled or uncertain binding com
 does not report success before the verified handle is published. Explicit repeated
 destruction produces one event after the first confirmed removal. Normal manager
 close produces no user failure or destruction event. Warm events have
-`owner_key=None` and do not masquerade as user Sandbox failures.
+`owner_key=None` to distinguish them from user Sandbox events.
 
-External changes are discovered through existing `get()`, `is_healthy()`,
-`get_details()`, or warm maintenance checks. Notifications add no remote user Sandbox
-polling, persistent outbox, or cross-process delivery guarantee. Shared-State polling
-for pause/resume coordination is independent of notification delivery. Observations are
-local to a manager; consumers requiring durable records own their storage.
+External changes are discovered by `get()`, `is_healthy()`, `get_details()`, or warm
+maintenance. Notifications are local and best effort; they do not add remote user
+Sandbox polling or guarantee durable or cross-process delivery. Consumers own any
+persistent notification records.
 
 Each observer has an independent ordered queue. The defaults are 128 pending events
 plus one active callback and a one-second callback timeout. Configure these with
@@ -296,8 +290,7 @@ plus one active callback and a one-second callback timeout. Configure these with
 and cancellation are isolated from Sandbox operations and other observers. Closing
 drains accepted notifications concurrently across observers, potentially taking up
 to `(max_pending_events + 1) * timeout` after resource settlement for cooperative
-callbacks. The manager never closes borrowed observers and creates no delivery
-tasks without them.
+callbacks. The manager never closes borrowed observers.
 
 Observers must use non-blocking asynchronous work and propagate cancellation. A
 callback or a task it starts must not call this manager's resource operations,
@@ -310,15 +303,12 @@ forcibly stopped by the timeout.
 
 After creation, health checking, replacement, reset, destroy, or close begins, the manager retains cleanup responsibility even if the requesting task is cancelled. A caller receiving cancellation does not mean remote cleanup has finished.
 
-`OpenSandboxClient.destroy()` retains one task per Sandbox ID. Concurrent callers join
-that same remote kill and local close. Caller cancellation waits for settlement and then
-propagates. Once kill succeeds, an SDK close failure does not turn it into a remote
-destruction failure. Client close waits for create/connect result handoff, cancelled-result
-reclamation, SDK child requests, and active destruction before closing the shared transport
-it created when `ConnectionConfig` omitted one. Concurrent client-close callers join one retained settlement. Cancelling a waiter
-does not cancel transport closure, and a close task that fails can be retried without
-losing ownership. A caller-supplied transport remains borrowed and is never closed by
-the client.
+Concurrent `OpenSandboxClient.destroy()` calls for the same Sandbox share one result.
+Caller cancellation waits for destruction and local cleanup before propagating. Once
+remote destruction succeeds, an SDK close failure does not reverse that result.
+Client close waits for accepted work before closing its owned transport. Concurrent
+close callers share the result; cancelling a waiter does not stop cleanup, and failed
+close can be retried. A caller-supplied transport remains caller-owned.
 
 ## Inspect details
 

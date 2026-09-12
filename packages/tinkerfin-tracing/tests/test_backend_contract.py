@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 from tinkerfin_tracing import (
     DurableTraceStore,
     InMemoryTraceStore,
@@ -194,7 +194,9 @@ async def test_writer_heartbeat_waits_for_an_owned_append_transaction(
             writer_heartbeat_interval_seconds=0.01,
         ),
     )
-    identity = RunIdentity(threadId="heartbeat-thread", runId="heartbeat-run")
+    identity = RunIdentity(
+        namespace="test", thread_id="heartbeat-thread", run_id="heartbeat-run"
+    )
     writer = await store.open_writer(identity)
     append = asyncio.create_task(
         writer.append(
@@ -228,8 +230,10 @@ async def test_store_rejects_event_page_for_another_exact_generation(
     direction: str,
     foreign_component: str,
 ) -> None:
-    store = InMemoryTraceStore(namespace="page-binding")
-    identity = RunIdentity(threadId="requested-thread", runId="requested-run")
+    store = InMemoryTraceStore()
+    identity = RunIdentity(
+        namespace="test", thread_id="requested-thread", run_id="requested-run"
+    )
     writer = await store.open_writer(identity)
     await writer.append(
         (
@@ -243,7 +247,7 @@ async def test_store_rejects_event_page_for_another_exact_generation(
             ),
         )
     )
-    snapshot = await store.snapshot(identity.thread_id)
+    snapshot = await store.snapshot(identity.thread)
     backend = store.backend
     assert isinstance(backend, _InMemoryTraceLedgerBackend)
     original = backend.read_event_page
@@ -291,8 +295,10 @@ async def test_store_rejects_event_page_for_another_exact_generation(
 async def test_store_rejects_checkpoint_for_another_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = InMemoryTraceStore(namespace="checkpoint-binding")
-    identity = RunIdentity(threadId="checkpoint-thread", runId="checkpoint-run")
+    store = InMemoryTraceStore()
+    identity = RunIdentity(
+        namespace="test", thread_id="checkpoint-thread", run_id="checkpoint-run"
+    )
     writer = await store.open_writer(identity)
     checkpoint = TraceProjectionCheckpoint(
         key=writer.key,
@@ -331,8 +337,10 @@ async def test_store_rejects_checkpoint_for_another_scope(
 async def test_snapshot_rejects_backend_state_for_another_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = InMemoryTraceStore(namespace="snapshot-binding")
-    identity = RunIdentity(threadId="requested-thread", runId="requested-run")
+    store = InMemoryTraceStore()
+    identity = RunIdentity(
+        namespace="test", thread_id="requested-thread", run_id="requested-run"
+    )
     writer = await store.open_writer(identity)
     backend = store.backend
     assert isinstance(backend, _InMemoryTraceLedgerBackend)
@@ -351,7 +359,7 @@ async def test_snapshot_rejects_backend_state_for_another_thread(
     monkeypatch.setattr(backend, "load_ledger_state", return_foreign_state)
     try:
         with pytest.raises(TraceThreadNotFound):
-            await store.snapshot(identity.thread_id)
+            await store.snapshot(identity.thread)
     finally:
         await writer.aclose()
 
@@ -359,8 +367,10 @@ async def test_snapshot_rejects_backend_state_for_another_thread(
 async def test_forward_event_page_rejects_descending_sequences(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = InMemoryTraceStore(namespace="page-ordering")
-    identity = RunIdentity(threadId="ordered-thread", runId="ordered-run")
+    store = InMemoryTraceStore()
+    identity = RunIdentity(
+        namespace="test", thread_id="ordered-thread", run_id="ordered-run"
+    )
     writer = await store.open_writer(identity)
     await writer.append(
         tuple(
@@ -375,7 +385,7 @@ async def test_forward_event_page_rejects_descending_sequences(
             for index in (1, 2)
         )
     )
-    snapshot = await store.snapshot(identity.thread_id)
+    snapshot = await store.snapshot(identity.thread)
     backend = store.backend
     assert isinstance(backend, _InMemoryTraceLedgerBackend)
     original = backend.read_event_page
@@ -419,7 +429,11 @@ async def test_store_rejects_commit_result_for_another_writer_identity(
     try:
         with pytest.raises(TraceStoreProtocolError, match="writer result"):
             await store.open_writer(
-                RunIdentity(threadId="requested-thread", runId="requested-run")
+                RunIdentity(
+                    namespace="test",
+                    thread_id="requested-thread",
+                    run_id="requested-run",
+                )
             )
     finally:
         backend._threads.clear()
@@ -430,7 +444,9 @@ async def test_store_rejects_append_result_with_foreign_event_identity(
 ) -> None:
     backend = _InMemoryTraceLedgerBackend()
     store = DurableTraceStore(backend)
-    identity = RunIdentity(threadId="append-thread", runId="append-run")
+    identity = RunIdentity(
+        namespace="test", thread_id="append-thread", run_id="append-run"
+    )
     writer = await store.open_writer(identity)
     original = backend.commit_ledger_change
 
@@ -466,14 +482,18 @@ async def test_store_rejects_append_result_with_foreign_event_identity(
 async def test_writer_rejects_empty_ordinary_and_mandatory_batches() -> None:
     store = InMemoryTraceStore()
     writer = await store.open_writer(
-        RunIdentity(threadId="empty-thread", runId="empty-run")
+        RunIdentity(namespace="test", thread_id="empty-thread", run_id="empty-run")
     )
     try:
         with pytest.raises(ValueError, match="must not be empty"):
             await writer.append(())
         with pytest.raises(ValueError, match="must not be empty"):
             await writer.append((), mandatory=True)
-        assert (await store.snapshot("empty-thread")).as_of_seq == 0
+        assert (
+            await store.snapshot(
+                ThreadIdentity(namespace="test", thread_id="empty-thread")
+            )
+        ).as_of_seq == 0
     finally:
         await writer.aclose()
 
@@ -484,7 +504,9 @@ async def test_checkpoint_result_and_payload_share_one_deep_snapshot(
     backend = _InMemoryTraceLedgerBackend()
     store = DurableTraceStore(backend)
     writer = await store.open_writer(
-        RunIdentity(threadId="checkpoint-snapshot", runId="checkpoint-run")
+        RunIdentity(
+            namespace="test", thread_id="checkpoint-snapshot", run_id="checkpoint-run"
+        )
     )
     checkpoint = TraceProjectionCheckpoint(
         key=writer.key,

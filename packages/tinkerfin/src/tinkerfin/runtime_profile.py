@@ -7,15 +7,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from types import MappingProxyType
-from typing import Protocol, TypeAlias, cast, runtime_checkable
+from typing import Any, Protocol, TypeAlias, cast, runtime_checkable
 
-from anyio import to_thread
 from deepagents import graph as _deepagents_graph
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
 from langgraph.graph.state import CompiledStateGraph
 
+from ._agui_lineage_state import RESUME_WRITE_OWNER
 from ._hitl import prepare_hitl_factory_overrides
+from ._tasks import run_sync_owned
 from ._v3_stream import graph_v3_stream
 from .native_driver import (
     DeepAgentsV2StreamDriver,
@@ -44,8 +45,6 @@ _COMPILED_ASTREAM_SIGNATURE = inspect.signature(_COMPILED_ASTREAM).replace(
 # preparing interrupted tasks, while map_command() persists native decisions on the
 # resume channel. These locked values belong to the v2 Profile rather than TinkerFin's
 # internal protocol; the resume settlement and Redis saver contract tests guard them.
-_V2_NULL_TASK_ID = "00000000-0000-0000-0000-000000000000"
-_V2_RESUME_CHANNEL = "__resume__"
 
 _CheckpointSaver: TypeAlias = (
     BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
@@ -59,12 +58,9 @@ class DeepAgentsFactoryPreparation:
     Attributes:
         keyword_overrides: Canonical keyword values that replace the caller's values
             before the selected graph factory is invoked.
-        uncontracted_external_subagents: External compiled subagent names that cannot
-            participate in TinkerFin's mixed-cancellation extension.
     """
 
     keyword_overrides: Mapping[str, object]
-    uncontracted_external_subagents: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         """Snapshot mutable mappings and reject ambiguous override names."""
@@ -77,8 +73,6 @@ class DeepAgentsFactoryPreparation:
             for name in overrides
         ):
             raise ValueError("factory override names must be canonical text")
-        if not isinstance(self.uncontracted_external_subagents, frozenset):
-            raise TypeError("uncontracted_external_subagents must be a frozenset")
         object.__setattr__(self, "keyword_overrides", MappingProxyType(overrides))
 
 
@@ -86,7 +80,7 @@ class DeepAgentsFactoryPreparation:
 class DeepAgentsRuntimeProfile(Protocol):
     """Provide one complete Deep Agents build and Native stream integration.
 
-    Hosts select a concrete Profile before creating a Definition. One TinkerFin
+    Hosts select a concrete Profile before building a Runtime. One TinkerFin
     instance and every Run created from it retain that exact Profile; the Runtime never
     negotiates or infers a profile from stream data. The same Profile owns the upstream
     saver semantics used to stage a resume without discarding pending root or subgraph
@@ -157,12 +151,12 @@ class DeepAgentsRuntimeProfile(Protocol):
         config: RunnableConfig,
         writes: tuple[tuple[str, object], ...],
     ) -> None:
-        """Persist private state writes without changing interrupted Graph control.
+        """Persist a resume intent without changing interrupted Graph state.
 
         Args:
             checkpointer: Borrowed saver that owns the interrupted checkpoint.
             config: Exact checkpoint configuration selected by Runtime lineage.
-            writes: Ordered private lineage and marker values.
+            writes: Ordered private resume-intent values.
 
         Raises:
             Exception: The concrete Profile cannot durably establish this intent.
@@ -179,23 +173,11 @@ class DeepAgentsRuntimeProfile(Protocol):
         """Return Profile-owned pending private values from one checkpoint.
 
         Args:
-            checkpoint: Saver tuple at the canonical thread head.
-            channel_name: TinkerFin private state channel to inspect.
+            checkpoint: Saver tuple at the selected approval checkpoint.
+            channel_name: TinkerFin resume-intent channel to inspect.
 
         Returns:
             Immutable raw values that the Runtime validates as exact markers.
-        """
-
-        ...
-
-    def native_resume_submitted(self, checkpoint: CheckpointTuple) -> bool:
-        """Return whether the Profile finds a durably submitted native decision.
-
-        Args:
-            checkpoint: Saver tuple at the canonical thread head.
-
-        Returns:
-            ``True`` only when retry must not submit the decision again.
         """
 
         ...
@@ -241,7 +223,7 @@ class DeepAgentsV2RuntimeProfile:
         """Return the currently installed locked factory without invoking it.
 
         Resolving the symbol on access keeps dependency monkeypatching and process-local
-        instrumentation scoped to Definition creation rather than Profile construction.
+        instrumentation scoped to Runtime building.
 
         Returns:
             Locked Deep Agents graph factory currently installed in this process.
@@ -283,8 +265,7 @@ class DeepAgentsV2RuntimeProfile:
                 ``create_agent_signature`` with defaults applied.
 
         Returns:
-            Immutable overrides for the selected factory and the external subagent
-            cancellation boundary.
+            Immutable tool review and permission overrides for the selected factory.
         """
 
         hitl = prepare_hitl_factory_overrides(arguments)
@@ -295,7 +276,6 @@ class DeepAgentsV2RuntimeProfile:
                 "permissions": hitl.permissions,
                 "subagents": hitl.subagents,
             },
-            uncontracted_external_subagents=(hitl.uncontracted_external_subagents),
         )
 
     async def create_agent_graph(
@@ -312,16 +292,30 @@ class DeepAgentsV2RuntimeProfile:
         running after this method returns.
 
         Args:
-            factory: Exact factory captured by the Definition.
+            factory: Exact factory captured by the Runtime.
             args: Frozen positional arguments for that factory.
             kwargs: Frozen keyword arguments for that factory.
 
         Returns:
-            The freshly constructed locked Deep Agents graph.
+            The fresh Graph. Checkpointed Graphs wait for each checkpoint by default,
+            so tool reviews can bind decisions to a persisted source.
         """
 
         build = partial(factory, *args, **dict(kwargs))
-        return await to_thread.run_sync(build)
+        graph = await run_sync_owned(build)
+        if isinstance(graph, CompiledStateGraph):
+            # Upstream's isinstance target omits its state/context generics.
+            # The resource test and with_config preserve the concrete Graph type.
+            compiled = cast(CompiledStateGraph[Any, Any, Any, Any], graph)
+            saver = compiled.checkpointer  # pyright: ignore[reportUnknownMemberType,reportUnknownVariableType] - upstream Checkpointer omits BaseCheckpointSaver's generic
+            if saver is None or saver is False:
+                return compiled
+            # LangGraph's per-step durability waits for asynchronous saver I/O;
+            # it does not run a blocking database driver on the event loop.
+            return compiled.with_config(
+                {"configurable": {"__pregel_durability": "sync"}}
+            )
+        return graph
 
     @property
     def stream_driver(self) -> NativeStreamDriver:
@@ -335,18 +329,16 @@ class DeepAgentsV2RuntimeProfile:
         config: RunnableConfig,
         writes: tuple[tuple[str, object], ...],
     ) -> None:
-        """Persist v2 null-task writes while preserving the interrupted checkpoint.
+        """Persist an intent without changing interrupted Graph state or task writes.
 
-        ``BaseCheckpointSaver.aput_writes()`` is awaited before host settlement. The
-        Graph later applies these writes in the same invocation that consumes the
-        native resume decision, so root, Planning, and nested subgraph task state remain
-        unchanged during the callback window. Matching partial writes are completed on
-        retry; conflicting or unrelated null-task writes fail closed.
+        The dedicated owner is never a Graph task. The checkpoint stays owned by its
+        source Run until execution creates a new checkpoint. Matching retries are
+        idempotent; conflicting records fail before decision submission.
 
         Args:
             checkpointer: Borrowed saver that owns the exact interrupted checkpoint.
-            config: Exact root checkpoint configuration selected by lineage validation.
-            writes: Ordered private lineage and marker channel values.
+            config: Exact approval checkpoint selected for the complete batch.
+            writes: Ordered private resume-intent channel values.
 
         Raises:
             TypeError: A write does not use a canonical channel name.
@@ -366,22 +358,18 @@ class DeepAgentsV2RuntimeProfile:
             raise ValueError("resume intent checkpoint is unavailable")
         existing: dict[str, object] = {}
         for task_id, channel, value in checkpoint.pending_writes or ():
-            if task_id != _V2_NULL_TASK_ID or channel == _V2_RESUME_CHANNEL:
+            if task_id != RESUME_WRITE_OWNER:
                 continue
             if channel not in expected:
-                raise ValueError(
-                    "checkpoint contains an unrelated v2 null-task state write"
-                )
+                raise ValueError("checkpoint contains an unrelated resume-intent write")
             if channel in existing and existing[channel] != value:
-                raise ValueError(
-                    "checkpoint contains conflicting v2 null-task state writes"
-                )
+                raise ValueError("checkpoint contains conflicting resume-intent writes")
             existing[channel] = value
         if any(expected[channel] != value for channel, value in existing.items()):
             raise ValueError("checkpoint contains a different resume intent")
         if existing == expected:
             return
-        await checkpointer.aput_writes(config, writes, _V2_NULL_TASK_ID)
+        await checkpointer.aput_writes(config, writes, RESUME_WRITE_OWNER)
 
     def pending_resume_values(
         self,
@@ -389,11 +377,11 @@ class DeepAgentsV2RuntimeProfile:
         *,
         channel_name: str,
     ) -> tuple[object, ...]:
-        """Return pending private writes owned by the v2 null task.
+        """Return pending records from the dedicated resume-intent owner.
 
         Args:
-            checkpoint: Saver tuple at the canonical thread head.
-            channel_name: Private state channel selected by TinkerFin.
+            checkpoint: Saver tuple at the selected approval checkpoint.
+            channel_name: Private intent channel selected by TinkerFin.
 
         Returns:
             Immutable raw marker values pending at the locked v2 boundary.
@@ -402,22 +390,7 @@ class DeepAgentsV2RuntimeProfile:
         return tuple(
             value
             for task_id, channel, value in checkpoint.pending_writes or ()
-            if task_id == _V2_NULL_TASK_ID and channel == channel_name
-        )
-
-    def native_resume_submitted(self, checkpoint: CheckpointTuple) -> bool:
-        """Return whether v2 persisted a native resume write at this checkpoint.
-
-        Args:
-            checkpoint: Saver tuple at the canonical thread head.
-
-        Returns:
-            Whether the locked v2 resume channel has a durable pending write.
-        """
-
-        return any(
-            channel == _V2_RESUME_CHANNEL
-            for _task_id, channel, _value in checkpoint.pending_writes or ()
+            if task_id == RESUME_WRITE_OWNER and channel == channel_name
         )
 
     def _matches_resume_subgraph_namespace(

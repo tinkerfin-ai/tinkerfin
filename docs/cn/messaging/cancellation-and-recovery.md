@@ -14,7 +14,7 @@ async def cancel_agent(context):
     return cancellation_tail
 
 
-body = await channel.sse(
+body = await channel.open_sse(
     source,
     identity=identity,
     cancel=cancel_agent,
@@ -29,11 +29,10 @@ cancelled = await channel.cancel(identity=identity)
 
 取消函数可以不接收参数，也可以接收 `CancelContext`。它可以返回有限的终止事件，让订阅者收到明确的取消结尾。
 
-TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messaging 时通常不用传 `cancel=`。
+TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messaging 时省略 `cancel=`。
 
-`cancel()` 属于 Messaging preflight 生命周期，不能越过 facade 关闭后继续访问 borrowed backend。
-关闭时，Messaging 会先通知当前 producer，再等待 cancel preflight 与 producer settlement，避免两条
-路径形成等待环。
+Messaging 开始关闭后不再接受新的取消请求。关闭时先通知当前生产者，再等待已经接受的
+取消操作、运行收尾及资源清理完成。
 
 | 结果或错误 | 含义 |
 | --- | --- |
@@ -45,33 +44,20 @@ TinkerFin 的 AG-UI 流已经提供取消能力，直接把该流交给 Messagin
 
 ## 只有 owner 才创建 Agent
 
-Managed TinkerFin AG-UI 运行使用面向任务的 helper：
+直接把 Runtime 创建的惰性运行流交给 Messaging：
 
 ```python
-from tinkerfin_messaging import create_agui_run_source
-
-
-source = create_agui_run_source(
-    identity,
-    open_events=lambda run_identity: tinkerfin.open_agui_run(
-        run_identity,
-        agent=create_agent,
-        input=graph_input,
-        config=graph_config,
-    ),
-    transform_event=add_product_metadata,
+source = runtime.open_agui_run(
+    thread_id="thread-42", run_id="run-7", input=graph_input,
 )
 ```
 
-Messaging 选定当前调用为 owner 后才会打开 Agent。该 helper 隐藏 Binding、profile 常量、source
-类型、映射和首事件取消 fence，并把调用方只传一次的同一个 `RunIdentity` 对象交给
-`open_events`。`transform_event` 可以补充产品 metadata 或内容，但必须保留具体事件类型和全部协议
-关联身份，并完整保留调用方提供的可选 `RUN_STARTED.input`。
+Messaging 选定生产者后才打开 Agent。附着请求复用已有状态，不会重复准备 Agent 或 Sandbox。
 
 宿主投递状态使用 channel callback：
 
 ```python
-body = await channel.sse(
+body = await channel.open_sse(
     source,
     on_source_ready=activate_business_run,
     on_delivery_not_started=cleanup_business_run,
@@ -93,9 +79,8 @@ from tinkerfin_messaging import (
 
 
 async def open_events():
-    runtime = await create_runtime()
-    events = runtime.astream(graph_input, graph_config)
-    return MessageSourceBinding(source=events)
+    events = await connect_event_source()
+    return MessageSourceBinding(source=events, cancel=events.cancel)
 
 
 source = DeferredMessageSource(
@@ -104,6 +89,9 @@ source = DeferredMessageSource(
     cancel_after_first_item=True,
 )
 ```
+
+`connect_event_source()` 由应用实现，返回支持异步迭代、幂等 `aclose()` 和取消的事件源。
+示例通过 `cancel` 明确提供取消函数。
 
 | 参数 | 作用 |
 | --- | --- |
@@ -151,7 +139,7 @@ source = ProfiledDeferredMessageSource(
 | `replay_type` | 必填 | codec 解码后的数据类型 |
 | `cancellable` | 必填 | source 是否支持远程取消 |
 | `cancel_after_first_item` | `False` | 是否防止取消越过第一条协议事件 |
-| `on_owner_preflight` | `None` | producer 执行前的 owner 专用异步激活函数 |
+| `on_owner_preflight` | `None` | 选定新生产者后、打开事件源前执行的准备函数 |
 
 ## 固定事件与转换事件
 

@@ -9,7 +9,7 @@
 | `Messaging(...)` | `backend=None`, `settlement_timeout=None` | Create one application lifecycle |
 | `Messaging.channel(...)` | name, optional codec and renderer | Create a reusable channel |
 | `Messaging.aclose()` | none | Settle preflight, producers, and cleanup |
-| `create_agui_run_source(...)` | identity, `open_events`, optional transform | Create the ordinary lazy TinkerFin AG-UI source |
+| `create_agui_run_source(...)` | profiled AG-UI source, optional transform | Transform event content or metadata while preserving protocol identity |
 
 The default backend is `MemoryBackend`.
 
@@ -17,7 +17,7 @@ The default backend is `MemoryBackend`.
 
 | Method | Main parameters | Result |
 | --- | --- | --- |
-| `sse(...)` | source, optional identity, after, callbacks | Caller-owned closeable SSE byte iterator |
+| `open_sse(...)` | source, optional identity, after, callbacks | Caller-owned closeable SSE byte iterator |
 | `publish(...)` | message, identity, optional message_id | Persist a notification in the existing run; return MessageEnvelope |
 | `wrap(...)` | source, optional identity, after, callbacks | `MessageSubscription` |
 | `wrap_recoverable(...)` | recoverable source, optional identity, after, callbacks | Recoverable subscription |
@@ -35,7 +35,7 @@ RunIdentity is optional only when the source advertises an immutable profile.
 
 | API | Purpose |
 | --- | --- |
-| `MessageSubscription` | Returned by channel `wrap()`/`follow()`; asynchronously iterates `DecodedMessage` and supports `sse()`/`aclose()`; do not construct directly |
+| `MessageSubscription` | Returned by channel `wrap()`/`follow()`; asynchronously iterates `DecodedMessage` and supports `to_sse()`/`aclose()`; do not construct directly |
 | `DecodedMessage` | Committed `envelope` plus codec-decoded `data` |
 | `MessageEnvelope` | Immutable committed durable message |
 
@@ -43,7 +43,7 @@ RunIdentity is optional only when the source advertises an immutable profile.
 
 | Envelope field | Meaning |
 | --- | --- |
-| `channel` | Codec namespace |
+| `channel` | Non-empty channel name |
 | `identity` | Nested shared RunIdentity |
 | `seq` | One-based thread position |
 | `message_id` | Stable message idempotency ID |
@@ -55,7 +55,7 @@ RunIdentity is optional only when the source advertises an immutable profile.
 
 | API | Purpose |
 | --- | --- |
-| `create_agui_run_source(...)` | Hide Binding, codec/type profile, transform, and first-event cancellation while opening one managed AG-UI run only for the owner |
+| `create_agui_run_source(...)` | Transform a lazy AG-UI source while preserving preparation, cancellation, and cleanup |
 | `parse_sse_event_id(value)` | Parse `None` or canonical non-negative ASCII decimal SSE IDs |
 | `is_active_run_status(status)` | TypeGuard for `running` and `cancel_requested` |
 | `is_final_run_status(status)` | TypeGuard for all terminal durable statuses |
@@ -67,6 +67,32 @@ event-type substitutions and changes to Run, message, Tool, snapshot, or interru
 It also preserves every field of an optional `RUN_STARTED.input`, including messages,
 tools, context, forwarded props, and resume entries. Use advanced `map_source()` when
 changing the output protocol is intentional.
+
+Use a built Runtime and an application-owned channel to add product fields:
+
+```python
+from ag_ui.core import BaseEvent
+from tinkerfin_messaging import create_agui_run_source
+
+
+def add_label(event: BaseEvent) -> BaseEvent:
+    return event.model_copy(update={"label": "Report"})
+
+
+source = create_agui_run_source(
+    runtime.open_agui_run(
+        thread_id="conversation-1",
+        run_id="run-1",
+        messages=[{"id": "message-1", "role": "user", "content": "Summarize this report"}],
+    ),
+    transform_event=add_label,
+)
+body = await channel.open_sse(source, after=0)
+```
+
+The HTTP host sends `body` and calls `await body.aclose()` on completion or disconnect.
+A failed adapter construction leaves source cleanup with the caller. After a cleanup
+waiting limit is exceeded, call `aclose()` again before disposing borrowed resources.
 
 ## Advanced source helpers
 
@@ -96,13 +122,19 @@ changing the output protocol is intentional.
 | `NativeStreamPartCodec` | `[native]` canonical Native replay codec and renderer |
 | `NativeStreamPart` | `[native]` finite canonical Native replay value |
 | `MemoryBackend` | In-process implementation |
+| `SqlAlchemyBackend(engine)` | `[sqlalchemy]` SQLite, MySQL and PostgreSQL; borrowed AsyncEngine |
 | `RedisBackend` | `[redis]` multi-process implementation |
+| `MessagingRetentionPolicy` | Disabled or positive terminal replay deadline |
+
+Backend-author contracts are exported from `tinkerfin_messaging.backend_contract`:
+
+| API | Purpose |
+| --- | --- |
 | `MessagingBackend` | Six-operation custom storage protocol |
 | `MessagingBackendSettings` | Immutable limits, retention, lease, renewal, and wait settings |
 | `MessagingTransition` | Framework-defined atomic lifecycle intent |
 | `MessagingStateSnapshot` | Bounded storage-clock-consistent transition evidence |
 | `MessagingStorageEffect` | Complete replacements produced by `resolve_messaging_transition()` |
-| `MessagingRetentionPolicy` | Disabled or positive terminal replay deadline |
 
 ### Backend operations
 
@@ -137,6 +169,9 @@ it never interprets or persists the token.
 Attachments invoke neither delivery callback. `on_owner_preflight` belongs to the source
 and runs before a deferred opener; `on_source_ready` runs after that opener completes.
 
+Cancellation waits for a delivery callback that has already started to finish.
+Use database and network timeouts inside these callbacks to bound that wait.
+
 ## Common errors
 
 | Error | Meaning |
@@ -156,4 +191,4 @@ and runs before a deferred opener; `on_source_ready` runs after that opener comp
 | `StreamExpired` | Terminal generation is outside its replay retention window |
 | `StreamDeleted` / `StreamDeleteConflict` | Generation is deleted or still active |
 
-Messaging does not read or compare request bodies. Callers own body consistency for a reused runId.
+Messaging does not read or compare request bodies. Callers own body consistency for a reused run_id.

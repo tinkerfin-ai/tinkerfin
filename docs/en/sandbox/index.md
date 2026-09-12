@@ -1,16 +1,9 @@
-# Sandbox basics
+# Sandbox
 
 [Documentation](../index.md) · [中文](../../cn/sandbox/index.md)
 
-`tinkerfin-sandbox` connects OpenSandbox to Deep Agents. An agent can run commands and work with files in an isolated environment instead of using the application server directly.
-
-## When to use it
-
-- The agent runs Shell commands;
-- the agent edits project files;
-- users or projects need isolated workspaces;
-- unhealthy Sandbox instances should reconnect or be replaced;
-- several application workers share Sandbox bindings.
+`tinkerfin-sandbox` provides asynchronous files, commands, reusable isolated
+environments, persistent bindings, warm capacity, pause, resume, and cleanup.
 
 ## Installation
 
@@ -18,73 +11,91 @@
 pip install tinkerfin-sandbox
 ```
 
-You also need a reachable OpenSandbox service. Configure its domain and API key explicitly or through the environment supported by the OpenSandbox SDK.
+For persistent bindings, install the SQLAlchemy extra and one asynchronous driver:
 
-## Your first Sandbox-backed agent
+```bash
+pip install "tinkerfin-sandbox[sqlalchemy]" aiosqlite
+```
+
+Use `asyncpg` for PostgreSQL or `asyncmy` for MySQL.
+
+## Use a Sandbox with AgentRuntime
+
+The application chooses both scopes:
+
+- Runtime `namespace` selects the business isolation scope.
+- `workspace_key` selects which runs share a Sandbox inside that scope.
+
+The key may represent a user, session, project, or another application policy.
 
 ```python
-from deepagents import create_deep_agent
 from opensandbox.config import ConnectionConfig
-from tinkerfin_sandbox import (
-    OpenSandboxClient,
-    OpenSandboxConfig,
-    OpenSandboxManager,
-)
-
+from tinkerfin import TinkerFin
+from tinkerfin_sandbox import OpenSandboxClient, OpenSandboxConfig, OpenSandboxManager
 
 client = OpenSandboxClient(
     connection_config=ConnectionConfig(domain="127.0.0.1:8091"),
     config=OpenSandboxConfig(workspace_root="/workspace"),
 )
-manager = OpenSandboxManager[str](
-    client=client,
-    key_resolver=lambda key: key,
-)
 
-
-async with manager:
-    backend = await manager.get("tenant-1/user-7")
-    agent = create_deep_agent(
-        model=model,
-        backend=backend,
-        middleware=manager.build_agent_middleware(backend),
+async with OpenSandboxManager(client=client) as sandboxes:
+    runtime = (
+        TinkerFin()
+        .with_namespace("company-a")
+        .build(
+            model=model,
+            backend=sandboxes.workspace("users/user-7"),
+        )
+    )
+    result = await runtime.ainvoke(
+        thread_id=thread_id,
+        run_id=run_id,
+        input=graph_input,
     )
 ```
 
-Acquire the backend before constructing the Graph.
+`workspace(...)` performs no I/O. The Runtime opens or reconnects the Sandbox only for
+an admitted run and releases the run's handle during cleanup. Finishing a run does not
+destroy a persistent Sandbox.
 
-## Choose what a key represents
+## Manage a Sandbox directly
 
-TinkerFin does not force keys to mean users, threads, or projects. Pick a stable scope for your application:
-
-```python
-manager = OpenSandboxManager[tuple[int, int]](
-    client=client,
-    key_resolver=lambda key: f"org/{key[0]}/project/{key[1]}",
-)
-```
-
-Keys resolving to the same string share one stable handle and serialized lifecycle transitions. Different resolved keys may proceed concurrently.
-
-Do not put passwords or tokens in a key. Remote owner labels use digests, but keys can still appear in application logs or state storage.
-
-## Resource lifetime
-
-By default, the manager controls its client and state lifetime. Graphs borrow the backend returned by `get()` and should not close it independently.
+Use direct manager methods when application code needs the environment outside an
+agent run:
 
 ```python
-async with manager:
-    backend = await manager.get(key)
-    # Use the backend.
-# The manager settles operations and closes local resources.
+backend = await sandboxes.get("projects/project-1", namespace="company-a")
+await backend.awrite("/notes.txt", "hello")
+result = await backend.aexecute("python -m pytest", timeout=300)
 ```
 
-Use asynchronous methods for all remote operations: `aexecute()`, `aread()`, `awrite()`, and their peers. Synchronous remote methods fail explicitly.
+| Task | Method |
+| --- | --- |
+| Open or reuse | `get(key)` |
+| Reconnect | `reconnect(key)` |
+| Replace | `recreate(key)` |
+| Clear workspace files | `reset(key)` |
+| Pause or resume | `pause(key)`, `resume(key)` |
+| Destroy | `destroy(key)` |
+| Inspect | `get_details(key)` |
+| Close local resources | `aclose()` |
+
+## Persistence and ownership
+
+`SQLAlchemyOpenSandboxState` supports SQLite, MySQL, and PostgreSQL through a borrowed
+SQLAlchemy `AsyncEngine`. The application creates and disposes the Engine. State stores
+bindings and lifecycle coordination; files remain in the Sandbox or attached volumes.
+
+The manager owns its OpenSandbox client and State. A caller-supplied HTTP transport
+remains caller-owned. Persistent State retains remote Sandboxes when the manager closes;
+in-memory State destroys the instances it created.
+
+File tools are confined to `workspace_root` and reject escaping paths and links. Shell
+commands are a separate Sandbox capability and are not restricted by the file root.
 
 ## Next steps
 
-- [Sandbox lifecycle](lifecycle.md)
-- [Rooted files and commands](rooted-filesystem.md)
+- [Lifecycle](lifecycle.md)
+- [Files and commands](rooted-filesystem.md)
 - [Persistent state and extensions](persistence-and-extensions.md)
-- [Sandbox usage reference](api-reference.md)
-
+- [Sandbox API](api-reference.md)

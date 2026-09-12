@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock
 import pytest
 from opensandbox.config import ConnectionConfig
 from test_backend import _FakeSandbox
-from test_manager import _FakeBackend, _FakeClient, _FakeState, _new_manager
+from test_manager import (
+    _FakeBackend,
+    _FakeClient,
+    _FakeState,
+    _new_manager,
+    _resource_key,
+)
 
 from tinkerfin_sandbox import (
     OpenSandboxBackend,
@@ -56,14 +62,14 @@ async def test_transient_recovery_retries_only_the_original_id() -> None:
             ),
         ]
     )
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client, state=state, recovery_policy=_fast_policy()
     ) as manager:
         backend = await manager.get("owner")
         assert backend.id == "original"
         assert client.connect_calls == ["original"] * 3
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
         assert client.create_calls == 0
         assert client.destroy_calls == []
 
@@ -87,7 +93,7 @@ async def test_nonrecoverable_failures_never_retry_or_recreate(
     failure: OpenSandboxBackendError,
 ) -> None:
     client = _RecoveringClient([failure])
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client, state=state, recovery_policy=_fast_policy(recreate=True)
     ) as manager:
@@ -97,7 +103,7 @@ async def test_nonrecoverable_failures_never_retry_or_recreate(
         assert client.connect_calls == ["original"]
         assert client.create_calls == 0
         assert client.destroy_calls == []
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
 
 
 @pytest.mark.asyncio
@@ -108,20 +114,20 @@ async def test_confirmed_missing_skips_retries_and_obeys_the_failure_action(
     client = _RecoveringClient(
         [OpenSandboxBackendUnavailableError("gone", context={"reason": "not_found"})]
     )
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client, state=state, recovery_policy=_fast_policy(recreate=recreate)
     ) as manager:
         if recreate:
             backend = await manager.get("owner")
             assert backend.id != "original"
-            assert state.bindings == {"owner": backend.id}
+            assert state.bindings == {_resource_key("owner"): backend.id}
             assert client.destroy_calls == ["original"]
         else:
             with pytest.raises(OpenSandboxBackendUnavailableError) as raised:
                 await manager.get("owner")
             assert raised.value.context["attempts"] == 1
-            assert state.bindings == {"owner": "original"}
+            assert state.bindings == {_resource_key("owner"): "original"}
             assert client.destroy_calls == []
         assert client.connect_calls == ["original"]
         assert client.create_calls == int(recreate)
@@ -132,7 +138,7 @@ async def test_reconnect_cannot_recreate_even_when_get_is_allowed_to() -> None:
     client = _RecoveringClient(
         [OpenSandboxBackendUnavailableError("gone", context={"reason": "not_found"})]
     )
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client, state=state, recovery_policy=_fast_policy(recreate=True)
     ) as manager:
@@ -140,20 +146,20 @@ async def test_reconnect_cannot_recreate_even_when_get_is_allowed_to() -> None:
             await manager.reconnect("owner")
         assert client.create_calls == 0
         assert client.destroy_calls == []
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
 
 
 @pytest.mark.asyncio
 async def test_cancellation_during_retry_keeps_binding_and_instance() -> None:
     client = _RecoveringClient([OpenSandboxBackendTimeoutError("temporary")])
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(client=client, state=state) as manager:
         getting = asyncio.create_task(manager.get("owner"))
         await client.connect_entered.wait()
         getting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await getting
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
         assert client.create_calls == 0
         assert client.destroy_calls == []
 
@@ -169,7 +175,7 @@ async def test_uncertain_connection_at_budget_expiry_cannot_authorize_recreation
             raise AssertionError("unreachable")
 
     client = BlockedClient([])
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     policy = replace(_fast_policy(recreate=True), timeout=0.02)
     async with _new_manager(
         client=client, state=state, recovery_policy=policy
@@ -180,7 +186,7 @@ async def test_uncertain_connection_at_budget_expiry_cannot_authorize_recreation
         assert client.connect_calls == ["original"]
         assert client.create_calls == 0
         assert client.destroy_calls == []
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
 
 
 @pytest.mark.asyncio
@@ -249,7 +255,7 @@ async def test_manager_deadline_does_not_wait_for_native_connection_settlement(
         ),
         initializers=[initialize],
     )
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     policy = replace(_fast_policy(recreate=True), timeout=0.02)
     async with _new_manager(
         client=client, state=state, recovery_policy=policy
@@ -264,7 +270,7 @@ async def test_manager_deadline_does_not_wait_for_native_connection_settlement(
             with pytest.raises(OpenSandboxBackendUnavailableError) as raised:
                 await getting
             assert raised.value.context["reason"] == "timeout"
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
     assert completed_in_budget
     if phase == "initializer":
         assert sandbox.closed
@@ -303,7 +309,7 @@ async def test_connection_settlement_retains_owner_claim_and_blocks_next_initial
         config=OpenSandboxConfig(workspace_root=None, warm_pool_size=0),
         initializers=[initialize],
     )
-    state = _FakeState({"owner": "original"})
+    state = _FakeState({_resource_key("owner"): "original"})
     async with _new_manager(
         client=client,
         state=state,
@@ -332,7 +338,7 @@ async def test_connection_settlement_retains_owner_claim_and_blocks_next_initial
                 await getting
             assert (await next_get).id == "original"
         assert initialized == 2
-        assert state.bindings == {"owner": "original"}
+        assert state.bindings == {_resource_key("owner"): "original"}
     assert first.closed and second.closed
     assert not first.killed and not second.killed
 

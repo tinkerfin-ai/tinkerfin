@@ -122,7 +122,9 @@ def test_invalid_form_default_time_zone_fails_at_definition_creation() -> None:
         default_time_zone: ClassVar[str] = "Mars/Olympus_Mons"
 
     with pytest.raises(PlanModeConfigurationError, match="default_time_zone"):
-        TinkerFin().plan(clarification_schema=InvalidTimeZoneForm)
+        TinkerFin().with_namespace("test").with_plan(
+            clarification_schema=InvalidTimeZoneForm
+        )
 
 
 def test_datetime_question_normalizes_one_unique_zoned_instant() -> None:
@@ -428,7 +430,7 @@ def test_shared_metadata_form_requires_no_per_question_subclasses() -> None:
         "time",
         "datetime",
     }
-    TinkerFin().plan(clarification_schema=_BrandedForm)
+    TinkerFin().with_namespace("test").with_plan(clarification_schema=_BrandedForm)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -499,7 +501,9 @@ def test_custom_type_is_one_registration_unit_and_extends_the_default_form() -> 
         bind_response_schema=_rating_schema,
         normalize=lambda _question, response: {"rating": response.rating},
     )
-    factory = TinkerFin().plan(clarification_types=(rating,))
+    factory = (
+        TinkerFin().with_namespace("test").with_plan(clarification_types=(rating,))
+    )
     assert factory._plan_options is not None
     binding = factory._plan_options.clarification
     form = binding.form_schema.model_validate(

@@ -53,7 +53,7 @@ def _filter_digest(where: TraceGraphFilter) -> str:
         "agentNames": sorted(where.agent_names),
         "providers": sorted(where.providers),
         "models": sorted(where.models),
-        "namespaces": sorted(list(value) for value in where.namespaces),
+        "graphNamespaces": sorted(list(value) for value in where.graph_namespaces),
         "search": where.search,
         "startedAfter": (
             None if where.started_after is None else where.started_after.isoformat()

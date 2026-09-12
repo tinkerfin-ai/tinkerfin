@@ -22,17 +22,14 @@ from langchain_core.tools import BaseTool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from tinkerfin import (
-    AgUiEventStream,
-    AgUiResumeBinding,
-    DeepAgentAgUiResumeRuntime,
-    DeepAgentAgUiRuntime,
-    DeepAgentDefinition,
-    DeepAgentRuntime,
-    NativeGraphRunStream,
+    AgentRuntime,
+    AgUiRunStream,
+    NativeRunStream,
     RunIdentity,
     TinkerFin,
 )
-from tinkerfin.deep_agent import DeepAgentGraph
+from tinkerfin.agui_resume import AgUiResumeRequest
+from tinkerfin.deep_agent import DeepAgentGraph, create_graph
 from tinkerfin.plan import (
     ClarificationForm,
     ClarificationModel,
@@ -94,38 +91,38 @@ class _RatingResponse(ClarificationResponseBase):
 
 
 if TYPE_CHECKING:
-    tinkerfin = TinkerFin()
+    tinkerfin = TinkerFin().with_namespace("test")
     observer = cast(RuntimeObserver, object())
-    observed = tinkerfin.observe(observer)
+    observed = tinkerfin.with_observer(observer)
     assert_type(observed, TinkerFin)
-    observed_definition = observed.create_deep_agent(
+    observed_definition = observed.build(
         model=_FakeModel(responses=[AIMessage(content="ok")]),
         tools=[],
         context_schema=_Context,
     )
-    assert_type(observed_definition, DeepAgentDefinition[_Context])
-    definition = tinkerfin.create_deep_agent(
+    assert_type(observed_definition, AgentRuntime[_Context])
+    definition = tinkerfin.build(
         model=_FakeModel(responses=[AIMessage(content="ok")]),
         tools=[],
         context_schema=_Context,
     )
-    assert_type(definition, DeepAgentDefinition[_Context])
+    assert_type(definition, AgentRuntime[_Context])
 
-    planned = tinkerfin.plan(enabled=True)
+    planned = tinkerfin.with_plan(enabled=True)
     assert_type(planned, TinkerFin)
-    editable_planned = tinkerfin.plan(
+    editable_planned = tinkerfin.with_plan(
         allowed_review_actions=(PlanReviewAction.APPROVE, PlanReviewAction.EDIT)
     )
     assert_type(editable_planned, TinkerFin)
-    planned_definition = planned.create_deep_agent(
+    planned_definition = planned.build(
         model=_FakeModel(responses=[AIMessage(content="ok")]),
         tools=[],
         context_schema=_Context,
         checkpointer=InMemorySaver(),
     )
-    assert_type(planned_definition, DeepAgentDefinition[_Context])
+    assert_type(planned_definition, AgentRuntime[_Context])
 
-    custom_planned = tinkerfin.plan(clarification_schema=_Form)
+    custom_planned = tinkerfin.with_plan(clarification_schema=_Form)
     assert_type(custom_planned, TinkerFin)
     custom_option = _Option(id="option", label="Option", attributes=None)
     assert_type(custom_option.attributes, _OptionAttributes | None)
@@ -140,46 +137,53 @@ if TYPE_CHECKING:
         rating_type,
         ClarificationType[_RatingQuestion, _RatingResponse],
     )
-    assert_type(tinkerfin.plan(clarification_types=(rating_type,)), TinkerFin)
+    assert_type(tinkerfin.with_plan(clarification_types=(rating_type,)), TinkerFin)
 
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
-    native = definition.new(identity=identity)
-    agui = definition.new_agui(identity=identity)
-    resumed_agui = definition.new_agui(
-        identity=identity,
-        resume=AgUiResumeBinding(
-            mode="resume",
-            resume_data={"decisions": [{"type": "approve"}]},
-            native_interrupt_ids=("interrupt-1",),
-        ),
-    )
-    planned_native = planned_definition.new(identity=identity, mode="plan")
-    planned_agui = planned_definition.new_agui(
-        identity=identity,
-        mode="default",
-    )
-    assert_type(native, DeepAgentRuntime[_Context])
-    assert_type(agui, DeepAgentAgUiRuntime[_Context])
-    assert_type(resumed_agui, DeepAgentAgUiResumeRuntime[_Context])
-    assert_type(planned_native, DeepAgentRuntime[_Context])
-    assert_type(planned_agui, DeepAgentAgUiRuntime[_Context])
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
+    native = definition
+    agui = definition
+    resumed_agui = definition
+    planned_native = planned_definition
+    planned_agui = planned_definition
+    assert_type(native, AgentRuntime[_Context])
+    assert_type(agui, AgentRuntime[_Context])
+    assert_type(resumed_agui, AgentRuntime[_Context])
+    assert_type(planned_native, AgentRuntime[_Context])
+    assert_type(planned_agui, AgentRuntime[_Context])
 
     graph_input = cast(InputAgentState, {"messages": []})
     assert_type(
-        native.astream(graph_input, context={"tenant": "tenant-1"}),
-        NativeGraphRunStream,
+        native.open_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=graph_input,
+            context={"tenant": "tenant-1"},
+        ),
+        NativeRunStream,
     )
     assert_type(
-        agui.astream(graph_input, context={"tenant": "tenant-1"}),
-        AgUiEventStream,
+        agui.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            input=graph_input,
+            context={"tenant": "tenant-1"},
+        ),
+        AgUiRunStream,
     )
     assert_type(
-        resumed_agui.astream(context={"tenant": "tenant-1"}),
-        AgUiEventStream,
+        resumed_agui.open_agui_run(
+            thread_id=identity.thread_id,
+            run_id=identity.run_id,
+            resume=AgUiResumeRequest.model_validate(
+                {"entries": [{"interruptId": "i", "status": "cancelled"}]}
+            ),
+            context={"tenant": "tenant-1"},
+        ),
+        AgUiRunStream,
     )
 
     async def check_managed_and_direct_graphs() -> None:
-        graph = await definition.create_graph()
+        graph = await create_graph(definition)
         assert_type(graph, DeepAgentGraph)
         subagent: CompiledSubAgent = {
             "name": "typed-subagent",
@@ -188,25 +192,25 @@ if TYPE_CHECKING:
         }
         assert_type(subagent["runnable"], Runnable)
         assert_type(
-            await tinkerfin.open_run(
-                identity,
-                agent=definition,
+            definition.open_run(
+                thread_id=identity.thread_id,
+                run_id=identity.run_id,
                 input=graph_input,
                 context={"tenant": "tenant-1"},
             ),
-            NativeGraphRunStream,
+            NativeRunStream,
         )
         assert_type(
-            await tinkerfin.open_agui_run(
-                identity,
-                agent=definition,
+            definition.open_agui_run(
+                thread_id=identity.thread_id,
+                run_id=identity.run_id,
                 input=graph_input,
                 context={"tenant": "tenant-1"},
             ),
-            AgUiEventStream,
+            AgUiRunStream,
         )
 
-    reveal_type(tinkerfin.create_deep_agent)
-    reveal_type(native.astream)
-    reveal_type(agui.astream)
-    reveal_type(resumed_agui.astream)
+    reveal_type(tinkerfin.build)
+    reveal_type(native.open_run)
+    reveal_type(agui.open_agui_run)
+    reveal_type(resumed_agui.open_agui_run)

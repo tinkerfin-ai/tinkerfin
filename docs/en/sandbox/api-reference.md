@@ -64,9 +64,7 @@ ordinary pause/resume operations.
 Implicit SDK transport retries are disabled. An explicit `ConnectionConfig.retry_policy`
 is retained, but an enabled policy that replays POST/PATCH response failures is rejected
 with `ValueError`. Caller-supplied transports keep their original policy and ownership.
-SDK creation telemetry is disabled in the managed copy because its reporting tasks
-cannot be joined at client close. Caller configuration, headers, and environment are
-not modified.
+Caller configuration, headers, and environment are not modified.
 
 Initializers receive an `OpenSandboxBackend` and may return an awaitable or `None`.
 Use native asynchronous callbacks for I/O. Synchronous callbacks run on the event
@@ -78,7 +76,9 @@ and cannot interrupt blocking synchronous work. Initialization failures raise
 
 ## Manager
 
-See [Sandbox lifecycle](lifecycle.md) for constructor parameters and operations. `build_agent_middleware(backend, permissions=None)` returns middleware ready for Deep Agents.
+See [Sandbox lifecycle](lifecycle.md) for constructor parameters and operations.
+`workspace(key)` returns the lazy declaration used by `TinkerFin.build(backend=...)`.
+`build_agent_middleware(...)` is available for caller-managed Deep Agents Graphs.
 
 `pause(key, timeout=30.0)` returns `None` after all registered holders finish work and
 the remote pause is confirmed. `resume(key, timeout=30.0)` returns a ready backend for
@@ -135,7 +135,7 @@ Synchronous remote methods fail explicitly; use the asynchronous forms.
 | --- | --- |
 | `OpenSandboxState` | Custom binding, lease, warm-pool, availability, holder coordination, and cleanup protocol |
 | `InMemoryOpenSandboxState(namespace="")` | Current-process state |
-| `SQLAlchemyOpenSandboxState(...)` | Shared SQLite or MySQL state |
+| `SQLAlchemyOpenSandboxState(...)` | Shared SQLite, MySQL, or PostgreSQL state through a borrowed `engine` |
 | `get_sqlalchemy_opensandbox_state_schema(dialect=...)` | Generate complete schema DDL |
 | `SQLAlchemyOpenSandboxStateSchema` | Immutable dialect, table names, and DDL |
 

@@ -4,20 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, NotRequired, Required, cast, get_origin, get_type_hints
+from typing import (
+    Any,
+    NotRequired,
+    Required,
+    cast,
+    get_origin,
+    get_type_hints,
+)
 
 from deepagents.graph import DeepAgentState
-from pydantic import JsonValue
 from typing_extensions import TypedDict, is_typeddict
-
-from ._agui_lineage_state import LINEAGE_STATE_KEY, RESUME_MARKER_STATE_KEY
-
-
-class TinkerFinRuntimeState(DeepAgentState, total=False):
-    """Deep Agent state with framework-owned durable lifecycle evidence."""
-
-    _tinkerfin_lineage: NotRequired[dict[str, JsonValue]]
-    _tinkerfin_resume: NotRequired[dict[str, JsonValue]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,13 +119,8 @@ def compose_deep_agent_base_schema(
 ) -> type[DeepAgentState] | None:
     """Merge framework, global, and Definition state without field precedence."""
 
-    if RESUME_MARKER_STATE_KEY not in TinkerFinRuntimeState.__annotations__:
-        raise RuntimeError("TinkerFin Runtime state lost its reserved resume channel")
-    if LINEAGE_STATE_KEY not in TinkerFinRuntimeState.__annotations__:
-        raise RuntimeError("TinkerFin Runtime state lost its reserved lineage channel")
     sources = [
         StateSchemaSource("DeepAgentState", DeepAgentState),
-        StateSchemaSource("TinkerFin Runtime state", TinkerFinRuntimeState),
     ]
     if global_schema is not None:
         sources.append(StateSchemaSource("TinkerFin state_schema", global_schema))
@@ -167,7 +159,6 @@ def middleware_state_sources(
 __all__ = [
     "StateSchemaCompositionError",
     "StateSchemaSource",
-    "TinkerFinRuntimeState",
     "compose_deep_agent_base_schema",
     "compose_state_schema",
     "middleware_state_sources",

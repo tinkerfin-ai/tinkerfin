@@ -48,7 +48,7 @@ export const traceGraphNode = (
     status: 'succeeded',
     name: 'tool',
     runId: 'run-fixture',
-    namespace: [],
+    graphNamespace: [],
     startedAt: '2026-08-28T00:00:00Z',
     completedAt: '2026-08-28T00:00:00Z',
     startedSeq,

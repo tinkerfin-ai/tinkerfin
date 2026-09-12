@@ -60,7 +60,7 @@ export interface TraceGraphNode {
   status: TraceGraphNodeStatus
   name: string
   runId: string
-  namespace: string[]
+  graphNamespace: string[]
   agentName?: string | null
   provider?: string | null
   model?: string | null
@@ -120,7 +120,7 @@ export interface TraceGraphFilter {
   agents?: string[]
   providers?: string[]
   models?: string[]
-  namespaces?: string[][]
+  graphNamespaces?: string[][]
   query?: string
   startedAfter?: string
   startedBefore?: string
@@ -177,7 +177,7 @@ const NODE_KEYS = new Set([
   'status',
   'name',
   'runId',
-  'namespace',
+  'graphNamespace',
   'agentName',
   'provider',
   'model',
@@ -309,7 +309,7 @@ const parseNode = (value: unknown): TraceGraphNode => {
     || !NODE_KINDS.has(value.kind as TraceGraphNodeKind)
     || typeof value.status !== 'string'
     || !NODE_STATUSES.has(value.status as TraceGraphNodeStatus)
-    || !isStringArray(value.namespace, { maxItems: 64, maxLength: 1024 })
+    || !isStringArray(value.graphNamespace, { maxItems: 64, maxLength: 1024 })
     || !isTimestamp(value.startedAt)
     || !Number.isSafeInteger(value.startedSeq)
     || Number(value.startedSeq) < 1
@@ -572,8 +572,8 @@ const appendFilter = (search: URLSearchParams, filter: TraceGraphFilter) => {
   filter.agents?.forEach((value) => search.append('agent', value))
   filter.providers?.forEach((value) => search.append('provider', value))
   filter.models?.forEach((value) => search.append('model', value))
-  filter.namespaces?.forEach((value) => search.append(
-    'namespace',
+  filter.graphNamespaces?.forEach((value) => search.append(
+    'graph_namespace',
     value.length === 0 ? 'root' : value.join('|'),
   ))
   if (filter.query) search.set('query', filter.query)

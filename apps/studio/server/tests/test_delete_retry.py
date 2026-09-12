@@ -7,15 +7,17 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import RunIdentity
+from tinkerfin import RunIdentity, TinkerFinLifecycleError
 from tinkerfin_contracts import (
     RunClosedObservation,
     RunInputObservation,
     RunSourceContext,
     RunStartedObservation,
     RunTerminalObservation,
+    ThreadIdentity,
 )
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.conversation.command import ConversationCommandService
@@ -91,7 +93,9 @@ async def test_delete_retries_each_destructive_stage_without_restoring_old_autho
     await repository.commit()
     thread_pk = thread.id
     thread_id = thread.thread_id
-    identity = RunIdentity(threadId=thread_id, runId=registration.run_id)
+    identity = RunIdentity(
+        namespace="ns_7", thread_id=thread_id, run_id=registration.run_id
+    )
     tracer = Tracer(
         projections=(ConversationFailureProjection(),),
     )
@@ -109,7 +113,7 @@ async def test_delete_retries_each_destructive_stage_without_restoring_old_autho
             if failure_stage == "messaging" and calls["messaging"] == 1:
                 raise RuntimeError("messaging delete failed")
 
-    class Checkpointer:
+    class Checkpointer(InMemorySaver):
         async def adelete_thread(self, thread_id: str) -> None:
             del thread_id
             calls["checkpoint"] += 1
@@ -135,14 +139,20 @@ async def test_delete_retries_each_destructive_stage_without_restoring_old_autho
     )
     service = ConversationCommandService(repository, user_id=7, resources=resources)
 
-    with pytest.raises(RuntimeError, match="delete failed"):
+    with pytest.raises(RuntimeError) as failure:
         await service.delete(thread_id=thread_id)
+    if failure_stage == "checkpoint":
+        assert isinstance(failure.value, TinkerFinLifecycleError)
+        assert isinstance(failure.value.cause, RuntimeError)
+        assert str(failure.value.cause) == "checkpoint delete failed"
+    else:
+        assert str(failure.value) == f"{failure_stage} delete failed"
 
     retained = await repository.get_thread_by_pk(thread_pk)
     assert retained is not None
     assert retained.status == "deleting"
     with pytest.raises(TraceThreadNotFound):
-        await tracer.get(thread_id)
+        await tracer.get(ThreadIdentity(namespace="ns_7", thread_id=thread_id))
 
     await service.delete(thread_id=thread_id)
 
@@ -176,7 +186,9 @@ async def test_delete_refuses_an_active_trace_and_restores_summary_status(
     tracer = Tracer(
         projections=(ConversationFailureProjection(),),
     )
-    identity = RunIdentity(threadId=thread.thread_id, runId=registration.run_id)
+    identity = RunIdentity(
+        namespace="ns_7", thread_id=thread.thread_id, run_id=registration.run_id
+    )
     context = RunSourceContext(
         identity=identity,
         runtime_profile="deepagents-v2",

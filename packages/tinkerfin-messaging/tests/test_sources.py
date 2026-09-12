@@ -26,7 +26,7 @@ from tinkerfin_messaging.sources import FiniteMessageSource, map_source
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 class _TrackedSource:
@@ -555,3 +555,31 @@ async def test_map_source_discards_the_whole_cancel_tail_on_transform_failure() 
         await callback(CancelContext(channel="events", identity=_identity()))
 
     await mapped.aclose()
+
+
+async def test_mapping_keeps_upstream_iteration_on_its_consumer_task() -> None:
+    """Upstream cancellation owners and context must survive across yielded items."""
+    resumed, release = asyncio.Event(), asyncio.Event()
+    consumers: list[asyncio.Task[object] | None] = []
+
+    async def events() -> AsyncGenerator[int, None]:
+        consumers.append(asyncio.current_task())
+        yield 1
+        consumers.append(asyncio.current_task())
+        resumed.set()
+        await release.wait()
+        yield 2
+
+    source = map_source(events(), lambda value: value)
+
+    async def consume() -> list[int]:
+        return [item async for item in source]
+
+    consuming = asyncio.create_task(consume())
+    try:
+        await resumed.wait()
+        assert consumers == [consuming, consuming]
+    finally:
+        release.set()
+        await consuming
+        await source.aclose()

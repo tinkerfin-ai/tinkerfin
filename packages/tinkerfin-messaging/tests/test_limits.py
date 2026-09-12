@@ -15,7 +15,7 @@ from tinkerfin_messaging._messaging_ledger import _MessagingLedger
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="quota-thread", runId="quota-run")
+    return RunIdentity(namespace="test", thread_id="quota-thread", run_id="quota-run")
 
 
 def test_messaging_limits_reject_invalid_capacity_shapes() -> None:

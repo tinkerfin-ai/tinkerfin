@@ -1,121 +1,66 @@
-# AG-UI 使用参考
+# AG-UI API
 
-[AG-UI 入门](index.md) · [English](../../en/agui/api-reference.md)
+[AG-UI](index.md) · [English](../../en/agui/api-reference.md)
 
-## 常用 managed 能力
-
-| API | 用途 |
-| --- | --- |
-| `TinkerFin.open_agui_run(identity, *, agent, input=... or resume=..., ...)` | 打开一次普通或恢复 AG-UI 运行 |
-| `AgUiEventStream` | 迭代、取消、关闭或转成 SSE |
-| `AgUiResumeRequest` | 只把不可信客户端决定带入 checkpoint 解析 |
-| `AgUiResumeCheckpoint` | marker 持久后传给 `on_resume_saved` 的稳定证据 |
-| `TINKERFIN_HITL_CONTRACT` | 外部 mixed-cancellation 子 Agent 的契约声明 |
-
-`open_agui_run()` 统一负责 Agent 解析、异步 Graph 构造、checkpoint 解析、失败生命周期转换、
-resume 结算与流创建。参数见 [AG-UI 入门](index.md)。
-
-## 高级 Runtime 能力
+## Runtime API
 
 | API | 用途 |
 | --- | --- |
-| `DeepAgentDefinition.new_agui(...)` | 创建一次 AG-UI Runtime |
-| `DeepAgentDefinition.prepare_agui_resume(...)` | 从权威 Graph checkpoint 解析客户端决定 |
-| `DeepAgentAgUiRuntime.astream(graph_input, ...)` | 执行普通 Graph 请求 |
-| `DeepAgentAgUiResumeRuntime.astream(...)` | 执行已绑定恢复，不接收调用方 input |
-| `AgUiResumeBinding` | 由框架解析并交给 `new_agui(...)` 的私有恢复事实 |
+| `runtime.open_agui_run(...)` | 返回惰性、单次消费的 `AgUiRunStream` |
+| `AgUiRunStream.abort()` | 请求取消并返回剩余终态事件 |
+| `AgUiRunStream.aclose()` | 等待执行与清理完成 |
+| `AgUiRunStream.to_sse()` | 返回单次消费的 UTF-8 SSE 字节流 `SseBody[bytes]` |
+| `AgUiResumeRequest` | 携带 pending interrupt 的不可信客户端决定 |
+| `AgUiResumeCheckpoint` | resume marker 持久后交给回调的证据 |
 
-普通和高级恢复边界见 [interrupt 与恢复](interrupts-and-resume.md)。
+### `open_agui_run()`
 
-## 转换入口
-
-| API | 主要参数 | 什么时候使用 |
+| 参数 | 默认值 | 用途 |
 | --- | --- | --- |
-| `astream_events(...)` | `parts`、`identity`、公开开关、此前已发出的 Tool ID、私有 state key | 已有原生异步流，希望自动管理完整生命周期 |
-| `DeepAgentAgUiAdapter(...)` | `identity`、此前已发出的 Tool ID、公开开关、私有 state key | 需要自己管理主开始和终止事件 |
-| `encode_sse(...)` | `event`、可选 `event_id` | 把单个 AG-UI 事件编码为 SSE |
-| `micro_batch(...)` | `events`、可选 batcher | 合并连续的小增量 |
+| `thread_id`、`run_id` | 必填 | Runtime namespace 内的运行身份 |
+| `messages` / `input` / `resume` | 严格三选一 | 用户消息、高级原生状态或恢复决定 |
+| `parent_run_id` | `None` | 已授权的分支或恢复来源 |
+| `mode` | Runtime 默认值 | `default` 或已配置的 `plan` |
+| `config`、`context` | `None` | Graph 设置与带类型调用上下文 |
+| `stream_timeout` | `None` | 原生流时限 |
+| `cleanup_timeout` | `None` | 调用方等待受保护清理的时限 |
+| `include_reasoning_events` | `False` | 输出已验证公开推理事件 |
+| `include_subagent_events` | `True` | 输出子智能体事件 |
+| `on_native_part`、`on_agui_event` | `None` | 交付前的异步观察函数 |
+| `on_resume_saved`、`on_resume_not_saved` | `None` | 仅恢复分支使用的结算回调 |
 
-### `DeepAgentAgUiAdapter` 方法
+`AgUiSettlementTimeoutError` 表示清理仍由流持有。释放共享资源前，应再次等待 `aclose()`。
 
-| 方法 | 作用 |
-| --- | --- |
-| `process(part)` | 校验并转换一条完整原生数据 |
-| `finish()` | 正常结束仍开放的文字、推理和 Tool 生命周期 |
-| `abort()` | 关闭开放的子生命周期；主终态仍由编排器唯一负责 |
-| `main_outcome()` | 返回 success 或 interrupt 终止结果 |
+## 输入辅助类型
 
-## 生命周期工厂
+宿主在授权后才分配消息 ID 时，可用 `AgUiUserInput` 校验一条无 ID 用户消息。
+`with_attachments(AttachmentSupport(...))` 允许宿主在模型调用前解析已授权附件描述。
 
-`AgUiLifecycleEventFactory` 只适合自定义编排器。
+`AgUiResumeBinding` 是框架解析后保存的恢复值。普通宿主把 `AgUiResumeRequest` 交给 Runtime，不自行构造 Binding。
 
-| 方法 | 参数 | 结果 |
-| --- | --- | --- |
-| `started(...)` | `identity`、可选 `parent_run_id` | `RUN_STARTED`，input 缺省 |
-| `finished(...)` | `identity`、`outcome` | 使用 canonical identity 的 `RUN_FINISHED` |
-| `failed(...)` | `identity`、`message`、`code`、可选 `parent_run_id` | 使用 canonical identity 的 `RUN_ERROR` |
-| `is_main_lifecycle(...)` | `event`、`identity` | 判断事件是否占用该主生命周期 |
-| `event_run_id(event)` | 事件 | 读取可验证的 run ID |
-| `validate_identity(...)` | `identity` | 提前验证运行身份类型 |
+## 独立 Adapter
 
-`AgentRunOutcome` 的 `type` 为 `success` 或 `interrupt`；只有 interrupt 结果携带 `interrupts`。
-
-## 恢复类型
+`tinkerfin-agui-adapter` 可以转换已有原生流，不创建 `AgentRuntime`：
 
 | API | 用途 |
 | --- | --- |
-| `TinkerFin.open_agui_run(resume=...)` | 恢复 pending 事实并执行 managed resume，不暴露 Binding |
-| `AgUiResumeRequest` | 不可变、非空且拒绝重复 ID 的客户端恢复项 |
-| `DeepAgentDefinition.prepare_agui_resume(...)` | 恢复 pending 事实并返回 Binding 的高级入口 |
-| `AgUiResumeBinding.from_agui(...)` | 自行拥有完整可信 AG-UI 终止日志时使用的高级入口 |
-| `AgUiResumeBinding.model_validate(...)` | 恢复完整稳定 Binding JSON 模型 |
-| `AgUiResumeBindingError` | 高层 Binding 无法无损保留恢复语义 |
-| `ResumeMapper.map(...)` | 从原生 interrupt 和 checkpoint 消息转换恢复请求 |
-| `ResumeMapper.map_agui(...)` | 从服务端保存的 AG-UI interrupt 转换恢复请求 |
-| `ResumeTranslation` | 保存 kind、mode、恢复数据、取消项、Tool ID、来源与原生决定 |
-| `ResumeMappingError` | Adapter 低层数据无法无损映射 |
+| `astream_events(parts, identity=...)` | 为原生流管理完整 AG-UI 生命周期 |
+| `DeepAgentAgUiAdapter` | 自定义编排器拥有主生命周期时逐条转换 |
+| `encode_sse(event, event_id=...)` | 把一条事件编码为 SSE 文本（`str`） |
+| `micro_batch(events)` | 在不跨生命周期边界的前提下合并相邻小增量 |
+| `ScopedIdCodec` | 使用完整 Graph 位置编码和解码 ID |
+| `ResumeMapper` | 转换可信原生或已保存 AG-UI interrupt 证据 |
 
-`ResumeTranslation` 是 Adapter 的低层结果。普通调用方把 `AgUiResumeRequest` 直接交给
-`open_agui_run(resume=...)`，门面从 checkpointer 恢复原生 interrupt 与完整消息。Definition 级
-Binding 方法继续服务可信事件日志或自定义编排，不能接收客户端重新提交的 interrupt 详情。
+Adapter 的 `RunIdentity` 只包含 AG-UI thread 和 run ID。业务 namespace 由上层 Runtime 或宿主选择。
 
-## interrupt 数据模型
+## Interrupt 契约
 
-| 模型 | 字段 |
+| 模型 | 用途 |
 | --- | --- |
-| `AgentRuntimeInterrupt` | 非空 `id`、JSON `value` |
-| `RuntimeInterruptEnvelope` | 当前 `schema`、非空 `kind`、可选 `message`、响应 JSON Schema 和可信 metadata |
-| `HitlActionRequest` | 非空 `name`、对象 `args`、可选 `description` |
-| `HitlReviewConfig` | `actionName`、非空 `allowedDecisions`、可选 `argsSchema` |
-| `HitlRequest` | 等长且非空的 `actionRequests` 与 `reviewConfigs` |
-| `ToolReviewInterruptMetadata` | 当前原生分组、action 位置、Tool 名称、决定与原始参数 |
-| `SubagentProvenance` | 稳定 invocation ID、完整 namespace、graph task、父 Tool、Agent、描述和当前请求 run |
+| `AgentRuntimeInterrupt` | 稳定 interrupt ID 与 JSON 值 |
+| `RuntimeInterruptEnvelope` | 已校验的非工具工作流暂停 |
+| `HitlRequest` | 配对的工具动作与审阅策略 |
+| `ToolReviewInterruptMetadata` | 稳定工具审阅关联数据 |
+| `SubagentProvenance` | 稳定子智能体调用与完整 Graph 位置 |
 
-公开决定为 `approve`、`edit`、`reject`、`respond`。同一请求中的 action 和 review config
-按位置配对。Adapter 在返回转换结果前，使用 JSON Schema Draft 2020-12 按 `argsSchema` 校验
-编辑后的参数。
-
-`RuntimeInterruptEnvelope` 用于非 Tool 工作流暂停。Adapter 把 `kind` 映射为 AG-UI
-interrupt reason。`require_valid_schema(...)` 在发布前检查 Draft 2020-12 Schema，
-`validate_json_schema_instance(...)` 在原生转换前使用 format checker 校验恢复 JSON；发出该
-envelope 的 Graph 继续负责业务语义。扩展 kind 必须带命名空间，一个待处理批次不能同时包含
-Runtime interrupt 和 Tool interrupt。
-
-`parse_tool_review_interrupt(interrupt)` 按
-`tinkerfin.deepagents.tool-review` 校验完整可信 Tool interrupt。
-`subagent_invocation_id(...)` 和 `create_subagent_provenance(...)` 实现固定的
-`tinkerfin.subagent-provenance` 身份契约。
-
-## ID 与错误
-
-| API | 作用 |
-| --- | --- |
-| `ScopedIdCodec.encode(...)` | 由类型、完整 namespace、原始 ID 创建 scoped ID |
-| `ScopedIdCodec.decode(...)` | 还原 scoped ID 的三部分 |
-| `HitlCorrelationError` | 审批动作与 Tool 消息无法可靠关联 |
-| `ToolReviewContractError` | 完整 Tool review interrupt 不符合当前公开契约 |
-| `SseEventId` | `encode_sse()` 接受的字符串或整数 ID 类型 |
-
-并行工具、子 Agent 和恢复流程都必须使用完整 scoped ID，不能按事件到达顺序关联。
-
-`ScopedIdCodec.encode()` 的 kind 可以是 `message`、`tool`、`reasoning` 或 `reasoning-message`；namespace 必须是只含非空字符串的元组，原始 ID 也不能为空。
+公开工具决定包括 `approve`、`edit`、`reject` 和 `respond`。编辑后的参数在转换为原生 resume 前按动作 Schema 校验。完整流程见 [Interrupt 与恢复](interrupts-and-resume.md)。

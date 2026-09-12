@@ -42,7 +42,7 @@ const applyUpdate = (
       || node.turnId !== current.turnId
       || node.kind !== current.kind
       || node.name !== current.name
-      || JSON.stringify(node.namespace) !== JSON.stringify(current.namespace)
+      || JSON.stringify(node.graphNamespace) !== JSON.stringify(current.graphNamespace)
     )) throw new ConversationError('stream_event_invalid')
     nodes.set(node.id, node)
   })

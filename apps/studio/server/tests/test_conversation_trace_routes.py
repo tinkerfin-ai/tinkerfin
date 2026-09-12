@@ -18,7 +18,7 @@ async def test_trace_graph_query_rejects_noncanonical_namespace() -> None:
     ) as client:
         response = await client.get(
             "/api/conversation/thread-1/trace/graph",
-            params={"namespace": "tools| invalid"},
+            params={"graph_namespace": "tools| invalid"},
         )
 
     assert response.status_code == 422
@@ -79,7 +79,7 @@ def test_trace_graph_routes_publish_only_the_current_filter_contract() -> None:
         "agent",
         "provider",
         "model",
-        "namespace",
+        "graph_namespace",
         "query",
         "startedAfter",
         "startedBefore",

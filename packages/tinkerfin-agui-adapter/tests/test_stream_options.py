@@ -13,7 +13,7 @@ from tinkerfin_agui_adapter import (
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 def _task_start(*, namespace: tuple[str, ...] = ()) -> dict[str, object]:
@@ -74,7 +74,7 @@ def test_extra_modes_emit_sanitized_raw_events() -> None:
             "kind": "root",
             "agentType": "main",
             "agentName": "main",
-            "namespace": [],
+            "graphNamespace": [],
         },
     }
 

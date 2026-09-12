@@ -7,7 +7,6 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import pytest
 from pydantic import JsonValue
@@ -69,7 +68,9 @@ def _context(
     content: JsonValue = "hello",
 ) -> RunSourceContext:
     return RunSourceContext(
-        identity=RunIdentity(threadId="thread-redaction", runId=run_id),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-redaction", run_id=run_id
+        ),
         runtime_profile="deepagents-v2",
         input_kind=input_kind,
         parent_run_id=parent_run_id,
@@ -256,7 +257,7 @@ async def test_framework_safety_and_business_redaction_cover_model_tool_and_stat
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={
                 "customer": {"password": "state-credential"},
                 "reasoning_content": "business-state-value",
@@ -278,7 +279,7 @@ async def test_framework_safety_and_business_redaction_cover_model_tool_and_stat
     )
     await _finish(session, context)
 
-    thread = await tracer.get(context.identity.thread_id)
+    thread = await tracer.get(context.identity.thread)
     events = (await thread.events(limit=200)).items
     encoded = "\n".join(event.model_dump_json(by_alias=True) for event in events)
     assert "input-credential" not in encoded
@@ -327,14 +328,14 @@ async def test_framework_safety_and_business_redaction_cover_model_tool_and_stat
     assert all(not hasattr(item, "thread_id") for item in redactor.contexts)
     assert all(not hasattr(item, "run_id") for item in redactor.contexts)
     public_search = await tracer.query(
-        context.identity.thread_id,
+        context.identity.thread,
         where=TraceGraphFilter(
             kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
             search="business-reasoning",
         ),
     )
     private_search = await tracer.query(
-        context.identity.thread_id,
+        context.identity.thread,
         where=TraceGraphFilter(
             search="private-reasoning",
         ),
@@ -474,7 +475,7 @@ async def test_model_request_and_state_required_shapes_fail_closed() -> None:
         else:
             observation = NativeStateObservation(
                 identity=context.identity,
-                namespace=(),
+                graph_namespace=(),
                 state={"value": "kept"},
                 observed_at=observed_at,
                 monotonic_ns=monotonic_ns,
@@ -493,7 +494,7 @@ async def test_hitl_review_semantics_cannot_be_removed_by_business_redaction() -
         await session.observe(
             NativeStateObservation(
                 identity=context.identity,
-                namespace=(),
+                graph_namespace=(),
                 state={},
                 messages=(
                     NativeMessageRecord(
@@ -618,7 +619,7 @@ async def test_authorized_reasoning_uses_the_model_response_context() -> None:
     await session.observe(
         NativeReasoningObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message_id="assistant-reasoning",
             extractor="deepseek.additional_kwargs.reasoning_content",
             content="private thought",
@@ -629,7 +630,7 @@ async def test_authorized_reasoning_uses_the_model_response_context() -> None:
     )
     await _finish(session, context)
 
-    trace = await tracer.get(context.identity.thread_id)
+    trace = await tracer.get(context.identity.thread)
     assert trace.reasoning[0].content == "business-redacted thought"
     assert (
         RedactionContext(
@@ -694,7 +695,7 @@ def test_redaction_context_validates_only_functional_source_metadata() -> None:
 async def test_codec_receives_only_the_redacted_fact_graph(tmp_path: Path) -> None:
     codec = _InspectingCodec()
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'redaction.db'}")
-    store = SqlAlchemyTraceStore(engine, namespace="redaction-codec", codec=codec)
+    store = SqlAlchemyTraceStore(engine, codec=codec)
 
     class MessageRedactor:
         def redact(
@@ -724,21 +725,21 @@ async def test_codec_receives_only_the_redacted_fact_graph(tmp_path: Path) -> No
         assert "codec-credential" not in encoded
         assert '"$type":"redacted"' in encoded
         safe_search = await tracer.query(
-            context.identity.thread_id,
+            context.identity.thread,
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
                 search="redacted",
             ),
         )
         pii_search = await tracer.query(
-            context.identity.thread_id,
+            context.identity.thread,
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
                 search="13800000000",
             ),
         )
         credential_search = await tracer.query(
-            context.identity.thread_id,
+            context.identity.thread,
             where=TraceGraphFilter(
                 kinds={TraceGraphNodeKind.HUMAN_MESSAGE},
                 search="codec-credential",
@@ -753,11 +754,10 @@ async def test_codec_receives_only_the_redacted_fact_graph(tmp_path: Path) -> No
 
 @pytest.mark.docker_integration
 async def test_mysql_stores_only_the_final_redacted_payload(
-    mysql_admin_url: str,
+    trace_mysql_url: str,
 ) -> None:
-    namespace = f"redaction-mysql-{uuid4().hex}"
-    engine = create_async_engine(mysql_admin_url)
-    store = SqlAlchemyTraceStore(engine, namespace=namespace)
+    engine = create_async_engine(trace_mysql_url)
+    store = SqlAlchemyTraceStore(engine)
 
     class MessageRedactor:
         def redact(
@@ -790,7 +790,7 @@ async def test_mysql_stores_only_the_final_redacted_payload(
                     ),
                     {
                         "namespace_hash": hashlib.sha256(
-                            namespace.encode("utf-8")
+                            context.identity.namespace.encode("utf-8")
                         ).digest()
                     },
                 )

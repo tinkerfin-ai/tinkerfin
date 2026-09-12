@@ -51,8 +51,8 @@ def encode_sse_payload(
     payload: SsePayload,
     *,
     event_id: str | int | None = None,
-) -> str:
-    """Encode validated payload fields as exactly one SSE frame."""
+) -> bytes:
+    """Encode validated payload fields as one complete UTF-8 SSE frame."""
 
     lines: list[str] = []
     if event_id is not None:
@@ -69,7 +69,7 @@ def encode_sse_payload(
     normalized_data = payload.data.replace("\r\n", "\n").replace("\r", "\n")
     data_lines = normalized_data.split("\n")
     lines.extend(f"data: {line}" for line in data_lines)
-    return "\n".join(lines) + "\n\n"
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
 
 
 class SseBody(Generic[ChunkT_co]):

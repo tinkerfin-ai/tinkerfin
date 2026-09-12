@@ -19,7 +19,6 @@ DEPLOY_DIR = APP_ROOT / "deploy"
 PASSWORDS = (
     "mysql_root_password",
     "mysql_password",
-    "redis_control_password",
     "redis_runtime_password",
     "opensandbox_api_key",
 )
@@ -159,13 +158,13 @@ def test_setup_does_not_replace_missing_existing_credentials(
     if missing_directory:
         shutil.rmtree(secrets)
     else:
-        (secrets / "redis_control_password").unlink()
+        (secrets / "redis_runtime_password").unlink()
     result = setup(deploy, environment)
     assert result.returncode != 0
     if missing_directory:
         assert not secrets.exists()
     else:
-        assert not (secrets / "redis_control_password").exists()
+        assert not (secrets / "redis_runtime_password").exists()
         assert (secrets / "mysql_password").read_bytes() == retained
 
 
@@ -217,7 +216,7 @@ def test_compose_groups_backend_and_supports_base_and_external_services(deployme
     _, deploy, environment = deployment
     assert setup(deploy, environment).returncode == 0
     full = compose_config(deploy, environment)
-    dependencies = {"mysql", "redis-control", "redis-runtime", "opensandbox"}
+    dependencies = {"mysql", "redis-runtime", "opensandbox"}
     assert full["name"] == "tinkerfin-studio"
     assert set(full["services"]) == dependencies | {"server"}
     assert (
@@ -227,11 +226,10 @@ def test_compose_groups_backend_and_supports_base_and_external_services(deployme
     assert set(external["services"]) == {"server"}
     partial = compose_config(
         deploy,
-        {**environment, "COMPOSE_PROFILES": "redis-control,redis-runtime,opensandbox"},
+        {**environment, "COMPOSE_PROFILES": "redis-runtime,opensandbox"},
     )
     assert set(partial["services"]) == {
         "server",
-        "redis-control",
         "redis-runtime",
         "opensandbox",
     }
@@ -285,7 +283,10 @@ def test_default_deploy_bootstraps_and_pulls_from_any_working_directory(
     assert any("pull" in item["args"] for item in operations)
     assert not any("build" in item["args"] for item in operations)
     up = next(item["args"] for item in operations if "up" in item["args"])
-    assert all(flag in up for flag in ("--force-recreate", "--no-build", "--wait"))
+    assert all(
+        flag in up
+        for flag in ("--force-recreate", "--remove-orphans", "--no-build", "--wait")
+    )
     assert up[up.index("--pull") + 1] == "never"
     assert (deploy / ".env").exists()
     assert not (cwd / "secrets").exists() if cwd != deploy else True

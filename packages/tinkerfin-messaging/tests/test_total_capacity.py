@@ -94,7 +94,7 @@ async def _start(
 ):
     return await backend.prepare(
         channel=channel,
-        identity=RunIdentity(threadId=thread, runId=run),
+        identity=RunIdentity(namespace="test", thread_id=thread, run_id=run),
         codec="bytes",
         after=0,
         cancellable=True,
@@ -389,7 +389,7 @@ async def test_concurrent_empty_admissions_cannot_overshoot_total_records(
 async def test_plain_commit_preserves_latest_checkpoint_and_historical_evidence(
     capacity_backend_factory,
 ) -> None:
-    from tinkerfin_messaging import MessagingStateQuery
+    from tinkerfin_messaging.backend_contract import MessagingStateQuery
 
     backend = capacity_backend_factory(MessagingLimits(), MessagingRetentionPolicy())
     run = await _start(backend, "checkpoint")

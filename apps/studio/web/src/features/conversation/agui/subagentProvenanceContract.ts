@@ -5,8 +5,8 @@ export const SUBAGENT_PROVENANCE_SCHEMA = "tinkerfin.subagent-provenance" as con
 export interface SubagentProvenance {
   readonly schema: typeof SUBAGENT_PROVENANCE_SCHEMA
   readonly subagentInvocationId: string
-  readonly namespace: readonly string[]
-  readonly parentNamespace: readonly string[]
+  readonly graphNamespace: readonly string[]
+  readonly parentGraphNamespace: readonly string[]
   readonly graphTaskId: string
   readonly agentName: string
   readonly parentToolCallId: string
@@ -18,8 +18,8 @@ const KEYS = [
   "agentName",
   "description",
   "graphTaskId",
-  "namespace",
-  "parentNamespace",
+  "graphNamespace",
+  "parentGraphNamespace",
   "parentToolCallId",
   "requestRunId",
   "schema",
@@ -39,7 +39,7 @@ const isObject = (value: unknown): value is JsonObject =>
 const canonicalText = (value: unknown): value is string =>
   typeof value === "string" && Boolean(value) && value.trim() === value
 
-const namespace = (value: unknown, field: string): string[] => {
+const graphNamespace = (value: unknown, field: string): string[] => {
   if (!Array.isArray(value) || !value.every(canonicalText)) {
     throw new SubagentProvenanceContractError(`${field} 无效`)
   }
@@ -54,8 +54,8 @@ export const parseSubagentProvenance = (value: unknown): SubagentProvenance => {
     actualKeys.length !== expectedKeys.length
     || !actualKeys.every((key, index) => key === expectedKeys[index])
   ) throw new SubagentProvenanceContractError("subagent provenance 字段不符合当前契约")
-  const parentNamespace = namespace(value.parentNamespace, "parentNamespace")
-  const childNamespace = namespace(value.namespace, "namespace")
+  const parentGraphNamespace = graphNamespace(value.parentGraphNamespace, "parentGraphNamespace")
+  const childNamespace = graphNamespace(value.graphNamespace, "graphNamespace")
   if (
     value.schema !== SUBAGENT_PROVENANCE_SCHEMA
     || !canonicalText(value.subagentInvocationId)
@@ -65,15 +65,15 @@ export const parseSubagentProvenance = (value: unknown): SubagentProvenance => {
     || !canonicalText(value.parentToolCallId)
     || !canonicalText(value.description)
     || !canonicalText(value.requestRunId)
-    || childNamespace.length !== parentNamespace.length + 1
-    || !parentNamespace.every((part, index) => childNamespace[index] === part)
+    || childNamespace.length !== parentGraphNamespace.length + 1
+    || !parentGraphNamespace.every((part, index) => childNamespace[index] === part)
     || !childNamespace.at(-1)?.startsWith(`tools:${value.graphTaskId}`)
   ) throw new SubagentProvenanceContractError("subagent provenance 关联字段不一致")
   return {
     schema: SUBAGENT_PROVENANCE_SCHEMA,
     subagentInvocationId: value.subagentInvocationId,
-    namespace: childNamespace,
-    parentNamespace,
+    graphNamespace: childNamespace,
+    parentGraphNamespace,
     graphTaskId: value.graphTaskId,
     agentName: value.agentName,
     parentToolCallId: value.parentToolCallId,

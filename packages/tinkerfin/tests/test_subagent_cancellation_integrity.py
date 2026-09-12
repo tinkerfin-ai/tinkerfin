@@ -25,7 +25,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import NodeCancelledError
 from langgraph.graph import END, START, MessagesState, StateGraph
 
-from tinkerfin import AgUiEventStream, RunIdentity, TinkerFin
+from tinkerfin import AgUiRunStream, RunIdentity, TinkerFin
 
 
 class _ToolBindingFakeModel(FakeMessagesListChatModel):
@@ -94,7 +94,7 @@ async def _run_default_agui(
     subagents: list[dict[str, object]],
 ) -> tuple[
     list[BaseEvent],
-    AgUiEventStream,
+    AgUiRunStream,
     list[Mapping[str, object]],
     list[str],
 ]:
@@ -109,22 +109,25 @@ async def _run_default_agui(
 
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=model,
             tools=[],
             subagents=cast(Any, subagents),
             checkpointer=InMemorySaver(),
         )
     )
-    identity = RunIdentity(threadId=thread_id, runId=f"run-{thread_id}")
-    runtime = definition.new_agui(
-        identity=identity,
-        mode="default",
-        on_part=observe,
+    identity = RunIdentity(
+        namespace="test", thread_id=thread_id, run_id=f"run-{thread_id}"
     )
-    stream = runtime.astream(
-        {"messages": [HumanMessage(content="Delegate the work")]},
+    runtime = definition
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        mode="default",
+        on_native_part=observe,
+        input={"messages": [HumanMessage(content="Delegate the work")]},
         config={"configurable": {"thread_id": thread_id}},
     )
     events = [event async for event in stream]
@@ -322,8 +325,9 @@ async def test_external_abort_stays_cancelled_and_cleans_the_subagent() -> None:
 
     definition = (
         TinkerFin()
-        .plan(enabled=True)
-        .create_deep_agent(
+        .with_namespace("test")
+        .with_plan(enabled=True)
+        .build(
             model=_root_model([_task_call()]),
             tools=[],
             subagents=cast(
@@ -339,13 +343,15 @@ async def test_external_abort_stays_cancelled_and_cleans_the_subagent() -> None:
             checkpointer=InMemorySaver(),
         )
     )
-    identity = RunIdentity(threadId="external-abort", runId="run-external-abort")
-    runtime = definition.new_agui(
-        identity=identity,
-        mode="default",
+    identity = RunIdentity(
+        namespace="test", thread_id="external-abort", run_id="run-external-abort"
     )
-    stream = runtime.astream(
-        {"messages": [HumanMessage(content="Delegate the work")]},
+    runtime = definition
+    stream = runtime.open_agui_run(
+        thread_id=identity.thread_id,
+        run_id=identity.run_id,
+        mode="default",
+        input={"messages": [HumanMessage(content="Delegate the work")]},
         config={"configurable": {"thread_id": "external-abort"}},
     )
     delivered: list[BaseEvent] = []

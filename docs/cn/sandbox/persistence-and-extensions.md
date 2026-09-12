@@ -1,84 +1,65 @@
-# 多进程持久化与自定义扩展
+# 持久化状态与扩展
 
-[受限根目录与文件操作](rooted-filesystem.md) · [English](../../en/sandbox/persistence-and-extensions.md)
+[文件与命令](rooted-filesystem.md) · [English](../../en/sandbox/persistence-and-extensions.md)
 
-默认状态只存在当前进程。应用有多个 worker，或者进程重启后仍要恢复 Sandbox 绑定时，使用 SQLAlchemy 状态。
+持久化 State 让多个进程共享 Sandbox 绑定，并在重启后恢复绑定、租约、可用性和待清理资源。
+容器文件仍需卷和备份。配置 `OpenSandboxConfig(ttl=None)` 后，新建的持久 Sandbox 保留至显式销毁；关闭管理器会保留绑定。
 
-State 保存绑定和租约，不保存容器文件。工作区需要保留到明确清理时，应同时使用持久 State 和
-`OpenSandboxConfig(ttl=None)`；Manager 正常关闭后会保留绑定和远端实例。文件必须跨实例或
-存储故障保留时，仍需要持久卷和备份策略。
-
-## SQLite：单机多进程
+## SQL 数据库
 
 ```bash
-pip install "tinkerfin-sandbox[sqlite]"
+pip install "tinkerfin-sandbox[sqlalchemy]" aiosqlite
 ```
+
+PostgreSQL 安装 `asyncpg`，MySQL 安装 `asyncmy`。将应用管理的 Engine 交给 State：
 
 ```python
-from tinkerfin_sandbox import (
-    OpenSandboxManager,
-    SQLAlchemyOpenSandboxState,
-)
+from sqlalchemy.ext.asyncio import create_async_engine
+from tinkerfin_sandbox import OpenSandboxManager, SQLAlchemyOpenSandboxState
 
+engine = create_async_engine("sqlite+aiosqlite:////var/lib/app/sandboxes.db")
+state = SQLAlchemyOpenSandboxState(engine=engine, namespace="production")
+manager = OpenSandboxManager(client=client, state=state)
 
-state = SQLAlchemyOpenSandboxState(
-    url="sqlite+aiosqlite:////var/lib/app/opensandbox.db",
-    namespace="production",
-    lease_ttl=15.0,
-    poll_interval=0.05,
-    sqlite_retry_timeout=5.0,
-)
-manager = OpenSandboxManager(
-    client=client,
-    key_resolver=key_resolver,
-    state=state,
-)
+try:
+    async with manager:
+        backend = await manager.get("projects/project-1")
+finally:
+    await engine.dispose()
 ```
 
-## MySQL：多主机 worker
+PostgreSQL 使用 `postgresql+asyncpg://...`，MySQL 使用 `mysql+asyncmy://...`，三种数据库共用同一套 State API。
+MySQL 5.7 使用有时限的领取等待；MySQL 8 和 PostgreSQL 可跳过已锁定的预热、清理记录。不支持 MariaDB。
 
-```bash
-pip install "tinkerfin-sandbox[mysql]"
-```
-
-```python
-state = SQLAlchemyOpenSandboxState(
-    url="mysql+asyncmy://user:password@db/sandbox_state",
-    namespace="production",
-)
-```
-
-当前支持 MySQL 5.7 和 MySQL 8.x。MariaDB 不在已验证范围内。
-
-### 状态参数
-
-| 参数 | 默认值 | 作用 |
+| 参数 | 默认值 | 用途 |
 | --- | --- | --- |
-| `url` | 必填 | SQLAlchemy 异步连接 URL |
-| `namespace` | `""` | 同一数据库中隔离不同部署 |
-| `lease_ttl` | `15.0` | owner、warm slot 和 cleanup claim 的租约秒数 |
-| `poll_interval` | `0.05` | 等待和重试的基础间隔 |
-| `sqlite_retry_timeout` | `5.0` | SQLite 锁冲突的总重试预算 |
+| `engine` | 必填 | 借用的 SQLAlchemy 异步 Engine |
+| `namespace` | `""` | 多个管理器共同使用的部署域 |
+| `lease_ttl` | `15.0` | 工作进程与资源领取租约的秒数 |
+| `poll_interval` | `0.05` | 领取轮询和首次锁重试的间隔秒数 |
+| `sqlite_retry_timeout` | `5.0` | SQLite 锁重试的最长秒数 |
 
-同一 namespace 的所有 worker 必须配置相同的 warm pool 大小。数据库账号在首次启动时需要建表和读写权限。
+同一部署域中的进程必须使用一致的预热容量。这个部署域与选择具体 Sandbox 的 Runtime namespace、业务 Key 各自独立，详见[使用指南](index.md)。
 
-取消调用时，State 会等待数据库结果读取完毕、连接归还连接池。COMMIT 开始前已收到取消请求的
-写入会回滚；COMMIT 已发出时，则等待确定其成功或结果未知。必要收尾可能超过调用方的工作
-时限，但不会串行化独立事务，也不会改变 SQLite 锁冲突的重试预算。
+State 不关闭借用的 Engine。启动和关闭会先等待已接受的数据库操作结束，再传播取消。
+提交前观察到取消会回滚；已发出提交时，先确认其结果或报告结果不确定。连接和语句超时由 Engine 配置，必要清理可能延长等待时间。
+提交结果不确定或连接清理失败时，不会重放写入。
 
-## 由基础设施提前建表
+SQLite 要求连接被独占借用。内存数据库使用 `AsyncAdaptedQueuePool`，配置 `pool_size=1, max_overflow=0`；不能使用 `StaticPool`。
+锁重试受 `sqlite_retry_timeout` 限制。提交遇到 BUSY 时只重试同一事务的提交，不重复写入。
+
+## 生成数据库结构
 
 ```python
 from pathlib import Path
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
 
-
-schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
+schema = get_sqlalchemy_opensandbox_state_schema(dialect="postgresql")
 Path("opensandbox-schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
-`dialect` 可以是 `mysql` 或 `sqlite`。返回值还包含 `table_names`。应用启动时仍会检查完整的表、字段、
-主键与索引结构，包括精确的索引集合和 unique 标志。
+`dialect` 接受 `postgresql`、`mysql` 或 `sqlite`，返回值同时提供 `table_names`。
+启动会创建空数据库中的表，或检查已有表、列、主键、索引和数据库注释。建表需要 DDL 权限；提前建立完整结构后，可使用 DML 账号。
 
 ## 预热 Sandbox
 

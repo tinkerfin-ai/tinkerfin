@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -13,7 +11,8 @@ from typing import Literal
 import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import ExceptionContext
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from tests.support.sql_faults import after_sql_command
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_tracing import (
@@ -37,7 +36,7 @@ from tinkerfin_tracing.sql_store import _SqlAlchemyTraceLedgerBackend
 
 
 def _identity(run_id: str = "run-contract") -> RunIdentity:
-    return RunIdentity(threadId="thread-contract", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-contract", run_id=run_id)
 
 
 def _fact(
@@ -62,7 +61,7 @@ async def _exercise_store_contract(store: TraceStore) -> None:
     empty_generation = empty.key.generation
     await asyncio.gather(empty.aclose(), empty.aclose())
     with pytest.raises(TraceThreadNotFound):
-        await store.snapshot(_identity().thread_id)
+        await store.snapshot(_identity().thread)
 
     first = await store.open_writer(_identity())
     second = await store.open_writer(_identity("run-second"))
@@ -76,7 +75,7 @@ async def _exercise_store_contract(store: TraceStore) -> None:
         second.append((_fact("run-second", "started"),)),
     )
     assert {first_events[0].trace_seq, second_events[0].trace_seq} == {1, 2}
-    snapshot = await store.snapshot(_identity().thread_id)
+    snapshot = await store.snapshot(_identity().thread)
     assert snapshot.active_run_ids == ("run-contract", "run-second")
 
     await first.append((_fact("run-contract", "terminal"),), mandatory=True)
@@ -95,7 +94,7 @@ async def _exercise_store_contract(store: TraceStore) -> None:
     )
     await second.aclose()
 
-    snapshot = await store.snapshot(_identity().thread_id)
+    snapshot = await store.snapshot(_identity().thread)
     assert snapshot.as_of_seq == 6
     assert snapshot.active_writers == ()
     assert [
@@ -174,14 +173,23 @@ async def test_in_memory_store_satisfies_shared_contract() -> None:
     await _exercise_store_contract(InMemoryTraceStore())
 
 
-async def test_sqlite_store_satisfies_shared_contract(tmp_path: Path) -> None:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'contract.db'}")
-    try:
-        await _exercise_store_contract(
-            SqlAlchemyTraceStore(engine, namespace="contract")
-        )
-    finally:
-        await engine.dispose()
+async def test_sql_store_satisfies_shared_contract(
+    trace_sql_engine: AsyncEngine,
+) -> None:
+    await _exercise_store_contract(SqlAlchemyTraceStore(trace_sql_engine))
+
+
+async def test_sql_backend_satisfies_cross_instance_verifier(
+    trace_sql_engine: AsyncEngine,
+) -> None:
+    options = TraceStoreOptions(
+        commit_retry_attempts=15, commit_retry_delay_seconds=0.02
+    )
+    primary = SqlAlchemyTraceStore(trace_sql_engine, options=options)
+    peer = SqlAlchemyTraceStore(trace_sql_engine, options=options)
+    await verify_trace_ledger_backend(
+        primary.backend, peer.backend, namespace="backend-contract", options=options
+    )
 
 
 @pytest.mark.parametrize(
@@ -200,18 +208,13 @@ async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
     options = TraceStoreOptions(
         commit_retry_attempts=15, commit_retry_delay_seconds=0.05
     )
-    primary = _SqlAlchemyTraceLedgerBackend(
-        first_engine, namespace="sqlite-backend-contract", options=options
-    )
-    peer = _SqlAlchemyTraceLedgerBackend(
-        second_engine, namespace="sqlite-backend-contract", options=options
-    )
+    primary = _SqlAlchemyTraceLedgerBackend(first_engine, options=options)
+    peer = _SqlAlchemyTraceLedgerBackend(second_engine, options=options)
     peer_locked = asyncio.Event()
     close_contended = asyncio.Event()
     if held_peer_close:
         original_primary_commit = primary.commit_ledger_change
         original_peer_commit = peer.commit_ledger_change
-        original_peer_transaction = peer._raw_write_connection
 
         def observe_contention(context: ExceptionContext) -> None:
             error = context.original_exception
@@ -225,15 +228,11 @@ async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
 
         event.listen(first_engine.sync_engine, "handle_error", observe_contention)
 
-        @asynccontextmanager
-        async def held_transaction() -> AsyncIterator[AsyncConnection]:
-            async with original_peer_transaction() as connection:
-                peer_locked.set()
-                # Release only after the competing client observes a real busy
-                # error, without imposing a transaction-speed assumption.
-                async with asyncio.timeout(10):
-                    await close_contended.wait()
-                yield connection
+        async def held_transaction() -> None:
+            peer_locked.set()
+            # Release after a real competing lock failure, not a timing estimate.
+            async with asyncio.timeout(10):
+                await close_contended.wait()
 
         async def primary_commit(change: TraceLedgerChange):
             if change.kind == "close_writer" and change.run_id == "contract-first":
@@ -243,8 +242,9 @@ async def test_sqlite_backend_satisfies_public_cross_instance_verifier(
 
         async def peer_commit(change: TraceLedgerChange):
             if change.kind == "close_writer" and change.run_id == "contract-second":
-                with monkeypatch.context() as patch:
-                    patch.setattr(peer, "_raw_write_connection", held_transaction)
+                with after_sql_command(
+                    second_engine, "BEGIN IMMEDIATE", held_transaction
+                ):
                     return await original_peer_commit(change)
             return await original_peer_commit(change)
 
@@ -272,8 +272,8 @@ async def test_sqlite_concurrent_schema_first_start_uses_one_current_shape(
     database = tmp_path / "concurrent-setup.db"
     first_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
     second_engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
-    first = SqlAlchemyTraceStore(first_engine, namespace="setup")
-    second = SqlAlchemyTraceStore(second_engine, namespace="setup")
+    first = SqlAlchemyTraceStore(first_engine)
+    second = SqlAlchemyTraceStore(second_engine)
     try:
         await asyncio.gather(first.setup(), second.setup())
         writers = await asyncio.gather(

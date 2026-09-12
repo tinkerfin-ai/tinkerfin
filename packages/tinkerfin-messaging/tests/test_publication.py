@@ -22,7 +22,7 @@ from tinkerfin_messaging import (
 async def test_publish_during_source_wait_is_replayed_and_idempotent(
     messaging_backend: MessagingBackendHarness,
 ) -> None:
-    identity = RunIdentity(threadId="thread", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
     ready, release = asyncio.Event(), asyncio.Event()
 
     async def observe(envelope: MessageEnvelope) -> None:
@@ -36,7 +36,7 @@ async def test_publish_during_source_wait_is_replayed_and_idempotent(
 
     async with Messaging(backend=messaging_backend.storage_backend) as messaging:
         channel = messaging.channel(name="events", codec=AgUiCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             source(), identity=identity, after=0, on_committed=observe
         )
         try:
@@ -85,7 +85,7 @@ async def test_publish_during_source_wait_is_replayed_and_idempotent(
 async def test_main_terminal_seals_publication_before_source_finishes(
     messaging_backend: MessagingBackendHarness,
 ) -> None:
-    identity = RunIdentity(threadId="thread", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
     terminal, release = asyncio.Event(), asyncio.Event()
 
     async def observe(envelope: MessageEnvelope) -> None:
@@ -100,7 +100,7 @@ async def test_main_terminal_seals_publication_before_source_finishes(
 
     async with Messaging(backend=messaging_backend.storage_backend) as messaging:
         channel = messaging.channel(name="events", codec=AgUiCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             source(), identity=identity, after=0, on_committed=observe
         )
         try:
@@ -118,7 +118,7 @@ async def test_main_terminal_seals_publication_before_source_finishes(
 async def test_other_facade_publishes_after_child_terminal_without_owning_source(
     messaging_backend: MessagingBackendHarness,
 ) -> None:
-    identity = RunIdentity(threadId="thread", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
     ready, release = asyncio.Event(), asyncio.Event()
 
     async def observe(envelope: MessageEnvelope) -> None:
@@ -133,7 +133,7 @@ async def test_other_facade_publishes_after_child_terminal_without_owning_source
 
     async with Messaging(backend=messaging_backend.storage_backend) as owner:
         channel = owner.channel(name="events", codec=AgUiCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             source(), identity=identity, after=0, on_committed=observe
         )
         try:
@@ -160,7 +160,7 @@ async def test_other_facade_publishes_after_child_terminal_without_owning_source
 async def test_publish_requires_first_source_commit(
     messaging_backend: MessagingBackendHarness,
 ) -> None:
-    identity = RunIdentity(threadId="thread", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
     release, child_committed = asyncio.Event(), asyncio.Event()
 
     async def observe(envelope: MessageEnvelope) -> None:
@@ -175,7 +175,7 @@ async def test_publish_requires_first_source_commit(
 
     async with Messaging(backend=messaging_backend.storage_backend) as messaging:
         channel = messaging.channel(name="events", codec=AgUiCodec())
-        body = await channel.sse(
+        body = await channel.open_sse(
             source(), identity=identity, after=0, on_committed=observe
         )
         try:
@@ -193,13 +193,10 @@ async def test_publish_requires_first_source_commit(
 async def test_external_publication_preserves_recoverable_checkpoint(
     messaging_backend: MessagingBackendHarness,
 ) -> None:
-    from tinkerfin_messaging import (
-        MessagingStateQuery,
-        RecoverableMessage,
-        RecoveryCheckpoint,
-    )
+    from tinkerfin_messaging import RecoverableMessage, RecoveryCheckpoint
+    from tinkerfin_messaging.backend_contract import MessagingStateQuery
 
-    identity = RunIdentity(threadId="thread", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="thread", run_id="run")
     release = asyncio.Event()
     expected_checkpoint = RecoveryCheckpoint(
         position=b"position", last_message_id="source-start"
@@ -248,7 +245,8 @@ def test_publication_error_has_stable_safe_context() -> None:
     from tinkerfin_messaging import MessagingError, MessagingErrorCode
 
     error = PublicationRejected(
-        identity=RunIdentity(threadId="thread", runId="run"), reason="run_closed"
+        identity=RunIdentity(namespace="test", thread_id="thread", run_id="run"),
+        reason="run_closed",
     )
     assert isinstance(error, MessagingError)
     assert error.code == MessagingErrorCode.PUBLICATION_REJECTED

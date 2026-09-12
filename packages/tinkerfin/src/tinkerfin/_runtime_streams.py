@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, TypeVar, cast
 from tinkerfin_contracts import RunTerminalOutcome
 from tinkerfin_native_stream import NativeStreamContractError, NativeValuesStreamPart
 
+from ._failure_evidence import retain_failure, select_failure
+from ._run_callbacks import callback_scope
 from ._tasks import join_task
 from .errors import (
     RunCoordinationError,
@@ -33,6 +35,7 @@ from .sse import (
 )
 
 if TYPE_CHECKING:
+    from ._lazy_run import NativeRunStream
     from .runtime import _GraphRunStream
 
 PartT = TypeVar("PartT")
@@ -92,6 +95,18 @@ def _coordination_error(operation: str, error: Exception) -> RunCoordinationErro
         diagnostic_context=diagnostic_context,
         cause=error,
     )
+
+
+def _run_error(self: _GraphRunStream[PartT], error: BaseException) -> BaseException:
+    resources = self._run_resources
+    if resources is None:
+        return error
+    resolved = resources.owner.failure_for(error)
+    if self.error is None:
+        # Cancellation stays primary, while callers can inspect the controller
+        # failure that stopped the Run before transport cleanup began.
+        self.error = resources.owner.error
+    return resolved
 
 
 def _validate_timeout(
@@ -164,29 +179,32 @@ async def __anext__(self: _GraphRunStream[PartT]) -> PartT:
         source = self._source
         assert source is not None
         try:
-            part = await _next_or_observer_failure(self, source)
+            with self._owned_operation_failures.capture():
+                part = await _next_or_observer_failure(self, source)
         except StopAsyncIteration:
             outcome: RunTerminalOutcome
             if self._observation.context.input_kind == "abandon":
                 outcome = "abandoned"
-            elif self._last_root_interrupt_ids:
+            elif self._root_interrupt_ids:
                 outcome = "interrupted"
             else:
                 outcome = "succeeded"
             await self._finish(None, outcome=outcome)
             raise
         except BaseException as error:
+            error = _run_error(self, error)
             if isinstance(error, Exception):
                 self.error = error
             await self._finish(error, outcome=_error_outcome(error))
-            raise
+            raise error
         try:
             await self._observe(part)
         except BaseException as error:
+            error = _run_error(self, error)
             if isinstance(error, Exception):
                 self.error = error
             await self._finish(error, outcome=_error_outcome(error))
-            raise
+            raise error
         return part
     finally:
         if self._active_task is current:
@@ -212,8 +230,7 @@ async def aclose(self: _GraphRunStream[PartT]) -> None:
         and not active.done()
         and not observer_lineage_active
     ):
-        active.cancel()
-        await asyncio.gather(active, return_exceptions=True)
+        await join_task(active, cancel=True, suppress_task_cancellation=True)
     await self._finish(
         None,
         outcome="cancelled" if self._started else None,
@@ -226,6 +243,14 @@ async def _next_or_observer_failure(
 ) -> PartT:
     """Race one upstream pull with the managed Observer failure signal."""
 
+    if self._run_resources is not None:
+        from ._call_observation import bind_observation_hub, reset_observation_hub
+
+        token = bind_observation_hub(self._observation)
+        try:
+            return await anext(source)
+        finally:
+            reset_observation_hub(token)
     if not self._observation.enabled:
         return await anext(source)
 
@@ -261,43 +286,20 @@ async def _next_or_observer_failure(
         # can interrupt LangGraph 1.2.10's AsyncPregelLoop.__aexit__ before its
         # provider tasks close. join_task also keeps repeated caller cancellation
         # from propagating into that cleanup while preserving the caller's signal.
-        cancellation: asyncio.CancelledError | None = None
-        process_control = (
-            primary
-            if primary is not None
-            and not isinstance(primary, Exception | asyncio.CancelledError)
-            else None
-        )
-        settlement_error: BaseException | None = None
+        settlement_error = primary
         for owned in (failure, pull):
             try:
                 await join_task(owned, cancel=True, suppress_task_cancellation=True)
-            except asyncio.CancelledError as error:
-                cancellation = cancellation or error
-            except Exception as error:  # noqa: BLE001 - settle both owners
-                if error is not primary:
-                    settlement_error = settlement_error or error
-            except BaseException as error:  # noqa: BLE001 - preserve control after joins
-                if process_control is None:
-                    process_control = error
-                elif error is not process_control:
-                    process_control.add_note(
-                        "Another owned task raised process control: "
-                        f"{type(error).__name__}: {error}"
-                    )
+            except BaseException as error:  # noqa: BLE001 - settle both owners before propagating every failure
+                settlement_error = (
+                    error
+                    if settlement_error is None
+                    else select_failure(settlement_error, error)
+                )
         # Process control stays observable even when an Observer or caller failed
         # first; cancellation still outranks ordinary provider/cleanup failures.
-        if process_control is not None:
-            raise process_control
-        if cancellation is not None:
-            raise cancellation
-        if settlement_error is not None:
-            if primary is None:
-                raise settlement_error
-            primary.add_note(
-                "Upstream pull settlement also failed: "
-                f"{type(settlement_error).__name__}: {settlement_error}"
-            )
+        if settlement_error is not None and settlement_error is not primary:
+            raise settlement_error
 
 
 def _error_outcome(error: BaseException) -> RunTerminalOutcome:
@@ -307,17 +309,18 @@ def _error_outcome(error: BaseException) -> RunTerminalOutcome:
 
 
 def to_sse(
-    self: _GraphRunStream[PartT],
+    self: _GraphRunStream[PartT] | NativeRunStream,
     *,
     timeout: float | None = None,
     mapper: SseMapper[NativeStreamPart] | None = None,
     event_id_resolver: SseEventIdResolver[NativeStreamPart] | None = None,
-) -> SseBody[str]:
-    """Consume this native object stream as safely framed SSE text."""
+) -> SseBody[bytes]:
+    """Consume this native object stream as UTF-8 SSE bytes."""
 
     total_timeout = _validate_timeout(timeout)
 
-    async def frames() -> AsyncGenerator[str, None]:
+    async def frames() -> AsyncGenerator[bytes, None]:
+        iterator = aiter(self)
         deadline: float | None = None
         if total_timeout is not None:
             loop = asyncio.get_running_loop()
@@ -329,7 +332,7 @@ def to_sse(
             while True:
                 try:
                     if deadline is None:
-                        raw_part = await anext(self)
+                        raw_part = await anext(iterator)
                         part = self._take_frame(raw_part).replay
                         payload = await _map_sse_item(
                             part,
@@ -348,7 +351,7 @@ def to_sse(
                         frame = encode_sse_payload(payload, event_id=event_id)
                     else:
                         async with asyncio.timeout_at(deadline):
-                            raw_part = await anext(self)
+                            raw_part = await anext(iterator)
                             part = self._take_frame(raw_part).replay
                             payload = await _map_sse_item(
                                 part,
@@ -398,12 +401,13 @@ async def _observe(self: _GraphRunStream[PartT], part: PartT) -> None:
     # The sidecar is the only downstream normalization authority for this raw part.
     # AG-UI, native SSE, and Messaging must consume it rather than parse v2 again.
     self._native_frame = (part, frame)
-    # Only a newer root state snapshot can replace the current interrupt set. LangGraph
-    # may emit task or message records after the interrupting values frame; their empty
-    # per-part metadata must not turn a paused Run into success. A later root values
-    # frame with no interrupts still clears the set for a continued invocation.
+    # Each root values part reports the interrupts for one task, not all pending
+    # tasks. Accumulate this invocation's IDs as LangGraph 1.2.10 Pregel.ainvoke
+    # does, including when later task/value parts contain no interrupts.
     if isinstance(frame.canonical, NativeValuesStreamPart) and not frame.canonical.ns:
-        self._last_root_interrupt_ids = frame.root_interrupt_ids
+        self._root_interrupt_ids = tuple(
+            dict.fromkeys((*self._root_interrupt_ids, *frame.root_interrupt_ids))
+        )
     if self._observation.enabled:
         for observation in frame.observations:
             await self._observation.observe(observation)
@@ -413,10 +417,11 @@ async def _observe(self: _GraphRunStream[PartT], part: PartT) -> None:
     self._active_observers += 1
     token = self._observer_lineage.set(True)
     try:
-        observed = observer(part)
-        if not inspect.isawaitable(observed):
-            raise TypeError("on_part must return an awaitable")
-        await observed
+        with callback_scope():
+            observed = observer(part)
+            if not inspect.isawaitable(observed):
+                raise TypeError("on_part must return an awaitable")
+            await observed
     finally:
         self._observer_lineage.reset(token)
         self._active_observers -= 1
@@ -448,10 +453,11 @@ async def _start(self: _GraphRunStream[PartT]) -> None:
             raise TypeError("source_factory must return an async iterator")
         self._source = source
     except BaseException as error:
+        error = _run_error(self, error)
         if isinstance(error, Exception):
             self.error = error
         await self._finish(error, outcome=_error_outcome(error))
-        raise
+        raise error
 
 
 async def ready(self: _GraphRunStream[PartT]) -> None:
@@ -471,15 +477,39 @@ async def _finish(
     *,
     outcome: RunTerminalOutcome | None = None,
 ) -> None:
+    resources = self._run_resources
+    if resources is not None:
+        if not resources.owner.is_current():
+            await resources.owner.aclose()
+            return
+        if not self._owned_finish_done:
+            self._closed = True
+            self._owned_finish_done = True
+            await resources.owner.begin_settlement()
+            try:
+                await self._finish_once(error, outcome)
+            except BaseException as cleanup_error:  # noqa: BLE001 - repeat close reports the same settled failure
+                self._owned_finish_error = cleanup_error
+                if self.error is None and isinstance(cleanup_error, Exception):
+                    self.error = cleanup_error
+        if self._owned_finish_error is not None:
+            raise self._owned_finish_error
+        return
     task = self._finish_task
     if task is None:
         self._closed = True
-        task = asyncio.create_task(
-            self._finish_once(error, outcome),
-            name="tinkerfin-graph-run-stream-close",
-        )
+        with self._owned_operation_failures.capture():
+            task = asyncio.create_task(
+                self._finish_once(error, outcome),
+                name="tinkerfin-graph-run-stream-close",
+            )
         self._finish_task = task
-    await join_task(task)
+    try:
+        await join_task(task)
+    except Exception as cleanup_error:
+        if self.error is None:
+            self.error = cleanup_error
+        raise
 
 
 async def _finish_once(
@@ -489,10 +519,10 @@ async def _finish_once(
 ) -> None:
     """Settle upstream ownership and publish one final Observation lifecycle.
 
-    Upstream and coordinator resources close before terminal Observation. Cleanup can
-    downgrade an otherwise successful outcome to failure, while an already selected
-    execution error remains primary and receives every cleanup failure as a note.
-    Observer terminal/close failures are retained without abandoning other sessions.
+    Upstream, workspace, and coordinator resources close before terminal Observation.
+    Cleanup can downgrade success to failure. Process control takes priority over
+    cancellation, and cancellation over ordinary errors; other failures retain their
+    notes and original causes. Observer failures do not abandon other sessions.
     """
 
     source = self._source
@@ -531,6 +561,23 @@ async def _finish_once(
         except BaseException as cleanup_error:  # noqa: BLE001 - cleanup outcome
             cleanup_errors.append(cleanup_error)
 
+    resources = self._run_resources
+    if resources is not None:
+        try:
+            await resources.aclose(
+                error or (cleanup_errors[0] if cleanup_errors else None)
+            )
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup outcome
+            cleanup_errors.append(cleanup_error)
+
+    # The source has joined its children. Preserve protected operation failures
+    # even when the upstream runner replaced their exception with cancellation.
+    cleanup_errors.extend(
+        failure
+        for failure in self._owned_operation_failures.take()
+        if failure is not error and all(failure is not item for item in cleanup_errors)
+    )
+
     effective_outcome = outcome
     if self._started and effective_outcome is None:
         effective_outcome = "failed" if error is not None else "cancelled"
@@ -550,7 +597,7 @@ async def _finish_once(
                 effective_outcome,
                 code=code,
                 error=terminal_error,
-                interrupt_ids=self._last_root_interrupt_ids,
+                interrupt_ids=self._root_interrupt_ids,
             )
         except BaseException as observation_error:  # noqa: BLE001 - cleanup continues
             observation_errors.append(observation_error)
@@ -579,17 +626,13 @@ async def _finish_once(
         # raised while closing a coordinator, source, or Observer session.
         for secondary in candidates:
             if secondary is not control:
-                control.add_note(
-                    "Graph run settlement also observed: "
-                    f"{type(secondary).__name__}: {secondary}"
+                retain_failure(
+                    control, secondary, label="Graph run settlement also observed"
                 )
         raise control
     if error is not None:
         for secondary in all_secondary:
-            error.add_note(
-                "Graph run settlement also failed: "
-                f"{type(secondary).__name__}: {secondary}"
-            )
+            retain_failure(error, secondary, label="Graph run settlement also failed")
         return
     if len(all_secondary) == 1:
         raise all_secondary[0]

@@ -23,13 +23,14 @@ from tinkerfin_contracts import (
     RunSourceContext,
     RuntimeObservation,
     RuntimeObserver,
+    ThreadIdentity,
     ToolExecutionObservation,
 )
 
 
 def _context() -> RunSourceContext:
     return RunSourceContext(
-        identity=RunIdentity(threadId="thread-1", runId="run-1"),
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1"),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={"messages": []},
@@ -38,25 +39,69 @@ def _context() -> RunSourceContext:
 
 
 def test_run_identity_is_strict_frozen_and_uses_current_aliases() -> None:
-    identity = RunIdentity(threadId="thread-1", runId="run-1")
+    identity = RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
     assert identity.model_dump(by_alias=True) == {
+        "namespace": "test",
         "threadId": "thread-1",
         "runId": "run-1",
     }
     with pytest.raises(ValidationError):
-        RunIdentity(threadId=" thread-1", runId="run-1")
+        RunIdentity(namespace="test", thread_id=" thread-1", run_id="run-1")
     with pytest.raises(ValidationError):
         RunIdentity.model_validate(
-            {"threadId": "thread-1", "runId": "run-1", "version": 1}
+            {
+                "namespace": "test",
+                "threadId": "thread-1",
+                "runId": "run-1",
+                "version": 1,
+            }
         )
     with pytest.raises(ValidationError):
         identity.thread_id = "replacement"  # type: ignore[misc]
-    assert RunIdentity(threadId="t" * 1024, runId="r" * 1024).run_id == "r" * 1024
+    assert (
+        RunIdentity(namespace="test", thread_id="t" * 1024, run_id="r" * 1024).run_id
+        == "r" * 1024
+    )
     with pytest.raises(ValidationError):
-        RunIdentity(threadId="t" * 1025, runId="run-1")
+        RunIdentity(namespace="test", thread_id="t" * 1025, run_id="run-1")
     with pytest.raises(ValidationError):
-        RunIdentity(threadId="thread-1", runId="r" * 1025)
+        RunIdentity(namespace="test", thread_id="thread-1", run_id="r" * 1025)
+
+
+def test_thread_identity_is_derived_and_run_json_stays_flat() -> None:
+    identity = RunIdentity(namespace="Company-A", thread_id="thread", run_id="run")
+
+    assert identity.thread == ThreadIdentity(namespace="Company-A", thread_id="thread")
+    assert identity.thread != ThreadIdentity(namespace="company-a", thread_id="thread")
+    assert RunIdentity.model_validate_json(identity.model_dump_json()) == identity
+    assert set(identity.model_dump()) == {"namespace", "thread_id", "run_id"}
+    with pytest.raises(ValidationError, match="frozen"):
+        identity.thread.namespace = "other"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "namespace", ["", " ", " tenant", "tenant ", "x" * 129, "\ud800"]
+)
+def test_invalid_namespaces_are_rejected(namespace: str) -> None:
+    with pytest.raises(ValidationError):
+        RunIdentity(namespace=namespace, thread_id="thread", run_id="run")
+
+
+def test_namespace_is_required_and_unicode_limit_counts_characters() -> None:
+    with pytest.raises(ValidationError, match="namespace"):
+        RunIdentity.model_validate({"threadId": "thread", "runId": "run"})
+    identity = RunIdentity(namespace="界" * 128, thread_id="thread", run_id="run")
+    assert identity.namespace == "界" * 128
+
+
+@pytest.mark.parametrize("field", ["thread_id", "run_id"])
+def test_identity_rejects_non_utf8_identifiers(field: str) -> None:
+    values = {"namespace": "test", "thread_id": "thread", "run_id": "run"}
+    values[field] = "\ud800"
+    with pytest.raises(ValidationError) as rejected:
+        RunIdentity.model_validate(values)
+    assert rejected.value.errors()[0]["loc"] == (field,)
 
 
 def test_observation_union_rejects_unknown_kinds_and_version_fields() -> None:
@@ -90,7 +135,7 @@ def test_observation_union_rejects_unknown_kinds_and_version_fields() -> None:
 def test_native_message_contract_preserves_structured_public_content() -> None:
     observation = NativeMessageObservation(
         identity=_context().identity,
-        namespace=("tools:task-1",),
+        graph_namespace=("tools:task-1",),
         message=NativeMessageRecord(
             message_type="assistant_chunk",
             id="message-1",
@@ -101,14 +146,14 @@ def test_native_message_contract_preserves_structured_public_content() -> None:
         monotonic_ns=2,
     )
 
-    assert observation.namespace == ("tools:task-1",)
+    assert observation.graph_namespace == ("tools:task-1",)
     assert observation.message.content == [{"type": "text", "text": "visible"}]
 
 
 def test_reasoning_observation_is_explicit_and_strict() -> None:
     observation = NativeReasoningObservation(
         identity=_context().identity,
-        namespace=(),
+        graph_namespace=(),
         message_id="message-1",
         extractor="deepseek.additional_kwargs.reasoning_content",
         content="private reasoning",
@@ -262,7 +307,9 @@ def test_resume_and_run_input_contracts_reject_ambiguous_identity() -> None:
         )
     with pytest.raises(ValidationError, match="identity must match"):
         RunInputObservation(
-            identity=RunIdentity(threadId="thread-1", runId="different-run"),
+            identity=RunIdentity(
+                namespace="test", thread_id="thread-1", run_id="different-run"
+            ),
             source=_context(),
             observed_at=datetime.now(UTC),
             monotonic_ns=1,

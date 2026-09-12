@@ -17,7 +17,7 @@ from tinkerfin_agui_adapter.ids import ScopedIdCodec
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 def _root_tool_id(raw_id: str) -> str:
@@ -406,7 +406,7 @@ def test_nameless_task_result_preserves_subagent_related_namespace() -> None:
     )
 
     assert isinstance(result.raw_event, dict)
-    assert result.raw_event["relatedNamespace"] == ["tools:native-task-node"]
+    assert result.raw_event["relatedGraphNamespace"] == ["tools:native-task-node"]
 
 
 def test_native_task_starts_reject_scoped_tool_id_reuse_atomically() -> None:

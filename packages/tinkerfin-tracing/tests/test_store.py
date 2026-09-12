@@ -9,7 +9,7 @@ from typing import Any, Literal
 import pytest
 from pydantic import JsonValue, ValidationError
 
-from tinkerfin_contracts import RunIdentity, RunSourceContext
+from tinkerfin_contracts import RunIdentity, RunSourceContext, ThreadIdentity
 from tinkerfin_tracing.capture import CapturedValue
 from tinkerfin_tracing.codec import CanonicalTracePayloadCodec
 from tinkerfin_tracing.durable_store import InMemoryTraceStore
@@ -33,7 +33,7 @@ from tinkerfin_tracing.tracer import Tracer
 
 
 def _identity(run_id: str = "run-1") -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
 
 
 def _captured(value: JsonValue) -> CapturedValue:
@@ -70,7 +70,7 @@ def _fact(
 
 
 async def test_store_assigns_one_contiguous_sequence_across_concurrent_runs() -> None:
-    store = InMemoryTraceStore(namespace="tests")
+    store = InMemoryTraceStore()
     first = await store.open_writer(_identity("run-1"))
     second = await store.open_writer(_identity("run-2"))
 
@@ -78,7 +78,9 @@ async def test_store_assigns_one_contiguous_sequence_across_concurrent_runs() ->
         first.append((_fact("run-1"),)),
         second.append((_fact("run-2"),)),
     )
-    snapshot = await store.snapshot("thread-1")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="thread-1")
+    )
 
     assert {first_events[0].trace_seq, second_events[0].trace_seq} == {1, 2}
     assert snapshot.as_of_seq == 2
@@ -102,7 +104,9 @@ async def test_in_memory_reads_reuse_framework_validated_event_evidence(
     store = InMemoryTraceStore()
     writer = await store.open_writer(_identity())
     await writer.append((_fact("run-1"),))
-    snapshot = await store.snapshot("thread-1")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="thread-1")
+    )
     decode_calls = 0
     original = CanonicalTracePayloadCodec.decode_fact
 
@@ -278,7 +282,9 @@ async def test_ordinary_batch_rejects_mixed_terminal_fact() -> None:
     try:
         with pytest.raises(TraceStoreProtocolError, match="mandatory append"):
             await writer.append((_fact("run-1"), _fact("run-1", "terminal")))
-        assert (await store.snapshot("thread-1")).as_of_seq == 0
+        assert (
+            await store.snapshot(ThreadIdentity(namespace="test", thread_id="thread-1"))
+        ).as_of_seq == 0
     finally:
         await writer.aclose()
 
@@ -334,9 +340,11 @@ async def test_failed_new_thread_reservation_does_not_leave_an_empty_thread() ->
     await first.aclose()
 
     with pytest.raises(TraceQuotaExceeded):
-        await store.open_writer(RunIdentity(threadId="thread-2", runId="run-2"))
+        await store.open_writer(
+            RunIdentity(namespace="test", thread_id="thread-2", run_id="run-2")
+        )
     with pytest.raises(TraceThreadNotFound):
-        await store.snapshot("thread-2")
+        await store.snapshot(ThreadIdentity(namespace="test", thread_id="thread-2"))
 
 
 async def test_one_writer_cannot_consume_another_writers_terminal_reserve() -> None:
@@ -415,7 +423,9 @@ async def test_append_copies_nested_fact_values_before_returning() -> None:
     assert isinstance(nested, dict)
     nested["value"] = "tampered"
 
-    snapshot = await store.snapshot("thread-1")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="thread-1")
+    )
     stored = await store.read_events(
         snapshot.key,
         after_seq=0,
@@ -496,7 +506,7 @@ async def test_tracer_rejects_invalid_store_results(
 
     monkeypatch.setattr(store, "snapshot", invalid_snapshot)
     with pytest.raises(TraceStoreProtocolError, match="invalid thread snapshot"):
-        await tracer.get("thread-1")
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-1"))
 
 
 async def test_cancelled_follow_wait_releases_the_condition() -> None:

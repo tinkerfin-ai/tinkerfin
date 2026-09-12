@@ -1,4 +1,4 @@
-"""Fixtures for exercising request Runtimes through the public Deep Agent façade."""
+"""Fixtures for exercising managed execution through the public Runtime API."""
 
 from __future__ import annotations
 
@@ -6,28 +6,30 @@ from collections.abc import Callable
 
 import pytest
 
-from tinkerfin import DeepAgentDefinition, TinkerFin
+from tinkerfin import AgentRuntime, TinkerFin
 
 
 @pytest.fixture
 def definition_factory(
     monkeypatch: pytest.MonkeyPatch,
-) -> Callable[..., DeepAgentDefinition[None]]:
-    """Build a public Definition around one deterministic Graph test double."""
+) -> Callable[..., AgentRuntime[None]]:
+    """Build a Runtime whose preparation returns a deterministic Graph or failure."""
 
     def create(
         graph: object,
         *,
         tinkerfin: TinkerFin | None = None,
-    ) -> DeepAgentDefinition[None]:
+    ) -> AgentRuntime[None]:
         def build(*_args: object, **_kwargs: object) -> object:
+            if isinstance(graph, BaseException):
+                raise graph
             return graph
 
         monkeypatch.setattr(
             "tinkerfin.runtime_profile._deepagents_graph.create_deep_agent",
             build,
         )
-        return (tinkerfin or TinkerFin()).create_deep_agent(
+        return (tinkerfin or TinkerFin().with_namespace("test")).build(
             model="provider:model",
             tools=[],
         )

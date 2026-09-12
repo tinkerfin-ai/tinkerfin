@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal, Never, TypeGuard
 from tinkerfin_contracts import RunIdentity
 
 from ._capacity import _ExpiryIndex, checkpoint_bytes
-from ._identity import required_identifier, required_identity
+from ._identity import required_identifier, required_identity, thread_key
 from .errors import (
     CodecMismatch,
     InvalidCursor,
@@ -231,7 +231,7 @@ class MemoryBackend:
         async with channel_state.lock:
             stream_state = self._expire_if_due(
                 channel_state,
-                transition.identity.thread_id,
+                thread_key(transition.identity),
             )
             if stream_state is None:
                 snapshot = self._memory_state_snapshot(
@@ -296,7 +296,7 @@ class MemoryBackend:
         async with channel_state.lock:
             stream_state = self._expire_if_due(
                 channel_state,
-                query.identity.thread_id,
+                thread_key(query.identity),
             )
             if stream_state is None:
                 return self._memory_state_snapshot(
@@ -362,7 +362,7 @@ class MemoryBackend:
         async with channel_state.lock:
             stream_state = self._expire_if_due(
                 channel_state,
-                query.identity.thread_id,
+                thread_key(query.identity),
             )
             if stream_state is None or stream_state.generation != query.generation:
                 self._raise_memory_generation_unavailable(query)
@@ -438,7 +438,7 @@ class MemoryBackend:
         assert channel_state is not None
         stream_state = self._expire_if_due(
             channel_state,
-            wait.identity.thread_id,
+            thread_key(wait.identity),
         )
         if stream_state is None or stream_state.generation != wait.generation:
             self._raise_memory_generation_unavailable(wait)
@@ -499,7 +499,7 @@ class MemoryBackend:
         if channel_state is None:
             return StreamGenerationPurgeResult(removed_records=0, complete=True)
         async with channel_state.lock:
-            stream_state = channel_state.streams.get(purge.identity.thread_id)
+            stream_state = channel_state.streams.get(thread_key(purge.identity))
             if stream_state is None or stream_state.generation != purge.generation:
                 return StreamGenerationPurgeResult(removed_records=0, complete=True)
             async with stream_state.condition:
@@ -564,7 +564,7 @@ class MemoryBackend:
             StoredMessagingStream,
         )
 
-        stream_state = channel_state.streams.get(identity.thread_id)
+        stream_state = channel_state.streams.get(thread_key(identity))
         selected_state = stream_state
         if selected_state is not None and (
             generation is not None and selected_state.generation != generation
@@ -572,7 +572,7 @@ class MemoryBackend:
             selected_state = None
         tombstone = self._tombstone_reason(
             channel_state,
-            identity.thread_id,
+            thread_key(identity),
             generation,
         )
         stored_channel = (
@@ -615,8 +615,9 @@ class MemoryBackend:
                     envelope=envelope.model_copy(deep=True),
                     signature=messaging_message_signature(
                         identity=RunIdentity(
-                            threadId=identity.thread_id,
-                            runId=run_id,
+                            namespace=identity.namespace,
+                            thread_id=identity.thread_id,
+                            run_id=run_id,
                         ),
                         codec_id=codec_id,
                         payload=payload,
@@ -726,12 +727,12 @@ class MemoryBackend:
                     actual=effect.channel.codec_id,
                 )
         stream_effect = effect.stream
-        stream_state = channel_state.streams.get(identity.thread_id)
+        stream_state = channel_state.streams.get(thread_key(identity))
         if stream_effect is not None and (
             stream_state is None or stream_state.generation != stream_effect.generation
         ):
             stream_state = _StreamState(generation=stream_effect.generation)
-            channel_state.streams[identity.thread_id] = stream_state
+            channel_state.streams[thread_key(identity)] = stream_state
         self._total_bytes += total_bytes
         self._total_records += total_records
         if stream_state is not None:
@@ -747,8 +748,9 @@ class MemoryBackend:
                 None
                 if stream_effect.active_run_id is None
                 else RunIdentity(
-                    threadId=identity.thread_id,
-                    runId=stream_effect.active_run_id,
+                    namespace=identity.namespace,
+                    thread_id=identity.thread_id,
+                    run_id=stream_effect.active_run_id,
                 )
             )
         if effect.runs:
@@ -800,14 +802,17 @@ class MemoryBackend:
                 )
             if effect.retention_action != "none":
                 self._expirations.set(
-                    (channel_state.channel, identity.thread_id),
+                    (channel_state.channel, thread_key(identity)),
                     stream_state.expires_at_monotonic,
                 )
         if effect.tombstone_reason is not None:
             if stream_state is None:
                 raise RuntimeError("Messaging tombstone effect requires a stream")
             self._retire_memory_generation(
-                channel_state, identity.thread_id, stream_state, effect.tombstone_reason
+                channel_state,
+                thread_key(identity),
+                stream_state,
+                effect.tombstone_reason,
             )
 
     def _effect_capacity(
@@ -816,10 +821,10 @@ class MemoryBackend:
         identity: RunIdentity,
         effect: MessagingStorageEffect,
     ) -> tuple[int, int, int]:
-        state = channel.streams.get(identity.thread_id)
+        state = channel.streams.get(thread_key(identity))
         records = int(channel.codec is None and effect.channel is not None)
         if effect.stream is not None and state is None:
-            records += 1 + int(identity.thread_id not in channel.next_generations)
+            records += 1 + int(thread_key(identity) not in channel.next_generations)
         generation_records = 0
         retained_bytes = 0
         for run in effect.runs:
@@ -883,7 +888,7 @@ class MemoryBackend:
         if channel_state is not None:
             tombstone = self._tombstone_reason(
                 channel_state,
-                query.identity.thread_id,
+                thread_key(query.identity),
                 query.generation,
             )
             if tombstone is not None:

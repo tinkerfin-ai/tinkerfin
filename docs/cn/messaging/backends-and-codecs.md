@@ -1,8 +1,40 @@
-# Redis、自定义 codec 和 backend
+# 存储、消息格式和自定义后端
 
 [取消、延迟创建与恢复](cancellation-and-recovery.md) · [English](../../en/messaging/backends-and-codecs.md)
 
-默认 `MemoryBackend` 适合单进程开发。多个进程共享事件、运行状态和取消请求时，可使用内置 `RedisBackend`，或按下文的公共契约接入自定义共享存储。
+默认 `MemoryBackend` 适合单进程开发。多个进程共享事件、运行状态和取消请求时，可使用 `SqlAlchemyBackend` 或 `RedisBackend`，也可按公共契约接入自定义共享存储。
+
+## 使用 SQLAlchemy
+
+安装 SQL 扩展和所选异步驱动：
+
+```bash
+pip install "tinkerfin-messaging[sqlalchemy]" aiosqlite
+```
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine
+from tinkerfin_messaging import Messaging, SqlAlchemyBackend
+
+engine = create_async_engine("sqlite+aiosqlite:///messages.db")
+try:
+    async with Messaging(backend=SqlAlchemyBackend(engine)) as messaging:
+        channel = messaging.channel(name="events", codec=codec)
+finally:
+    await engine.dispose()
+```
+
+也可直接传入已有 Engine。应用负责连接池和关闭，Messaging 自动准备所需数据表。
+PostgreSQL 使用 `postgresql+asyncpg` 和 `asyncpg`，MySQL 使用 `mysql+asyncmy` 和
+`asyncmy`，SQLite 使用 `sqlite+aiosqlite` 和 `aiosqlite`。SQL 扩展不会强制安装数据库驱动。
+SQLite 内存数据库须保证连接独占借用，使用 `AsyncAdaptedQueuePool`，并设置
+`pool_size=1, max_overflow=0`。
+
+`SqlAlchemyBackend` 可选参数为 `producer_lease_seconds=15`、`poll_interval_seconds=0.1`、
+`limits=MessagingLimits()` 和 `retention_policy=MessagingRetentionPolicy()`。
+同一数据库中的所有消息通道共享这些设置和总容量；完整 namespace 与线程身份隔离消息和
+生产者控制。轮询间隔不占用数据库连接。连接与语句超时由 Engine 配置，建表锁最多等待
+30 秒。总容量检查会串行化各通道的写入。提交确认失败时直接报错，不自动重放操作。
 
 ## 使用 Redis
 
@@ -76,12 +108,11 @@ channel = messaging.channel(
 | --- | --- | --- |
 | `[agui]` | `AgUiCodec` | AG-UI 事件编码、解码和 SSE |
 | `[native]` | `NativeStreamPartCodec` | canonical Native replay 编码、解码和 SSE |
+| `[sqlalchemy]` | `SqlAlchemyBackend` | SQL 消息存储，另装异步驱动 |
 | `[redis]` | `RedisBackend` | 多进程持久 backend |
 
-TinkerFin 的规范事件流带有 codec 与 RunIdentity，因此 name-only channel 可以自动选择 codec 和
-durable scope。Native Runtime source 还会通过 `MessageCodecInputSource` 转交 Driver-owned
-`NativeStreamPart`，codec 不会再次解析 live 上游 Mapping。自定义 source 必须显式配置 codec，
-并在调用时提供 RunIdentity。
+TinkerFin 事件流自带消息格式和完整 RunIdentity。接入这类流时，消息通道只需填写名称，
+无需重复配置消息格式和运行身份。自定义事件源需要明确提供 codec 和 RunIdentity。
 
 RedisBackend 保存限额、每个 generation 的 Payload 计数，以及当前和上一个 owner 的成功
 续租次数与 UTC 时间，用于可信故障取证。共享同一 channel 的 worker 必须使用相同的全部
@@ -90,7 +121,7 @@ channel 位于一个 Redis Cluster hash slot，容量准入、写入和计数在
 这些字段不会进入 `MessageEnvelope`。
 
 默认上限为单条编码消息 16 MiB、checkpoint position 1 MiB、每个 thread generation
-100,000 条消息与 1 GiB Payload，以及每个 MemoryBackend 实例或 Redis 前缀合计
+100,000 条消息与 1 GiB Payload，以及每个 MemoryBackend 实例、SQL 数据库或 Redis 前缀合计
 1 GiB 字节和 100,000 条记录。通过 `MessagingLimits.max_total_bytes` 和
 `max_total_records` 调整总限额。
 
@@ -114,7 +145,7 @@ import json
 
 
 class JsonEventCodec:
-    codec_id = "my-app.event.v1"
+    codec_id = "my-app.event"
 
     def encode(self, item: dict[str, object]) -> bytes:
         return json.dumps(item, separators=(",", ":")).encode()
@@ -167,6 +198,18 @@ class QueueSource:
 如果 source 能稳定声明自己的 codec profile，可以实现 `ProfiledMessageSource`；普通业务 source 通常直接给 channel 传 codec 更简单。
 
 ## 自定义 backend
+
+存储扩展契约从对应模块导入：
+
+```python
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackend,
+    MessagingStateSnapshot,
+    MessagingStorageEffect,
+    MessagingTransition,
+    resolve_messaging_transition,
+)
+```
 
 只有需要接入其他持久化存储时才实现 `MessagingBackend`。Messaging 负责 producer
 任务、取消、follow 循环、收尾、retention 判定和错误转换；Backend 作者只实现一个不可变设置

@@ -1,4 +1,4 @@
-"""Borrowed-AsyncEngine SQLite and MySQL implementation of the Trace Store contract."""
+"""SQL persistence for the Trace Ledger through a borrowed asynchronous Engine."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from types import CoroutineType
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
 from sqlalchemy import (
+    DateTime,
     and_,
     case,
     delete,
@@ -23,22 +24,35 @@ from sqlalchemy import (
     inspect,
     or_,
     select,
-    text,
     tuple_,
     type_coerce,
     update,
 )
+from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
-from sqlalchemy.pool import PoolProxiedConnection
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import Subquery
+
+from tinkerfin_sqlalchemy import (
+    SqlTransaction,
+    engine_dialect,
+    mysql_error_code,
+    postgresql_error_code,
+    sqlite_lock_error,
+)
 
 from ._graph_reducer import (
     assistant_run_terminal_status,
     resolve_graph_link_issue,
     resolve_graph_node_kind,
+)
+from ._tasks import (
+    TaskOutcome,
+    capture,
+    join_owned_task,
+    run_owned_operation,
 )
 from .backend import (
     StoredTraceCheckpoint,
@@ -69,6 +83,7 @@ from .errors import (
     TraceStoreProtocolError,
     TraceStoreTimeout,
     TraceThreadNotFound,
+    TracingError,
 )
 from .facts import RunFact, TraceEvent
 from .graph import (
@@ -103,91 +118,6 @@ _GRAPH_PREFETCH_PAIR_LIMIT = 400
 _SQL_IN_CHUNK_SIZE = 500
 
 
-async def _join_owned_task(
-    task: asyncio.Future[_ResultT],
-    *,
-    primary_error: BaseException | None,
-    failure_label: str,
-    suppress_task_cancellation: bool = False,
-) -> _ResultT | None:
-    """Settle one owned task across repeated cancellation of its caller."""
-
-    current = asyncio.current_task()
-    cancel_count = current.cancelling() if current is not None else 0
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            next_count = current.cancelling() if current is not None else 0
-            if next_count > cancel_count or (cancellation is None and next_count > 0):
-                cancellation = cancellation or error
-                cancel_count = next_count
-                continue
-            if task.done():
-                break
-            raise
-        except BaseException:  # noqa: BLE001 - inspect the retained outcome below
-            break
-
-    task_error: BaseException | None = None
-    result: _ResultT | None = None
-    try:
-        result = task.result()
-    except asyncio.CancelledError as error:
-        if not suppress_task_cancellation:
-            task_error = error
-    except BaseException as error:  # noqa: BLE001 - preserve exact owned outcome
-        task_error = error
-
-    if primary_error is not None:
-        if task_error is not None:
-            primary_error.add_note(
-                f"{failure_label} also failed: "
-                f"{type(task_error).__module__}.{type(task_error).__qualname__}"
-            )
-        return result
-    if cancellation is not None:
-        if task_error is not None:
-            cancellation.add_note(
-                f"{failure_label} also failed: "
-                f"{type(task_error).__module__}.{type(task_error).__qualname__}"
-            )
-        raise cancellation.with_traceback(cancellation.__traceback__)
-    if task_error is not None:
-        raise task_error.with_traceback(task_error.__traceback__)
-    return result
-
-
-async def _run_database_operation(
-    operation: Awaitable[_ResultT],
-    *,
-    task_name: str,
-) -> _ResultT:
-    """Run database I/O in one task that receives at most one cancellation request."""
-
-    task = asyncio.ensure_future(operation)
-    if isinstance(task, asyncio.Task):
-        task.set_name(task_name)
-    current = asyncio.current_task()
-    cancel_count = current.cancelling() if current is not None else 0
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError as error:
-        next_count = current.cancelling() if current is not None else 0
-        if next_count <= cancel_count:
-            return task.result()
-        if not task.done():
-            task.cancel()
-        await _join_owned_task(
-            task,
-            primary_error=error,
-            failure_label="Database operation",
-            suppress_task_cancellation=True,
-        )
-        raise
-
-
 def _owned_database_operation(
     operation: Callable[
         Concatenate[_BackendT, _OperationP],
@@ -206,116 +136,41 @@ def _owned_database_operation(
         *args: _OperationP.args,
         **kwargs: _OperationP.kwargs,
     ) -> _ResultT:
-        return await _run_database_operation(
-            operation(owner, *args, **kwargs),
-            task_name=f"tinkerfin-trace-sql-{operation.__name__.replace('_', '-')}",
-        )
+        try:
+            return await run_owned_operation(
+                operation(owner, *args, **kwargs),
+                task_name=f"tinkerfin-trace-sql-{operation.__name__.replace('_', '-')}",
+            )
+        except SQLAlchemyError as error:
+            raise TraceStoreError(
+                "Trace Store database read failed", cause=error
+            ) from error
 
     return wrapped
-
-
-async def _complete_connection_cleanup(
-    operation: Awaitable[object],
-    *,
-    task_name: str,
-    primary_error: BaseException | None = None,
-) -> None:
-    """Finish one borrowed-connection cleanup before propagating cancellation.
-
-    SQLAlchemy 2.0.52 shields ``AsyncConnection.close()`` with a child task, but the
-    cancelled caller stops awaiting that child immediately. Retaining and awaiting the
-    task here prevents a pool return from outliving the Store operation that owns it.
-    Repeated caller cancellation is recorded while the owned cleanup remains joined.
-
-    Args:
-        operation: Borrowed-connection cleanup that must settle before returning.
-        task_name: Diagnostic name for the retained cleanup task.
-        primary_error: Earlier failure that must keep precedence over cleanup failure.
-    """
-
-    task = asyncio.ensure_future(operation)
-    if isinstance(task, asyncio.Task):
-        task.set_name(task_name)
-    await _join_owned_task(
-        task,
-        primary_error=primary_error,
-        failure_label="Borrowed-connection cleanup",
-    )
-
-
-async def _discard_cancelled_connection(
-    connection: AsyncConnection,
-    pooled: PoolProxiedConnection | None,
-    error: asyncio.CancelledError,
-) -> None:
-    """Discard a driver connection that may no longer match the server protocol.
-
-    SQLite must finish closing its background connection before cancellation returns,
-    so a following writer does not contend with the cancelled transaction. In
-    SQLAlchemy's aiosqlite adapter, invalidation outside a greenlet only queues a
-    worker stop; AsyncConnection.invalidate awaits graceful driver closure instead.
-
-    asyncmy marks an interrupted command as ``Cancelled during execution``. Returning
-    that socket through the normal rollback-on-return path produces a reset failure and
-    may leave the pool checkout owned until garbage collection. The public pool proxy
-    can synchronously invalidate asyncmy's socket outside SQLAlchemy's cancelled
-    greenlet; a following rollback only clears SQLAlchemy's local transaction state.
-
-    Args:
-        connection: Borrowed connection whose cancelled transaction must release locks.
-        pooled: Pool checkout captured before cancellation, when available.
-        error: Original cancellation retained if cleanup also fails.
-    """
-
-    if pooled is None or connection.dialect.name == "sqlite":
-        await _complete_connection_cleanup(
-            connection.invalidate(error),
-            task_name="tinkerfin-trace-connection-invalidate",
-            primary_error=error,
-        )
-    elif pooled.is_valid:
-
-        async def invalidate_pooled_connection() -> None:
-            pooled.invalidate(error)
-
-        await _complete_connection_cleanup(
-            invalidate_pooled_connection(),
-            task_name="tinkerfin-trace-pool-connection-invalidate",
-            primary_error=error,
-        )
-    if connection.in_transaction():
-        await _complete_connection_cleanup(
-            connection.rollback(),
-            task_name="tinkerfin-trace-transaction-cancel",
-            primary_error=error,
-        )
 
 
 class _SqlAlchemyTraceLedgerBackend:
     """Persist Trace Ledger generations through one borrowed asynchronous Engine.
 
-    The Backend supports SQLite and MySQL only, owns schema preparation, and applies
+    The Backend supports SQLite, MySQL, and PostgreSQL, prepares its schema, and applies
     framework-resolved effects under database locks. It never changes pool sizing or
     disposes the host Engine. Contract coverage lives in
     ``tests/test_store_implementations.py``, ``tests/test_sqlite_store.py``, and
     ``tests/test_mysql_store.py``.
 
     Args:
-        engine: Borrowed asynchronous Engine using ``sqlite+aiosqlite`` or
-            ``mysql+asyncmy``.
-        namespace: Stable logical isolation key shared by cooperating Store instances.
+        engine: Borrowed asynchronous SQLite, MySQL, or PostgreSQL Engine.
         options: Bounded SQL preparation and commit retry settings.
 
     Raises:
         TypeError: An argument has the wrong public type.
-        ValueError: Namespace or Engine dialect is unsupported.
+        ValueError: The Engine dialect is unsupported.
     """
 
     def __init__(
         self,
         engine: AsyncEngine,
         *,
-        namespace: str = "default",
         options: TraceStoreOptions | None = None,
     ) -> None:
         """Bind validated policy objects without performing database I/O.
@@ -325,28 +180,14 @@ class _SqlAlchemyTraceLedgerBackend:
 
         if not isinstance(engine, AsyncEngine):
             raise TypeError("engine must be an AsyncEngine")
-        if not isinstance(namespace, str):
-            raise TypeError("namespace must be a string")
-        if not namespace or namespace != namespace.strip() or len(namespace) > 2048:
-            raise ValueError("namespace must be canonical text of at most 2048 chars")
         if options is not None and not isinstance(options, TraceStoreOptions):
             raise TypeError("options must be TraceStoreOptions or None")
-        dialect = engine.url.get_backend_name()
-        if dialect not in {"sqlite", "mysql"}:
-            raise ValueError("SqlAlchemyTraceStore supports only SQLite and MySQL")
+        dialect = engine_dialect(engine)
+        SqlTransaction(engine)
         self._engine = engine
-        self._namespace = namespace
-        self._namespace_hash = _digest(namespace)
         self._dialect = dialect
         self._options = options or TraceStoreOptions()
-        self._setup_lock = asyncio.Lock()
-        self._setup_task: asyncio.Task[None] | None = None
-
-    @property
-    def namespace(self) -> str:
-        """Return the immutable logical namespace."""
-
-        return self._namespace
+        self._setup_task: asyncio.Task[TaskOutcome[None]] | None = None
 
     @property
     def options(self) -> TraceStoreOptions:
@@ -357,68 +198,45 @@ class _SqlAlchemyTraceLedgerBackend:
     async def setup(self) -> None:
         """Create every owned table once without disposing the borrowed Engine.
 
-        Concurrent Store instances coordinate through the database itself. MySQL uses
-        a connection-scoped advisory lock because ``MetaData.create_all(checkfirst)``
-        alone has a check/create race; SQLite serializes the same sequence with
-        ``BEGIN IMMEDIATE``. Caller cancellation does not cancel the retained setup
-        task. Cancellation waits for that retained task to settle before propagating,
-        so a host cannot dispose the borrowed Engine while setup still uses it; another
-        caller can then observe its exact success or failure.
+        Setup holds database exclusion while creating or checking all owned tables.
+        Caller cancellation waits for the shared setup task to finish before
+        propagating, so the host can safely dispose its Engine after the call exits.
+        Concurrent waiters observe the same setup success or failure.
         A later call replaces a completed failed or self-cancelled setup task, allowing
         transient database failures to recover without reconstructing the Store.
 
         Raises:
-            TraceStoreTimeout: Schema exclusion or retry budget is exhausted.
-            TraceStoreError: SQLAlchemy or database setup fails.
+            TraceStoreTimeout: The database contention retry budget is exhausted.
+            TraceStoreError: Schema exclusion, SQLAlchemy, or database setup fails.
             TraceStoreProtocolError: Existing Trace-owned objects do not match the one
                 current Schema, or a digest collision is detected.
         """
 
-        async with self._setup_lock:
-            task = self._setup_task
-            if (
-                task is not None
-                and task.done()
-                and (task.cancelled() or task.exception() is not None)
-            ):
-                # Only the next explicit setup call retries. Callers that were already
-                # waiting on the retained task still observe the same original failure.
-                self._setup_task = None
-                task = None
-            if task is None:
-                task = asyncio.create_task(
-                    self._setup_once(),
-                    name="tinkerfin-trace-sql-setup",
-                )
-                task.add_done_callback(_consume_task_exception)
-                self._setup_task = task
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as error:
-            await _join_owned_task(
-                task,
-                primary_error=error,
-                failure_label="Trace Store setup",
+        # Task selection has no suspension point. Concurrent callers retain the same
+        # setup result; only a subsequent explicit call replaces a failed attempt.
+        task = self._setup_task
+        if task is None or (task.done() and isinstance(task.result(), BaseException)):
+            task = asyncio.create_task(
+                capture(self._setup_once()), name="tinkerfin-trace-sql-setup"
             )
-            raise
+            self._setup_task = task
+        await join_owned_task(task, cancel_operation=False)
 
     async def _setup_once(self) -> None:
         for attempt in range(self._options.commit_retry_attempts):
+            transaction = SqlTransaction(self._engine, schema_lock="trace-schema")
             try:
-                if self._dialect == "mysql":
-                    await self._setup_mysql()
-                else:
-                    async with self._raw_write_connection(
-                        sqlite_fail_fast=False
-                    ) as connection:
-                        await connection.run_sync(_prepare_trace_schema)
-                        await self._ensure_namespace(connection)
+                async with transaction as connection:
+                    await connection.run_sync(_prepare_trace_schema)
                 return
             except DBAPIError as error:
-                if not _retryable(error, dialect=self._dialect):
+                if (
+                    transaction.committed
+                    or transaction.cleanup_failed
+                    or not _retryable(error, dialect=self._dialect)
+                ):
                     raise TraceStoreError(
-                        "Trace Store schema setup failed",
-                        cause=error,
+                        "Trace Store schema setup failed", cause=error
                     ) from error
                 if attempt + 1 >= self._options.commit_retry_attempts:
                     raise TraceStoreTimeout(
@@ -428,65 +246,37 @@ class _SqlAlchemyTraceLedgerBackend:
                 await asyncio.sleep(
                     self._options.commit_retry_delay_seconds * (attempt + 1)
                 )
-            except SQLAlchemyError as error:
+            except TracingError:
+                raise
+            except Exception as error:
                 raise TraceStoreError(
-                    "Trace Store schema setup failed",
-                    cause=error,
+                    "Trace Store schema setup failed", cause=error
                 ) from error
-
-    async def _setup_mysql(self) -> None:
-        """Serialize MySQL check/create and namespace registration on one connection."""
-
-        database = self._engine.url.database or ""
-        lock_name = f"tinkerfin-trace:{_digest(database).hex()[:40]}:schema"
-        async with self._engine.connect() as connection:
-            acquired = await connection.scalar(
-                text("SELECT GET_LOCK(:lock_name, 30)"),
-                {"lock_name": lock_name},
-            )
-            if acquired != 1:
-                raise TraceStoreTimeout("Trace Store schema lock could not be acquired")
-            try:
-                await connection.run_sync(_prepare_trace_schema)
-                await self._ensure_namespace(connection)
-                await connection.commit()
-            finally:
-                try:
-                    await connection.scalar(
-                        text("SELECT RELEASE_LOCK(:lock_name)"),
-                        {"lock_name": lock_name},
-                    )
-                    await connection.commit()
-                except SQLAlchemyError:
-                    # MySQL also releases advisory locks when this connection closes.
-                    # Preserve the primary setup result rather than replacing it with
-                    # a release failure from an already broken connection.
-                    pass
-
-    async def _ensure_namespace(self, connection: AsyncConnection) -> None:
-        """Register and collision-check the logical namespace under setup exclusion."""
-
-        now = await _database_now(connection)
-        existing = await connection.scalar(
-            select(namespaces.c.namespace).where(
-                namespaces.c.namespace_hash == self._namespace_hash
-            )
-        )
-        if existing is None:
-            await connection.execute(
-                insert(namespaces).values(
-                    namespace_hash=self._namespace_hash,
-                    namespace=self._namespace,
-                    created_at=now,
-                )
-            )
-        elif existing != self._namespace:
-            raise TraceStoreProtocolError("Trace namespace digest collision")
 
     async def prepare_storage(self) -> None:
         """Idempotently prepare and validate the current SQL Trace structures."""
 
         await self.setup()
+
+    @asynccontextmanager
+    async def _read_transaction(self) -> AsyncGenerator[AsyncConnection]:
+        """Keep provider failures inside SQL I/O and preserve public input errors.
+
+        Callers validate their request before entering this context. Drivers and
+        connection hooks can fail outside SQLAlchemy's exception family; their
+        original causes remain diagnostic while callers receive a Store error.
+        Cancellation and process control propagate after transaction cleanup.
+        """
+
+        try:
+            async with SqlTransaction(self._engine, read_only=True) as connection:
+                yield connection
+        except TracingError:
+            raise
+        except Exception as error:
+            raise TraceStoreError(
+                "Trace Store database read failed", cause=error
+            ) from error
 
     async def commit_ledger_change(
         self,
@@ -496,8 +286,6 @@ class _SqlAlchemyTraceLedgerBackend:
 
         if not isinstance(change, TraceLedgerChange):
             raise TypeError("change must be a TraceLedgerChange")
-        if change.namespace != self._namespace:
-            raise TraceThreadNotFound("Trace namespace does not exist")
         await self.setup()
         delete_generation_was_observed = False
         expected_renewal_expiry: datetime | None = None
@@ -509,7 +297,9 @@ class _SqlAlchemyTraceLedgerBackend:
             nonlocal expected_renewal_expiry
             nonlocal append_commit_was_attempted
             nonlocal checkpoint_commit_was_attempted
-            await self._locked_namespace(connection)
+            await self._locked_namespace(
+                connection, change.namespace, create=change.kind == "open_writer"
+            )
             # Every Trace writer locks namespace before thread or writer rows. Sampling
             # after that potentially long wait gives successful ownership changes their
             # complete configured lease instead of a deadline already spent in the queue.
@@ -529,6 +319,7 @@ class _SqlAlchemyTraceLedgerBackend:
                     return checkpoint_result
             state = await self._load_backend_state(
                 connection,
+                namespace=change.namespace,
                 thread_id=_change_thread_id(change),
                 run_id=_change_run_id(change),
                 include_active_writers=change.kind == "delete_generation",
@@ -595,14 +386,13 @@ class _SqlAlchemyTraceLedgerBackend:
 
         if not isinstance(request, TraceLedgerStateRequest):
             raise TypeError("request must be a TraceLedgerStateRequest")
-        if request.namespace != self._namespace:
-            raise TraceThreadNotFound("Trace namespace does not exist")
         _validate_thread_id(request.thread_id)
         await self.setup()
-        async with self._read_connection() as connection:
+        async with self._read_transaction() as connection:
             now = await _database_now(connection)
             state = await self._load_backend_state(
                 connection,
+                namespace=request.namespace,
                 thread_id=request.thread_id,
                 run_id=request.run_id,
                 include_active_writers=request.include_active_writers,
@@ -631,15 +421,11 @@ class _SqlAlchemyTraceLedgerBackend:
         if request.limit < 1:
             raise ValueError("event page limit must be positive")
         await self.setup()
-        async with self._read_connection() as connection:
+        async with self._read_transaction() as connection:
             # One bounded metadata read also detects a vanished writer when the
             # event tail is unchanged. Use the database's UTC clock for lease facts;
             # local wall time cannot establish distributed ownership.
-            now = (
-                func.utc_timestamp(6)
-                if connection.dialect.name == "mysql"
-                else func.strftime("%Y-%m-%d %H:%M:%f", "now")
-            )
+            now = _statement_clock(connection)
             rows = (
                 (
                     await connection.execute(
@@ -662,7 +448,7 @@ class _SqlAlchemyTraceLedgerBackend:
                             )
                         )
                         .where(
-                            threads.c.namespace_hash == self._namespace_hash,
+                            threads.c.namespace_hash == _digest(request.key.namespace),
                             threads.c.thread_hash == _digest(request.key.thread_id),
                         )
                     )
@@ -673,7 +459,7 @@ class _SqlAlchemyTraceLedgerBackend:
             if not rows:
                 raise TraceThreadNotFound("Trace thread does not exist")
             thread = rows[0]
-            _verify_thread_row(thread, self._namespace, request.key.thread_id)
+            _verify_thread_row(thread, request.key.namespace, request.key.thread_id)
             if thread["generation"] != request.key.generation:
                 raise TraceThreadNotFound("Trace generation does not exist")
             tail = cast(int, thread["next_seq"]) - 1
@@ -686,7 +472,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 )
             )
             criteria = [
-                events.c.namespace_hash == self._namespace_hash,
+                events.c.namespace_hash == _digest(request.key.namespace),
                 events.c.thread_hash == _digest(request.key.thread_id),
                 events.c.generation == request.key.generation,
             ]
@@ -740,17 +526,17 @@ class _SqlAlchemyTraceLedgerBackend:
             raise TypeError("request must be a TraceGraphQueryRequest")
         self._validate_key(request.key)
         await self.setup()
-        async with self._read_connection() as connection:
+        async with self._read_transaction() as connection:
             thread = await self._thread_row(
                 connection,
+                namespace=request.key.namespace,
                 thread_id=request.key.thread_id,
             )
             if thread["generation"] != request.key.generation:
                 raise TraceThreadNotFound("Trace generation does not exist")
             tail = cast(int, thread["next_seq"]) - 1
-            effective_nodes = _trace_graph_effective_source(self, request)
+            effective_nodes = _trace_graph_effective_source(request)
             base_criteria = _trace_graph_criteria(
-                self,
                 request,
                 source=effective_nodes,
             )
@@ -799,7 +585,7 @@ class _SqlAlchemyTraceLedgerBackend:
             }
             if parent_hashes:
                 scope = (
-                    effective_nodes.c.namespace_hash == self._namespace_hash,
+                    effective_nodes.c.namespace_hash == _digest(request.key.namespace),
                     effective_nodes.c.thread_hash == _digest(request.key.thread_id),
                     effective_nodes.c.generation == request.key.generation,
                 )
@@ -878,7 +664,8 @@ class _SqlAlchemyTraceLedgerBackend:
                     (
                         await connection.execute(
                             select(events).where(
-                                events.c.namespace_hash == self._namespace_hash,
+                                events.c.namespace_hash
+                                == _digest(request.key.namespace),
                                 events.c.thread_hash == _digest(request.key.thread_id),
                                 events.c.generation == request.key.generation,
                                 events.c.trace_seq.in_(selected_sequences),
@@ -961,13 +748,13 @@ class _SqlAlchemyTraceLedgerBackend:
             raise ValueError("Graph rebuild mutations exceed the requested tail")
 
         async def operation(connection: AsyncConnection) -> int:
-            await self._locked_namespace(connection)
+            await self._locked_namespace(connection, request.key.namespace)
             row = (
                 (
                     await connection.execute(
                         select(threads)
                         .where(
-                            threads.c.namespace_hash == self._namespace_hash,
+                            threads.c.namespace_hash == _digest(request.key.namespace),
                             threads.c.thread_hash == _digest(request.key.thread_id),
                         )
                         .with_for_update()
@@ -978,13 +765,13 @@ class _SqlAlchemyTraceLedgerBackend:
             )
             if row is None or row["generation"] != request.key.generation:
                 raise TraceThreadNotFound("Trace generation does not exist")
-            _verify_thread_row(row, self._namespace, request.key.thread_id)
+            _verify_thread_row(row, request.key.namespace, request.key.thread_id)
             if cast(int, row["next_seq"]) - 1 != request.as_of_seq:
                 raise TraceStoreProtocolError(
                     "Trace Ledger changed while rebuilding the Graph"
                 )
             scope = (
-                graph_nodes.c.namespace_hash == self._namespace_hash,
+                graph_nodes.c.namespace_hash == _digest(request.key.namespace),
                 graph_nodes.c.thread_hash == _digest(request.key.thread_id),
                 graph_nodes.c.generation == request.key.generation,
             )
@@ -1021,7 +808,7 @@ class _SqlAlchemyTraceLedgerBackend:
             as_of_seq=request.as_of_seq,
         )
         await self.setup()
-        async with self._read_connection() as connection:
+        async with self._read_transaction() as connection:
             await self._require_key(connection, request.key)
             row = await self._checkpoint_row(
                 connection,
@@ -1036,6 +823,7 @@ class _SqlAlchemyTraceLedgerBackend:
         self,
         connection: AsyncConnection,
         *,
+        namespace: str,
         thread_id: str,
         run_id: str | None,
         include_active_writers: bool,
@@ -1045,7 +833,7 @@ class _SqlAlchemyTraceLedgerBackend:
     ) -> TraceLedgerState:
         thread_hash = _digest(thread_id)
         thread_statement = select(threads).where(
-            threads.c.namespace_hash == self._namespace_hash,
+            threads.c.namespace_hash == _digest(namespace),
             threads.c.thread_hash == thread_hash,
         )
         if lock:
@@ -1054,17 +842,13 @@ class _SqlAlchemyTraceLedgerBackend:
             # The first table read establishes the database snapshot. Its clock
             # belongs to that same observation, including when a read was delayed
             # after connection acquisition. Do not timestamp it before the read.
-            clock = (
-                func.utc_timestamp(6)
-                if connection.dialect.name == "mysql"
-                else func.strftime("%Y-%m-%d %H:%M:%f", "now")
-            )
+            clock = _statement_clock(connection)
             thread_statement = thread_statement.add_columns(clock.label("observed_at"))
         thread_row = (
             (await connection.execute(thread_statement)).mappings().one_or_none()
         )
         if thread_row is not None:
-            _verify_thread_row(thread_row, self._namespace, thread_id)
+            _verify_thread_row(thread_row, namespace, thread_id)
             if not lock:
                 now = _database_timestamp(thread_row["observed_at"])
 
@@ -1073,12 +857,12 @@ class _SqlAlchemyTraceLedgerBackend:
                 select(
                     func.count(),
                     func.coalesce(func.sum(threads.c.persisted_bytes), 0),
-                ).where(threads.c.namespace_hash == self._namespace_hash)
+                ).where(threads.c.namespace_hash == _digest(namespace))
             )
         ).one()
         namespace_reserve = await connection.scalar(
             select(func.coalesce(func.sum(writers.c.remaining_byte_reserve), 0)).where(
-                writers.c.namespace_hash == self._namespace_hash,
+                writers.c.namespace_hash == _digest(namespace),
                 writers.c.active.is_(True),
             )
         )
@@ -1091,7 +875,7 @@ class _SqlAlchemyTraceLedgerBackend:
         if thread_row is not None:
             generation = cast(str, thread_row["generation"])
             writer_scope = (
-                writers.c.namespace_hash == self._namespace_hash,
+                writers.c.namespace_hash == _digest(namespace),
                 writers.c.thread_hash == thread_hash,
                 writers.c.generation == generation,
             )
@@ -1134,13 +918,11 @@ class _SqlAlchemyTraceLedgerBackend:
             if include_active_writers:
                 rows = (
                     await connection.execute(
-                        select(writers.c.run_id, writers.c.committed_events)
-                        .where(
+                        select(writers.c.run_id, writers.c.committed_events).where(
                             *writer_scope,
                             writers.c.active.is_(True),
                             writers.c.lease_expires_at > now,
                         )
-                        .order_by(writers.c.run_id)
                     )
                 ).all()
                 active_writers = tuple(
@@ -1148,7 +930,7 @@ class _SqlAlchemyTraceLedgerBackend:
                         run_id=cast(str, row.run_id),
                         committed_events=cast(int, row.committed_events),
                     )
-                    for row in rows
+                    for row in sorted(rows, key=lambda item: cast(str, item.run_id))
                 )
 
         current_checkpoint = None
@@ -1174,7 +956,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 if thread_row is None
                 else TraceLedgerThreadState(
                     key=TraceThreadKey(
-                        namespace=self._namespace,
+                        namespace=namespace,
                         thread_id=thread_id,
                         generation=cast(str, thread_row["generation"]),
                     ),
@@ -1200,7 +982,7 @@ class _SqlAlchemyTraceLedgerBackend:
     ):
         scope = request.run_id or ""
         criteria = [
-            projection_checkpoints.c.namespace_hash == self._namespace_hash,
+            projection_checkpoints.c.namespace_hash == _digest(request.key.namespace),
             projection_checkpoints.c.thread_hash == _digest(request.key.thread_id),
             projection_checkpoints.c.generation == request.key.generation,
             projection_checkpoints.c.projection_hash
@@ -1239,7 +1021,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 (
                     await connection.execute(
                         select(events).where(
-                            events.c.namespace_hash == self._namespace_hash,
+                            events.c.namespace_hash == _digest(change.namespace),
                             events.c.event_id.in_(
                                 event_ids[offset : offset + _SQL_IN_CHUNK_SIZE]
                             ),
@@ -1304,7 +1086,8 @@ class _SqlAlchemyTraceLedgerBackend:
             (
                 await connection.execute(
                     select(projection_checkpoints).where(
-                        projection_checkpoints.c.namespace_hash == self._namespace_hash,
+                        projection_checkpoints.c.namespace_hash
+                        == _digest(change.namespace),
                         projection_checkpoints.c.thread_hash
                         == _digest(checkpoint.key.thread_id),
                         projection_checkpoints.c.generation
@@ -1350,29 +1133,30 @@ class _SqlAlchemyTraceLedgerBackend:
             if key is None:
                 raise TraceStoreProtocolError("Delete effect has no generation")
             criteria = and_(
-                events.c.namespace_hash == self._namespace_hash,
+                events.c.namespace_hash == _digest(change.namespace),
                 events.c.thread_hash == _digest(key.thread_id),
                 events.c.generation == key.generation,
             )
             await connection.execute(delete(events).where(criteria))
             await connection.execute(
                 delete(graph_nodes).where(
-                    graph_nodes.c.namespace_hash == self._namespace_hash,
+                    graph_nodes.c.namespace_hash == _digest(change.namespace),
                     graph_nodes.c.thread_hash == _digest(key.thread_id),
                     graph_nodes.c.generation == key.generation,
                 )
             )
             await connection.execute(
                 delete(projection_checkpoints).where(
-                    projection_checkpoints.c.namespace_hash == self._namespace_hash,
+                    projection_checkpoints.c.namespace_hash
+                    == _digest(change.namespace),
                     projection_checkpoints.c.thread_hash == _digest(key.thread_id),
                     projection_checkpoints.c.generation == key.generation,
                 )
             )
-            await connection.execute(delete(writers).where(_writer_scope(self, key)))
+            await connection.execute(delete(writers).where(_writer_scope(key)))
             await connection.execute(
                 delete(threads).where(
-                    threads.c.namespace_hash == self._namespace_hash,
+                    threads.c.namespace_hash == _digest(change.namespace),
                     threads.c.thread_hash == _digest(key.thread_id),
                     threads.c.generation == key.generation,
                 )
@@ -1384,26 +1168,27 @@ class _SqlAlchemyTraceLedgerBackend:
             if effect.remove_writer_run_id is not None:
                 await connection.execute(
                     delete(writers).where(
-                        _writer_where(self, key, effect.remove_writer_run_id)
+                        _writer_where(key, effect.remove_writer_run_id)
                     )
                 )
             await connection.execute(
                 delete(projection_checkpoints).where(
-                    projection_checkpoints.c.namespace_hash == self._namespace_hash,
+                    projection_checkpoints.c.namespace_hash
+                    == _digest(change.namespace),
                     projection_checkpoints.c.thread_hash == _digest(key.thread_id),
                     projection_checkpoints.c.generation == key.generation,
                 )
             )
             await connection.execute(
                 delete(graph_nodes).where(
-                    graph_nodes.c.namespace_hash == self._namespace_hash,
+                    graph_nodes.c.namespace_hash == _digest(change.namespace),
                     graph_nodes.c.thread_hash == _digest(key.thread_id),
                     graph_nodes.c.generation == key.generation,
                 )
             )
             await connection.execute(
                 delete(threads).where(
-                    threads.c.namespace_hash == self._namespace_hash,
+                    threads.c.namespace_hash == _digest(change.namespace),
                     threads.c.thread_hash == _digest(key.thread_id),
                     threads.c.generation == key.generation,
                 )
@@ -1414,9 +1199,9 @@ class _SqlAlchemyTraceLedgerBackend:
             if previous_state.thread is None:
                 await connection.execute(
                     insert(threads).values(
-                        namespace_hash=self._namespace_hash,
+                        namespace_hash=_digest(change.namespace),
                         thread_hash=thread_hash,
-                        namespace=self._namespace,
+                        namespace=change.namespace,
                         thread_id=effect.thread.key.thread_id,
                         generation=effect.thread.key.generation,
                         next_seq=effect.thread.next_seq,
@@ -1433,7 +1218,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 await connection.execute(
                     update(threads)
                     .where(
-                        threads.c.namespace_hash == self._namespace_hash,
+                        threads.c.namespace_hash == _digest(change.namespace),
                         threads.c.thread_hash == thread_hash,
                         threads.c.generation == effect.thread.key.generation,
                     )
@@ -1449,12 +1234,10 @@ class _SqlAlchemyTraceLedgerBackend:
             return
         if effect.remove_writer_run_id is not None:
             await connection.execute(
-                delete(writers).where(
-                    _writer_where(self, key, effect.remove_writer_run_id)
-                )
+                delete(writers).where(_writer_where(key, effect.remove_writer_run_id))
             )
         if effect.writer is not None:
-            where = _writer_where(self, key, effect.writer.run_id)
+            where = _writer_where(key, effect.writer.run_id)
             values = dict(
                 owner_token=effect.writer.owner_token,
                 fence=effect.writer.fence,
@@ -1470,7 +1253,7 @@ class _SqlAlchemyTraceLedgerBackend:
             if previous_state.target_writer is None:
                 await connection.execute(
                     insert(writers).values(
-                        namespace_hash=self._namespace_hash,
+                        namespace_hash=_digest(change.namespace),
                         thread_hash=_digest(key.thread_id),
                         generation=key.generation,
                         run_hash=_digest(effect.writer.run_id),
@@ -1490,7 +1273,7 @@ class _SqlAlchemyTraceLedgerBackend:
                 insert(events),
                 [
                     {
-                        "namespace_hash": self._namespace_hash,
+                        "namespace_hash": _digest(change.namespace),
                         "thread_hash": _digest(key.thread_id),
                         "generation": key.generation,
                         "trace_seq": record.trace_seq,
@@ -1525,7 +1308,7 @@ class _SqlAlchemyTraceLedgerBackend:
             await connection.execute(
                 update(graph_nodes)
                 .where(
-                    graph_nodes.c.namespace_hash == self._namespace_hash,
+                    graph_nodes.c.namespace_hash == _digest(change.namespace),
                     graph_nodes.c.thread_hash == _digest(key.thread_id),
                     graph_nodes.c.generation == key.generation,
                     graph_nodes.c.run_hash == _digest(fact.identity.run_id),
@@ -1548,7 +1331,7 @@ class _SqlAlchemyTraceLedgerBackend:
             scope = effect.checkpoint.run_id or ""
             await connection.execute(
                 insert(projection_checkpoints).values(
-                    namespace_hash=self._namespace_hash,
+                    namespace_hash=_digest(change.namespace),
                     thread_hash=_digest(key.thread_id),
                     generation=key.generation,
                     projection_hash=_digest(effect.checkpoint.projection_name),
@@ -1604,7 +1387,7 @@ class _SqlAlchemyTraceLedgerBackend:
                     await connection.execute(
                         select(graph_nodes)
                         .where(
-                            graph_nodes.c.namespace_hash == self._namespace_hash,
+                            graph_nodes.c.namespace_hash == _digest(key.namespace),
                             graph_nodes.c.thread_hash == thread_hash,
                             graph_nodes.c.generation == key.generation,
                             tuple_(
@@ -1651,7 +1434,7 @@ class _SqlAlchemyTraceLedgerBackend:
         """Return one complete new node or tombstone row for bulk insertion."""
 
         common: dict[str, object] = {
-            "namespace_hash": self._namespace_hash,
+            "namespace_hash": _digest(key.namespace),
             "thread_hash": _digest(key.thread_id),
             "generation": key.generation,
             "node_hash": _digest(mutation.node_id),
@@ -1694,10 +1477,10 @@ class _SqlAlchemyTraceLedgerBackend:
         assert mutation.kind is not None
         assert mutation.status is not None
         assert mutation.name is not None
-        assert mutation.namespace is not None
+        assert mutation.graph_namespace is not None
         assert mutation.started_at is not None
         assert mutation.started_seq is not None
-        namespace = _encode_namespace(mutation.namespace)
+        namespace = _encode_namespace(mutation.graph_namespace)
         return {
             **common,
             "parent_subagent_hash": (
@@ -1769,7 +1552,7 @@ class _SqlAlchemyTraceLedgerBackend:
 
         node_hash = _digest(mutation.node_id)
         criteria = and_(
-            graph_nodes.c.namespace_hash == self._namespace_hash,
+            graph_nodes.c.namespace_hash == _digest(key.namespace),
             graph_nodes.c.thread_hash == _digest(key.thread_id),
             graph_nodes.c.generation == key.generation,
             graph_nodes.c.node_hash == node_hash,
@@ -1833,9 +1616,9 @@ class _SqlAlchemyTraceLedgerBackend:
             raise TraceStoreProtocolError("Trace Graph node name changed")
         if mutation.run_id is not None and row["run_id"] != mutation.run_id:
             raise TraceStoreProtocolError("Trace Graph node Run changed")
-        if mutation.namespace is not None and row[
+        if mutation.graph_namespace is not None and row[
             "graph_namespace"
-        ] != _encode_namespace(mutation.namespace):
+        ] != _encode_namespace(mutation.graph_namespace):
             raise TraceStoreProtocolError("Trace Graph node namespace changed")
         values: dict[str, object] = {"updated_seq": mutation.updated_seq}
         current_kind = TraceGraphNodeKind(cast(str, row["kind"]))
@@ -1921,12 +1704,14 @@ class _SqlAlchemyTraceLedgerBackend:
             values["link_issue"] = resolved_issue.value
         await connection.execute(update(graph_nodes).where(criteria).values(**values))
 
-    async def _thread_row(self, connection: AsyncConnection, *, thread_id: str):
+    async def _thread_row(
+        self, connection: AsyncConnection, *, namespace: str, thread_id: str
+    ) -> RowMapping:
         row = (
             (
                 await connection.execute(
                     select(threads).where(
-                        threads.c.namespace_hash == self._namespace_hash,
+                        threads.c.namespace_hash == _digest(namespace),
                         threads.c.thread_hash == _digest(thread_id),
                     )
                 )
@@ -1936,34 +1721,69 @@ class _SqlAlchemyTraceLedgerBackend:
         )
         if row is None:
             raise TraceThreadNotFound("Trace thread does not exist")
-        _verify_thread_row(row, self._namespace, thread_id)
+        _verify_thread_row(row, namespace, thread_id)
         return row
 
-    async def _locked_namespace(self, connection: AsyncConnection) -> None:
-        """Lock and collision-check the namespace row before global accounting."""
+    async def _locked_namespace(
+        self, connection: AsyncConnection, namespace: str, *, create: bool = False
+    ) -> None:
+        """Serialize writes and quotas within one namespace before any thread locks.
 
+        First writers register the namespace atomically. A digest conflict never
+        overwrites identity evidence. Missing namespaces have no owned threads; only
+        writer admission may create one. See test_trace_runtime_identity.py.
+        """
+
+        namespace_hash = _digest(namespace)
+        if create:
+            values = dict(
+                namespace_hash=namespace_hash,
+                namespace=namespace,
+                created_at=await _database_now(connection),
+            )
+            if self._dialect == "mysql":
+                statement = mysql.insert(namespaces).values(**values)
+                await connection.execute(
+                    statement.on_duplicate_key_update(
+                        namespace_hash=namespaces.c.namespace_hash
+                    )
+                )
+            elif self._dialect == "postgresql":
+                await connection.execute(
+                    postgresql.insert(namespaces)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[namespaces.c.namespace_hash]
+                    )
+                )
+            else:
+                await connection.execute(
+                    sqlite.insert(namespaces)
+                    .values(**values)
+                    .on_conflict_do_nothing(
+                        index_elements=[namespaces.c.namespace_hash]
+                    )
+                )
         existing = await connection.scalar(
             select(namespaces.c.namespace)
-            .where(namespaces.c.namespace_hash == self._namespace_hash)
+            .where(namespaces.c.namespace_hash == namespace_hash)
             .with_for_update()
         )
-        if existing is None:
-            raise TraceStoreProtocolError("Trace namespace registration is missing")
-        if existing != self._namespace:
+        if existing is not None and existing != namespace:
             raise TraceStoreProtocolError("Trace namespace digest collision")
 
     def _validate_key(self, key: TraceThreadKey) -> None:
-        """Reject a key from another Store before issuing a database query."""
+        """Require a complete generation identity before issuing a database query."""
 
         if not isinstance(key, TraceThreadKey):
             raise TypeError("key must be a TraceThreadKey")
-        if key.namespace != self._namespace:
-            raise TraceThreadNotFound("Trace namespace does not exist")
 
     async def _require_key(
         self, connection: AsyncConnection, key: TraceThreadKey
     ) -> None:
-        row = await self._thread_row(connection, thread_id=key.thread_id)
+        row = await self._thread_row(
+            connection, namespace=key.namespace, thread_id=key.thread_id
+        )
         if row["generation"] != key.generation:
             raise TraceThreadNotFound("Trace generation does not exist")
 
@@ -1972,7 +1792,7 @@ class _SqlAlchemyTraceLedgerBackend:
     ) -> _ResultT:
         """Keep repeated caller cancellation outside the active SQL transaction."""
 
-        return await _run_database_operation(
+        return await run_owned_operation(
             self._execute_write(operation),
             task_name="tinkerfin-trace-sql-write",
         )
@@ -1990,11 +1810,46 @@ class _SqlAlchemyTraceLedgerBackend:
 
         await self.setup()
         for attempt in range(self._options.commit_retry_attempts):
+            transaction = SqlTransaction(self._engine, sqlite_busy_timeout_ms=0)
             try:
-                async with self._raw_write_connection() as connection:
-                    return await operation(connection)
+                async with transaction as connection:
+                    result = await operation(connection)
+                    # SQLite COMMIT BUSY leaves this transaction open. Retry only
+                    # COMMIT, keeping the same Ledger decision and database locks.
+                    for commit_attempt in range(self._options.commit_retry_attempts):
+                        try:
+                            await transaction.commit()
+                            break
+                        except DBAPIError as error:
+                            if (
+                                self._dialect != "sqlite"
+                                or not sqlite_lock_error(error)
+                                or transaction.commit_uncertain
+                                or transaction.committed
+                            ):
+                                raise
+                            if (
+                                commit_attempt + 1
+                                >= self._options.commit_retry_attempts
+                            ):
+                                raise TraceStoreTimeout(
+                                    "Trace Store commit retry budget was exhausted",
+                                    cause=error,
+                                ) from error
+                            await asyncio.sleep(
+                                self._options.commit_retry_delay_seconds
+                                * (commit_attempt + 1)
+                            )
+                    return result
             except DBAPIError as error:
-                if not _retryable(error, dialect=self._dialect):
+                # Cleanup failure must reach the caller even when the original
+                # statement was retryable. Uncertain commits otherwise require
+                # the closure's retained domain evidence before another write.
+                if (
+                    transaction.committed
+                    or transaction.cleanup_failed
+                    or not _retryable(error, dialect=self._dialect)
+                ):
                     raise TraceStoreError(
                         "Trace Store database operation failed",
                         cause=error,
@@ -2007,189 +1862,25 @@ class _SqlAlchemyTraceLedgerBackend:
                 await asyncio.sleep(
                     self._options.commit_retry_delay_seconds * (attempt + 1)
                 )
-            except SQLAlchemyError as error:
+            except TracingError:
+                raise
+            except Exception as error:
                 raise TraceStoreError(
                     "Trace Store database operation failed",
                     cause=error,
                 ) from error
         raise TraceStoreTimeout("Trace Store retry budget was exhausted")
 
-    @asynccontextmanager
-    async def _raw_write_connection(
-        self,
-        *,
-        sqlite_fail_fast: bool = True,
-    ) -> AsyncGenerator[AsyncConnection, None]:
-        """Own one transaction while leaving Engine and pool ownership with the host.
-
-        Ordinary SQLite writes temporarily disable the driver's blocking busy wait so
-        lock conflicts enter the Store's bounded, cancellation-responsive retry loop.
-        The prior per-connection PRAGMA is restored before the borrowed connection
-        returns to the host pool. Schema setup opts out because its retained task must
-        serialize concurrent first starts rather than consume the short write budget.
-        """
-
-        connection = await self._engine.connect()
-        pooled: PoolProxiedConnection | None = None
-        sqlite_busy_timeout: int | None = None
-        primary_error: BaseException | None = None
-        try:
-            pooled = await connection.get_raw_connection()
-            if self._dialect == "sqlite":
-                if sqlite_fail_fast:
-                    value = await connection.scalar(text("PRAGMA busy_timeout"))
-                    if not isinstance(value, int) or value < 0:
-                        raise TraceStoreProtocolError(
-                            "SQLite did not return a valid busy timeout"
-                        )
-                    sqlite_busy_timeout = value
-                    await connection.exec_driver_sql("PRAGMA busy_timeout = 0")
-                await connection.exec_driver_sql("BEGIN IMMEDIATE")
-            else:
-                connection = await connection.execution_options(
-                    isolation_level="READ COMMITTED"
-                )
-                await connection.begin()
-            yield connection
-            await connection.commit()
-        except asyncio.CancelledError as error:
-            primary_error = error
-            await _discard_cancelled_connection(connection, pooled, error)
-            raise
-        except BaseException as error:
-            primary_error = error
-            try:
-                await connection.rollback()
-            except Exception as rollback_error:  # noqa: BLE001 - preserve primary failure
-                error.add_note(
-                    "Trace Store transaction rollback also failed: "
-                    f"{type(rollback_error).__module__}."
-                    f"{type(rollback_error).__qualname__}"
-                )
-            raise
-        finally:
-
-            async def close_connection() -> None:
-                if sqlite_busy_timeout is not None:
-                    try:
-                        await connection.exec_driver_sql(
-                            f"PRAGMA busy_timeout = {sqlite_busy_timeout}"
-                        )
-                    except SQLAlchemyError:
-                        # An invalidated connection cannot return to the pool;
-                        # SQLAlchemy discards it, so no changed PRAGMA can leak to
-                        # another borrower.
-                        pass
-                await connection.close()
-
-            await _complete_connection_cleanup(
-                close_connection(),
-                task_name="tinkerfin-trace-write-connection-close",
-                primary_error=primary_error,
-            )
-
-    @asynccontextmanager
-    async def _read_connection(self) -> AsyncGenerator[AsyncConnection, None]:
-        """Read one fixed database snapshot and translate infrastructure failure.
-
-        MySQL reads use next-transaction REPEATABLE READ and an explicit read-only
-        transaction, including when the host uses READ COMMITTED or AUTOCOMMIT. The
-        session settings stay untouched, and connection close rolls back the read
-        before returning it to the pool. MySQL's SET TRANSACTION scope is documented
-        at https://dev.mysql.com/doc/refman/8.4/en/set-transaction.html; consistency,
-        settings, and complete server-command budgets are covered by
-        ``tests/test_mysql_read_transactions.py``. Cancellation invalidates only the
-        current borrowed connection because asyncmy cannot safely roll back a command
-        interrupted in flight; repeated cancellation and pool recovery are covered by
-        ``tests/test_mysql_store.py::test_mysql_cancelled_reads_return_pool_capacity``.
-        """
-
-        try:
-            connection = await self._engine.connect()
-            pooled: PoolProxiedConnection | None = None
-            primary_error: BaseException | None = None
-            mysql_transaction_started = False
-            try:
-                pooled = await connection.get_raw_connection()
-                if self._dialect == "mysql":
-                    await connection.exec_driver_sql(
-                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-                    )
-                    await connection.exec_driver_sql("START TRANSACTION READ ONLY")
-                    mysql_transaction_started = True
-                    yield connection
-                else:
-                    # Python's SQLite driver legacy mode does not BEGIN for SELECT.
-                    # An explicit transaction fixes generation metadata and event rows
-                    # to the same snapshot instead of allowing a concurrent append
-                    # between statements.
-                    await connection.exec_driver_sql("BEGIN")
-                    yield connection
-                    if connection.in_transaction():
-                        await connection.rollback()
-            except asyncio.CancelledError as error:
-                primary_error = error
-                await _discard_cancelled_connection(connection, pooled, error)
-                raise
-            except BaseException as error:
-                primary_error = error
-                if connection.in_transaction():
-                    try:
-                        await connection.rollback()
-                    except Exception as rollback_error:  # noqa: BLE001
-                        error.add_note(
-                            "Trace Store read rollback also failed: "
-                            f"{type(rollback_error).__module__}."
-                            f"{type(rollback_error).__qualname__}"
-                        )
-                raise
-            finally:
-                if not connection.closed:
-
-                    async def close_connection() -> None:
-                        try:
-                            if self._dialect == "mysql" and not connection.invalidated:
-                                if not mysql_transaction_started:
-                                    # A failed START can leave next-transaction settings
-                                    # pending. Discard that connection even if rollback
-                                    # appeared to succeed; no later borrower may inherit
-                                    # an unconsumed Trace transaction configuration.
-                                    await connection.invalidate()
-                                elif connection.dialect.skip_autocommit_rollback:
-                                    # SQLAlchemy skips driver rollback in AUTOCOMMIT
-                                    # mode, but our explicit transaction still needs to
-                                    # end. This host option must not retain a read view
-                                    # or READ ONLY state across pool borrowers.
-                                    try:
-                                        await connection.exec_driver_sql("ROLLBACK")
-                                    except BaseException:
-                                        await connection.invalidate()
-                                        raise
-                        finally:
-                            await connection.close()
-
-                    await _complete_connection_cleanup(
-                        close_connection(),
-                        task_name="tinkerfin-trace-read-connection-close",
-                        primary_error=primary_error,
-                    )
-        except SQLAlchemyError as error:
-            raise TraceStoreError(
-                "Trace Store database read failed",
-                cause=error,
-            ) from error
-
 
 class SqlAlchemyTraceStore(DurableTraceStore):
     """Persist the framework-owned Trace Ledger through a borrowed SQLAlchemy Engine.
 
-    SQLite and MySQL use the same public five-operation backend boundary and Ledger
+    SQLite, MySQL, and PostgreSQL use the same public backend boundary and Ledger
     reducer as every other durable Store. The convenience Store owns no Engine resource
-    and preserves the current six-table SQL shape.
+    and isolates each operation by its supplied identity.
 
     Args:
-        engine: Borrowed asynchronous SQLite or MySQL Engine.
-        namespace: Stable logical isolation key.
+        engine: Borrowed asynchronous SQLite, MySQL, or PostgreSQL Engine.
         limits: Ledger and terminal-reserve capacity limits.
         options: Writer lease, follow, and commit retry settings.
         codec: Canonical payload codec borrowed by the Store.
@@ -2199,7 +1890,6 @@ class SqlAlchemyTraceStore(DurableTraceStore):
         self,
         engine: AsyncEngine,
         *,
-        namespace: str = "default",
         limits: TraceLimits | None = None,
         options: TraceStoreOptions | None = None,
         codec: CanonicalTracePayloadCodec | None = None,
@@ -2207,9 +1897,8 @@ class SqlAlchemyTraceStore(DurableTraceStore):
         """Initialize a Store over a borrowed asynchronous SQLAlchemy Engine.
 
         Args:
-            engine: Borrowed SQLite or MySQL Engine.
-            namespace: Stable logical isolation key.
-            limits: Optional capacity limits.
+            engine: Borrowed asynchronous SQLite, MySQL, or PostgreSQL Engine.
+                limits: Optional capacity limits.
             options: Optional writer and retry settings.
             codec: Optional canonical payload codec.
         """
@@ -2219,12 +1908,10 @@ class SqlAlchemyTraceStore(DurableTraceStore):
         resolved_codec = codec or CanonicalTracePayloadCodec()
         backend = _SqlAlchemyTraceLedgerBackend(
             engine,
-            namespace=namespace,
             options=resolved_options,
         )
         super().__init__(
             backend,
-            namespace=namespace,
             limits=resolved_limits,
             options=resolved_options,
             codec=resolved_codec,
@@ -2306,7 +1993,7 @@ def _graph_mutation_creates_node(mutation: TraceGraphNodeMutation) -> bool:
         mutation.kind is not None
         and mutation.status is not None
         and mutation.name is not None
-        and mutation.namespace is not None
+        and mutation.graph_namespace is not None
         and mutation.started_at is not None
         and mutation.started_seq is not None
     )
@@ -2331,7 +2018,6 @@ def _decode_namespace(value: object) -> tuple[str, ...]:
 
 
 def _trace_graph_effective_source(
-    backend: _SqlAlchemyTraceLedgerBackend,
     request: TraceGraphQueryRequest,
 ) -> Subquery:
     """Select the latest revision of each logical node in one chosen lineage."""
@@ -2340,7 +2026,7 @@ def _trace_graph_effective_source(
         return (
             select(*graph_nodes.c)
             .where(
-                graph_nodes.c.namespace_hash == backend._namespace_hash,
+                graph_nodes.c.namespace_hash == _digest(request.key.namespace),
                 graph_nodes.c.thread_hash == _digest(request.key.thread_id),
                 graph_nodes.c.generation == request.key.generation,
                 graph_nodes.c.run_hash == _digest(request.run_ids[0]),
@@ -2453,7 +2139,7 @@ def _trace_graph_effective_source(
             latest_present(graph_nodes.c.link_issue, "_link_issue"),
         )
         .where(
-            graph_nodes.c.namespace_hash == backend._namespace_hash,
+            graph_nodes.c.namespace_hash == _digest(request.key.namespace),
             graph_nodes.c.thread_hash == _digest(request.key.thread_id),
             graph_nodes.c.generation == request.key.generation,
             graph_nodes.c.run_hash.in_(
@@ -2534,7 +2220,6 @@ def _trace_graph_effective_source(
 
 
 def _trace_graph_criteria(
-    backend: _SqlAlchemyTraceLedgerBackend,
     request: TraceGraphQueryRequest,
     *,
     source: Subquery,
@@ -2542,7 +2227,7 @@ def _trace_graph_criteria(
     where = request.where
     nodes = source.c
     criteria: list[ColumnElement[bool]] = [
-        nodes.namespace_hash == backend._namespace_hash,
+        nodes.namespace_hash == _digest(request.key.namespace),
         nodes.thread_hash == _digest(request.key.thread_id),
         nodes.generation == request.key.generation,
     ]
@@ -2566,10 +2251,13 @@ def _trace_graph_criteria(
         criteria.append(
             nodes.model_hash.in_(tuple(_digest(value) for value in where.models))
         )
-    if where.namespaces:
+    if where.graph_namespaces:
         criteria.append(
             nodes.graph_namespace_hash.in_(
-                tuple(_digest(_encode_namespace(value)) for value in where.namespaces)
+                tuple(
+                    _digest(_encode_namespace(value))
+                    for value in where.graph_namespaces
+                )
             )
         )
     if where.started_after is not None:
@@ -2624,7 +2312,7 @@ def _validate_graph_node_row(
         raise TraceStoreProtocolError("Trace Graph provider filter digest collision")
     if where.models and mapping["model"] not in where.models:
         raise TraceStoreProtocolError("Trace Graph model filter digest collision")
-    if where.namespaces and namespace not in where.namespaces:
+    if where.graph_namespaces and namespace not in where.graph_namespaces:
         raise TraceStoreProtocolError("Trace Graph namespace filter digest collision")
 
 
@@ -2677,7 +2365,7 @@ def _stored_graph_node_from_row(
         status=status,
         name=cast(str, mapping["name"]),
         run_id=cast(str, mapping["run_id"]),
-        namespace=_decode_namespace(mapping["graph_namespace"]),
+        graph_namespace=_decode_namespace(mapping["graph_namespace"]),
         agent_name=cast(str | None, mapping["agent_name"]),
         provider=cast(str | None, mapping["provider"]),
         model=cast(str | None, mapping["model"]),
@@ -2804,7 +2492,7 @@ def _validate_reflected_schema(connection: Connection) -> None:
                     f"Trace Store column {table.name}.{column.name} has a stale type"
                 )
             if (
-                connection.dialect.name == "mysql"
+                connection.dialect.name in {"mysql", "postgresql"}
                 and reflected.get("comment") != column.comment
             ):
                 raise TraceStoreProtocolError(
@@ -2843,7 +2531,7 @@ def _validate_reflected_schema(connection: Connection) -> None:
             raise TraceStoreProtocolError(
                 f"Trace Store table {table.name!r} has stale indexes"
             )
-        if connection.dialect.name == "mysql":
+        if connection.dialect.name in {"mysql", "postgresql"}:
             table_comment = inspector.get_table_comment(table.name).get("text")
             if table_comment != table.comment:
                 raise TraceStoreProtocolError(
@@ -2857,32 +2545,37 @@ def _verify_thread_row(row: object, namespace: str, thread_id: str) -> None:
         raise TraceStoreProtocolError("Trace thread digest collision")
 
 
-def _writer_scope(store: _SqlAlchemyTraceLedgerBackend, key: TraceThreadKey):
+def _writer_scope(key: TraceThreadKey):
     return and_(
-        writers.c.namespace_hash == store._namespace_hash,
+        writers.c.namespace_hash == _digest(key.namespace),
         writers.c.thread_hash == _digest(key.thread_id),
         writers.c.generation == key.generation,
     )
 
 
 def _writer_where(
-    store: _SqlAlchemyTraceLedgerBackend,
     key: TraceThreadKey,
     run_id: str,
 ):
-    return and_(_writer_scope(store, key), writers.c.run_hash == _digest(run_id))
+    return and_(_writer_scope(key), writers.c.run_hash == _digest(run_id))
 
 
 def _retryable(error: DBAPIError, *, dialect: str) -> bool:
-    original = error.orig
+    # MySQL 1205 rolls back a statement, 1213 the transaction. The shared scope
+    # ends the whole attempt before a domain retry. Connection-loss outcomes use
+    # the Ledger closure's id/digest confirmation, never blind INSERT replay.
     if dialect == "mysql":
-        args = getattr(original, "args", ())
-        # 1205/1213 are safe transaction rollbacks. Connection-loss codes can be
-        # reported while COMMIT is in flight, so append/checkpoint closures must query
-        # their retained id/digest evidence before inserting on the replacement link.
-        return bool(args) and args[0] in {1205, 1213, 2006, 2013, 2055}
-    code = getattr(original, "sqlite_errorcode", None)
-    return code in {5, 6, 261, 262, 517, 773}
+        return mysql_error_code(error) in {1205, 1213, 2006, 2013, 2055}
+    if dialect == "postgresql":
+        return postgresql_error_code(error) in {
+            "40001",
+            "40P01",
+            "55P03",
+            "08003",
+            "08006",
+            "40003",
+        }
+    return sqlite_lock_error(error) or error.connection_invalidated
 
 
 def _database_timestamp(value: object) -> datetime:
@@ -2890,27 +2583,25 @@ def _database_timestamp(value: object) -> datetime:
         value = datetime.fromisoformat(value)
     if not isinstance(value, datetime):
         raise TraceStoreProtocolError("database did not return a timestamp")
-    return value.replace(tzinfo=None)
+    return _as_utc(value).replace(tzinfo=None)
+
+
+def _statement_clock(connection: AsyncConnection) -> ColumnElement[datetime]:
+    # One UTC observation per statement keeps selected time and lease predicates
+    # consistent. PostgreSQL CURRENT_TIMESTAMP samples transaction start instead;
+    # a lock-following lease uses a newly issued statement (PG17 datetime functions).
+    if connection.dialect.name == "mysql":
+        return type_coerce(func.utc_timestamp(6), DateTime())
+    if connection.dialect.name == "postgresql":
+        return type_coerce(func.timezone("UTC", func.statement_timestamp()), DateTime())
+    return type_coerce(func.strftime("%Y-%m-%d %H:%M:%f", "now"), DateTime())
 
 
 async def _database_now(connection: AsyncConnection) -> datetime:
-    # MySQL CURRENT_TIMESTAMP follows the session time zone of the borrowed Engine.
-    # UTC_TIMESTAMP is independent of host session configuration; SQLite's documented
-    # CURRENT_TIMESTAMP is already UTC. Both remain database clocks for lease fencing.
-    if connection.dialect.name == "mysql":
-        value = await connection.scalar(text("SELECT UTC_TIMESTAMP(6)"))
-    else:
-        value = await connection.scalar(
-            text("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')")
-        )
-    return _database_timestamp(value)
-
-
-def _consume_task_exception(task: asyncio.Task[object]) -> None:
-    """Retrieve retained task failures when every current waiter was cancelled."""
-
-    if not task.cancelled():
-        task.exception()
+    # Called after the namespace lock, so a successful owner receives its full lease.
+    return _database_timestamp(
+        await connection.scalar(select(_statement_clock(connection)))
+    )
 
 
 __all__ = ["SqlAlchemyTraceStore"]

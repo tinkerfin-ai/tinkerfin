@@ -65,7 +65,9 @@ async def _media_fixture() -> str:
     )
     assert isinstance(message, ToolMessage)
     adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-media", runId="run-media")
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-media", run_id="run-media"
+        )
     )
     events = adapter.process(
         {
@@ -137,7 +139,7 @@ def _artifacts() -> dict[Path, str]:
     tool_schema = ToolReviewInterruptMetadata.model_json_schema(by_alias=True)
     tool_schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
     tool_schema["$id"] = (
-        "https://github.com/tinkerfin-ai/tinkerfin/blob/main/"
+        "https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/"
         "packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/"
         "contracts/tool-review.schema.json"
     )
@@ -158,16 +160,18 @@ def _artifacts() -> dict[Path, str]:
     subagent_schema = SubagentProvenance.model_json_schema(by_alias=True)
     subagent_schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
     subagent_schema["$id"] = (
-        "https://github.com/tinkerfin-ai/tinkerfin/blob/main/"
+        "https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/"
         "packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/"
         "contracts/subagent-provenance.schema.json"
     )
     parent_namespace = ("tools:parent",)
     parent_tool_call_id = ScopedIdCodec().encode("tool", parent_namespace, "call-task")
     subagent_fixture = create_subagent_provenance(
-        identity=RunIdentity(threadId="thread-known", runId="run-known"),
-        namespace=(*parent_namespace, "tools:graph-task"),
-        parent_namespace=parent_namespace,
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-known", run_id="run-known"
+        ),
+        graph_namespace=(*parent_namespace, "tools:graph-task"),
+        parent_graph_namespace=parent_namespace,
         graph_task_id="graph-task",
         agent_name="researcher",
         parent_tool_call_id=parent_tool_call_id,

@@ -1,21 +1,9 @@
-# Runtime 入门
+# Runtime
 
 [文档首页](../index.md) · [English](../../en/runtime/index.md)
 
-TinkerFin 打开一次 managed Agent run，并把运行过程作为异步流交给调用方。模型、数据库、
-checkpointer、Store 与 Sandbox 资源仍由宿主管理。
-
-## 选择入口
-
-| 目标 | 使用方式 |
-| --- | --- |
-| 处理已校验的 LangGraph 原生数据 | `TinkerFin.open_run()` |
-| 保留 managed Observation 与清理并返回最终 state | `TinkerFin.ainvoke()` |
-| 给前端发送 AG-UI 事件 | `TinkerFin.open_agui_run()` |
-| 在 managed 生命周期外复用异步 Runnable | `DeepAgentDefinition.create_graph()` |
-
-只需要最终 state 时从 `ainvoke()` 开始，需要消费过程时使用 `open_run()`。Direct Graph 属于
-高级边界，不会自动创建 run identity、Runtime Observation、Trace、AG-UI、Messaging 或业务生命周期。
+`TinkerFin` 用于配置智能体，`with_namespace(...).build(...)` 返回执行该配置的
+`AgentRuntime`。构建过程不会打开模型、数据库、Sandbox 或 Graph。
 
 ## 安装
 
@@ -23,99 +11,76 @@ checkpointer、Store 与 Sandbox 资源仍由宿主管理。
 pip install tinkerfin
 ```
 
-基础安装包含原生 Runtime、Plan Mode、Observation 与原生 SSE。使用 `open_agui_run()` 前安装
-`pip install "tinkerfin[agui]"`。
+如需输出 AG-UI 事件，安装 `tinkerfin[agui]`。模型由应用安装对应的 LangChain
+提供方包。
 
-模型供应商依赖和密钥仍按供应商要求配置。下方 OpenAI 模型字符串需要
-`pip install langchain-openai`。
-
-## 第一次 managed run
+## 构建与执行
 
 ```python
-import asyncio
+from contextlib import aclosing
 
-from tinkerfin import RunIdentity, TinkerFin
+from tinkerfin import TinkerFin
 
-
-tinkerfin = TinkerFin()
-agent = tinkerfin.create_deep_agent(
-    model="openai:gpt-5.4",
-    tools=[],
+runtime = (
+    TinkerFin()
+    .with_namespace("company-a")
+    .build(model="openai:gpt-5.4", tools=[])
 )
 
+stream = runtime.open_run(
+    thread_id="conversation-1",
+    run_id="request-1",
+    input={"messages": [{"role": "user", "content": "概括这项请求"}]},
+)
 
-async def main() -> None:
-    stream = await tinkerfin.open_run(
-        RunIdentity(threadId="conversation-1", runId="run-1"),
-        agent=agent,
-        input={"messages": [{"role": "user", "content": "用一句话介绍北京"}]},
-    )
+async with aclosing(stream):
     async for part in stream:
-        print(part)
-
-
-asyncio.run(main())
+        await handle(part)
 ```
 
-普通路径只有三步：
+按所需结果选择执行入口：
 
-1. 配置可复用的 `TinkerFin` 门面
-2. 创建可复用的 Agent Definition
-3. 通过 `open_run()` 传入身份和输入，并消费返回的流
+| 目标 | API |
+| --- | --- |
+| 获取最终状态 | `await runtime.ainvoke(...)` |
+| 消费原生对象 | `runtime.open_run(...)` |
+| 消费 AG-UI 事件 | `runtime.open_agui_run(...)` |
+| 构建由调用方管理的 Graph | `await tinkerfin.deep_agent.create_graph(runtime)` |
 
-门面会按需解析惰性 Agent callback，通过所选 Profile 的原生异步方法或有容量限制的同步 factory
-边界构造 Graph，注入身份，打开 Observation 和协调作用域，并负责取消与清理。
+两个流入口都是同步、惰性的工厂。只有预检或消费流时才开始准备资源。消费者提前退出时必须关闭流。
 
-## `RunIdentity` 的作用
+## 身份与隔离
 
-`RunIdentity` 只包含 `threadId` 和 `runId`。TinkerFin 会自动把 `threadId` 注入 Graph 配置，
-调用方不应重复填写。
+应用自行决定 Runtime 的 namespace。它可以表示租户、用户、项目或其他业务范围，框架只把它视为不透明文本。
+
+| 值 | 含义 |
+| --- | --- |
+| `runtime.namespace` | 构建时固定的业务数据和资源范围 |
+| `thread_id` | namespace 内持续使用的一次对话 |
+| `run_id` | thread 内的一次语义执行 |
+| `graph_namespace` | 事件在执行 Graph 中的位置 |
+
+其他 TinkerFin 包需要完整身份时，使用 `runtime.run_identity(thread_id, run_id)`。
+`graph_namespace` 表示执行位置，不能代替业务 namespace。
+
+## 持久化与资源
+
+传入 checkpointer 可保留对话状态，并恢复工具或 Plan 审批。传入 Store 可保存长期记忆。Runtime 会按自己的 namespace 隔离两者。
 
 ```python
-identity = RunIdentity(threadId="user-42-support", runId="run-20260820-1")
+runtime = (
+    TinkerFin(checkpointer=checkpointer)
+    .with_namespace(namespace)
+    .build(model=model, tools=tools, store=store)
+)
 ```
 
-| 字段 | 要求 | 作用 |
-| --- | --- | --- |
-| `threadId` | 必填、非空、不能有首尾空白 | 连续会话和 checkpoint thread |
-| `runId` | 必填、非空、不能有首尾空白 | 一次语义运行的幂等 ID |
+模型、Store、checkpointer、cache、协调器和传入的 backend 仍由应用管理。每次运行负责关闭自己创建的 Graph、惰性 workspace、流和清理资源。
 
-该值不可修改，每个 ID 最多 1,024 个字符，并拒绝额外字段。parent 谱系、认证与请求正文属于
-独立输入。同一段连续会话复用 `threadId`；新的语义输入使用新的 `runId`，只有同一次运行的
-重试或附着才复用它。
+## 后续阅读
 
-## Managed stream 与 Direct Graph
-
-`open_run()` 和 `open_agui_run()` 返回的流都只能消费一次，并支持显式关闭。两者会先提交 Run
-start 与 input Observation，再在尚未拉取第一条模型输出时返回；不再消费的返回流必须显式关闭。
-Agent Definition 可以复用，也可以同时服务不同 thread ID。
-
-高级集成可以直接创建可复用异步 Runnable：
-
-```python
-graph = await agent.create_graph(mode="plan")
-result = await graph.ainvoke(graph_input, config=config)
-```
-
-`DeepAgentGraph` 支持 `ainvoke()`、`astream()`、`abatch()` 与标准 Runnable 组合。Direct resume
-使用原生 LangGraph `Command(resume=...)`。同步 `invoke()`、`stream()` 和 `batch()` 会明确拒绝，
-从而保持异步 checkpointer、Store、Tool 与取消语义。
-
-## Runtime Profile 选择
-
-`DeepAgentsV2RuntimeProfile` 是默认稳定集成；显式的 Deep Agents v3 集成
-`DeepAgentsV3RuntimeProfile` 使用 LangGraph 的实验性 v3 事件流。Runtime 不会在两者之间
-探测、协商或回退。两者输出相同的 canonical Native Observation，因此 Trace、AG-UI、Messaging
-与宿主代码不按上游 stream API 分支。`TodoGroups` 仍由宿主基于 canonical Trace fact 投影，
-不是 Runtime state 或第二套持久化格式。
-
-所选 Profile 及其 `profile_id` 只构成框架私有的集成与 checkpoint 恢复边界。宿主在框架装配时
-选择该边界；Profile identity 不是应用数据库字段，也不进入 HTTP 请求或响应。
-
-## 下一步
-
-- [创建和运行 Deep Agent](deep-agents.md)
-- [事件流与 SSE](streams-and-sse.md)
-- [运行协调与 Redis 租约](extensions.md)
-- [记录语义执行历史](../tracing/index.md)
-- [Runtime 使用参考](api-reference.md)
+- [运行第一个智能体](quick_start.md)
+- [配置智能体与 Plan](deep-agents.md)
+- [流与 SSE](streams-and-sse.md)
+- [Runtime 扩展](extensions.md)
+- [Runtime API](api-reference.md)

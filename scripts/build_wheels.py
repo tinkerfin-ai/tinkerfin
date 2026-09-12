@@ -16,10 +16,12 @@ PROJECT_PATHS = (
     "packages/tinkerfin-native-stream",
     "packages/tinkerfin-agui-adapter",
     "packages/tinkerfin",
+    "packages/tinkerfin-automation",
     "packages/tinkerfin-messaging",
     "packages/tinkerfin-tracing",
     "packages/tinkerfin-sandbox",
-    "packages/tinkerfin-langgraph-mysql",
+    "packages/tinkerfin-langgraph-store",
+    "packages/tinkerfin-sqlalchemy",
     "apps/studio/server",
 )
 
@@ -182,7 +184,7 @@ def main() -> None:
         "projects",
         nargs="*",
         metavar="PROJECT_PATH",
-        help="repository-relative project paths; defaults to all nine projects",
+        help="repository-relative project paths; defaults to all framework and Studio projects",
     )
     parser.add_argument("--out-dir", type=Path, default=ROOT / "dist")
     parser.add_argument("--python", default=sys.executable)

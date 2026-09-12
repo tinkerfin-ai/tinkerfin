@@ -107,7 +107,7 @@ class _MutableMessage:
     id: str
     trace_seq: int
     source_id: str | None
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     run_id: str
     role: MessageRole
     created_at: datetime
@@ -123,7 +123,7 @@ class _MutableReasoning:
     id: str
     trace_seq: int
     message_id: str
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     run_id: str
     extractor: str
     created_at: datetime
@@ -876,7 +876,7 @@ def _advance_messages(
         for message in current:
             if (
                 message.role == "tool"
-                and message.namespace == fact.namespace
+                and message.graph_namespace == fact.graph_namespace
                 and message.tool_call_id == fact.source_tool_call_id
             ):
                 values[message.id] = _message_with_content(
@@ -897,7 +897,7 @@ def _advance_messages(
             id=fact.message_id,
             trace_seq=trace_seq,
             source_id=fact.source_message_id,
-            namespace=fact.namespace,
+            graph_namespace=fact.graph_namespace,
             run_id=fact.identity.run_id,
             role=fact.role,
             name=fact.name,
@@ -966,7 +966,7 @@ def _advance_reasoning(
             id=fact.reasoning_id,
             trace_seq=trace_seq,
             message_id=fact.message_id,
-            namespace=fact.namespace,
+            graph_namespace=fact.graph_namespace,
             run_id=fact.identity.run_id,
             extractor=fact.extractor,
             status="streaming",
@@ -1127,8 +1127,8 @@ def _apply_incremental_state(
     subgraphs = {name: dict(value) for name, value in current.subgraphs.items()}
     target = (
         root
-        if not fact.namespace
-        else subgraphs.setdefault(_namespace_key(fact.namespace), {})
+        if not fact.graph_namespace
+        else subgraphs.setdefault(_namespace_key(fact.graph_namespace), {})
     )
     if isinstance(fact, PlanRevisionFact):
         if fact.plan.disposition == "inline":
@@ -1413,7 +1413,7 @@ def _messages(
         if isinstance(fact, ToolFact) and fact.phase == "result":
             if fact.content is None:
                 continue
-            tool_key = (fact.namespace, fact.source_tool_call_id)
+            tool_key = (fact.graph_namespace, fact.source_tool_call_id)
             tool_results[tool_key] = fact.content
             message = tool_messages.get(tool_key)
             if message is not None:
@@ -1437,7 +1437,7 @@ def _messages(
                 id=fact.message_id,
                 trace_seq=fact_sequences[id(fact)],
                 source_id=fact.source_message_id,
-                namespace=fact.namespace,
+                graph_namespace=fact.graph_namespace,
                 run_id=fact.identity.run_id,
                 role=fact.role,
                 created_at=fact.occurred_at,
@@ -1447,7 +1447,7 @@ def _messages(
             values[fact.message_id] = message
             order.append(fact.message_id)
             if fact.role == "tool" and fact.tool_call_id is not None:
-                tool_key = (fact.namespace, fact.tool_call_id)
+                tool_key = (fact.graph_namespace, fact.tool_call_id)
                 tool_messages[tool_key] = message
                 result = tool_results.get(tool_key)
                 if result is not None:
@@ -1478,7 +1478,7 @@ def _messages(
             id=message.id,
             trace_seq=message.trace_seq,
             source_id=message.source_id,
-            namespace=message.namespace,
+            graph_namespace=message.graph_namespace,
             run_id=message.run_id,
             role=message.role,
             content=message.content,
@@ -1541,7 +1541,7 @@ def _reasoning(
                 id=fact.reasoning_id,
                 trace_seq=fact_sequences[id(fact)],
                 message_id=fact.message_id,
-                namespace=fact.namespace,
+                graph_namespace=fact.graph_namespace,
                 run_id=fact.identity.run_id,
                 extractor=fact.extractor,
                 created_at=fact.occurred_at,
@@ -1570,7 +1570,7 @@ def _reasoning(
             id=reasoning.id,
             trace_seq=reasoning.trace_seq,
             message_id=reasoning.message_id,
-            namespace=reasoning.namespace,
+            graph_namespace=reasoning.graph_namespace,
             run_id=reasoning.run_id,
             extractor=reasoning.extractor,
             content=reasoning.content,
@@ -1625,7 +1625,7 @@ def _interactions(
                 fact_sequences[id(fact)] if previous is None else previous.trace_seq
             ),
             source_id=fact.source_interaction_id,
-            namespace=fact.namespace,
+            graph_namespace=fact.graph_namespace,
             run_id=fact.identity.run_id,
             kind=fact.interaction_kind,
             tool_call_ids=(
@@ -1653,8 +1653,8 @@ def _state(facts: tuple[TraceSemanticFact, ...]) -> TraceState:
         if isinstance(fact, PlanRevisionFact):
             target = (
                 root
-                if not fact.namespace
-                else subgraphs.setdefault(_namespace_key(fact.namespace), {})
+                if not fact.graph_namespace
+                else subgraphs.setdefault(_namespace_key(fact.graph_namespace), {})
             )
             if fact.plan.disposition == "inline":
                 target["tinkerfin_plan"] = fact.plan.value
@@ -1663,8 +1663,8 @@ def _state(facts: tuple[TraceSemanticFact, ...]) -> TraceState:
             continue
         target = (
             root
-            if not fact.namespace
-            else subgraphs.setdefault(_namespace_key(fact.namespace), {})
+            if not fact.graph_namespace
+            else subgraphs.setdefault(_namespace_key(fact.graph_namespace), {})
         )
         for key in fact.removed_keys:
             target.pop(key, None)
@@ -1675,9 +1675,9 @@ def _state(facts: tuple[TraceSemanticFact, ...]) -> TraceState:
     return TraceState(root=root, subgraphs=subgraphs)
 
 
-def _namespace_key(namespace: tuple[str, ...]) -> str:
+def _namespace_key(graph_namespace: tuple[str, ...]) -> str:
     return json.dumps(
-        namespace,
+        graph_namespace,
         ensure_ascii=False,
         separators=(",", ":"),
     )

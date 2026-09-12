@@ -124,7 +124,7 @@ const applyTraceGraphDelta = (
       || node.turnId !== previous.turnId
       || node.kind !== previous.kind
       || node.name !== previous.name
-      || JSON.stringify(node.namespace) !== JSON.stringify(previous.namespace)
+      || JSON.stringify(node.graphNamespace) !== JSON.stringify(previous.graphNamespace)
     )) throw new ConversationError('stream_event_invalid')
   })
   const nodeValues = applyEntityDelta(
@@ -181,8 +181,8 @@ const allowedDecisions = (value: JsonValue | undefined): ApprovalAllowedDecision
   ))
 }
 
-const scopedSourceKey = (namespace: string[], sourceId: string): string => (
-  JSON.stringify([namespace, sourceId])
+const scopedSourceKey = (graphNamespace: string[], sourceId: string): string => (
+  JSON.stringify([graphNamespace, sourceId])
 )
 
 const approvalFromInteraction = (
@@ -211,9 +211,9 @@ const approvalFromInteraction = (
       && (node.status === 'running' || node.status === 'waiting')
       && node.sourceId === toolCallId
       && node.name === rawAction.name
-      && node.namespace.length === interaction.namespace.length
-      && node.namespace.every(
-        (value, position) => value === interaction.namespace[position],
+      && node.graphNamespace.length === interaction.graphNamespace.length
+      && node.graphNamespace.every(
+        (value, position) => value === interaction.graphNamespace[position],
       )
     ))
     if (!toolNode || !toolCallId) return []
@@ -288,7 +288,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     trace.messages
       .filter((item) => item.role === 'tool' && item.toolCallId)
       .map((item) => [
-        scopedSourceKey(item.namespace, item.toolCallId as string),
+        scopedSourceKey(item.graphNamespace, item.toolCallId as string),
         item,
       ]),
   )
@@ -298,13 +298,13 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
   ))
   const subagentPartialOutput = new Map<string, Array<{ sequence: number; content: string; attachments: Attachment[] }>>()
   trace.messages.forEach((message) => {
-    if (message.role !== 'assistant' || message.namespace.length === 0) return
+    if (message.role !== 'assistant' || message.graphNamespace.length === 0) return
     const owner = verifiedSubagents
       .filter((node) => (
-        node.namespace.length <= message.namespace.length
-        && node.namespace.every((value, position) => value === message.namespace[position])
+        node.graphNamespace.length <= message.graphNamespace.length
+        && node.graphNamespace.every((value, position) => value === message.graphNamespace[position])
       ))
-      .sort((left, right) => right.namespace.length - left.namespace.length)[0]
+      .sort((left, right) => right.graphNamespace.length - left.graphNamespace.length)[0]
     if (!owner) return
     const content = messageText(message.content)
     const attachments = messageAttachments(message.content)
@@ -319,7 +319,7 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     return parent?.kind === 'subagent' ? parent : undefined
   }
   const ordered: Array<{ value: Message; sequence: number }> = trace.messages.flatMap((item) => {
-    if (item.namespace.length > 0) return []
+    if (item.graphNamespace.length > 0) return []
     if (item.role !== 'user' && item.role !== 'assistant') return []
     return [{
       sequence: item.traceSeq,
@@ -349,15 +349,15 @@ const traceMessages = (trace: ConversationHistoryCoreDetail): Message[] => {
     ) return
     if (node.kind === 'subagent' && !node.sourceId) return
     const resultNamespace = node.kind === 'subagent'
-      ? node.namespace.slice(0, -1)
-      : node.namespace
+      ? node.graphNamespace.slice(0, -1)
+      : node.graphNamespace
     const result = node.sourceId
       ? toolResults.get(scopedSourceKey(resultNamespace, node.sourceId))
       : undefined
     const retainedInput = node.requestOmitted ? undefined : node.request
     const retainedResult = node.resultOmitted ? undefined : node.result
     const subagent = node.kind === 'tool' ? owningSubagent(node) : undefined
-    if (node.kind === 'tool' && node.namespace.length > 0 && !subagent) return
+    if (node.kind === 'tool' && node.graphNamespace.length > 0 && !subagent) return
     const subagentInput = isObject(retainedInput)
       && typeof retainedInput.description === 'string'
       ? retainedInput.description

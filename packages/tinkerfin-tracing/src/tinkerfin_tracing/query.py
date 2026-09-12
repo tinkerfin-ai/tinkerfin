@@ -11,6 +11,8 @@ from typing import TypeVar, cast
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError, model_validator
 
+from tinkerfin_contracts import ThreadIdentity
+
 from ._graph_projection import (
     project_trace_graph_records,
     reduce_trace_graph_records,
@@ -545,7 +547,7 @@ class TraceThread:
 async def resolve_history_request(
     store: TraceStore,
     *,
-    thread_id: str,
+    identity: ThreadIdentity,
     head_run_id: str | None,
     history_cursor: str | None,
     limit: int,
@@ -554,13 +556,16 @@ async def resolve_history_request(
 
     _validate_limit(limit)
     if history_cursor is None:
-        return await store.snapshot(thread_id), head_run_id, limit
+        return await store.snapshot(identity), head_run_id, limit
     payload = _decode_history_cursor(history_cursor)
-    if payload.thread_id != thread_id:
+    if (
+        payload.namespace != identity.namespace
+        or payload.thread_id != identity.thread_id
+    ):
         raise InvalidTraceCursor("Trace history cursor belongs to another thread")
     if head_run_id is not None and head_run_id != payload.head_run_id:
         raise InvalidTraceCursor("Trace history cursor belongs to another Run head")
-    current = await store.snapshot(thread_id)
+    current = await store.snapshot(identity)
     if (
         current.key.namespace != payload.namespace
         or current.key.generation != payload.generation
@@ -846,7 +851,7 @@ async def _materialize_history_graph(
         core_state.runs[run_id].call_history_known for run_id in window.visible_run_ids
     )
     relationship_evidence_missing = False
-    if isinstance(store, TraceGraphStore):
+    if isinstance(store, TraceGraphStore) and store.supports_graph_queries:
         current = await store.query_trace_graph(
             key,
             run_ids=tuple(sorted(window.visible_run_ids)),

@@ -23,6 +23,7 @@ from tinkerfin_contracts import (
     RunSourceContext,
     RunStartedObservation,
     RunTerminalObservation,
+    ThreadIdentity,
 )
 from tinkerfin_messaging import MessageChannel, Messaging, RunNotFound
 from tinkerfin_messaging.agui import AgUiCodec
@@ -34,7 +35,7 @@ from tinkerfin_studio.conversation.models import ConversationRunRegistration
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.service import ConversationChatService
 from tinkerfin_studio.resources import ApplicationResources
-from tinkerfin_tracing import Tracer, TraceRunNotFound, TraceThread, TraceUpdate
+from tinkerfin_tracing import Tracer, TraceRunNotFound, TraceThread
 
 
 async def _messaging_channel() -> tuple[
@@ -102,7 +103,7 @@ class _DelayedTraceLookup:
 
     async def get(
         self,
-        thread_id: str,
+        identity: ThreadIdentity,
         *,
         head_run_id: str | None = None,
         projections: tuple[str, ...] = (),
@@ -113,7 +114,7 @@ class _DelayedTraceLookup:
                 "Selected Run does not exist in this Trace generation",
                 context={"head_run_id": head_run_id},
             )
-        assert thread_id == self._trace.key.thread_id
+        assert identity == self._trace.key.thread
         assert head_run_id == self._trace.head_run_id
         return self._trace
 
@@ -142,7 +143,7 @@ async def _setup_run(database, *, thread_id: str, run_id: str):
         await repository.commit()
         thread_pk = thread.id
     context = RunSourceContext(
-        identity=RunIdentity(threadId=thread_id, runId=run_id),
+        identity=RunIdentity(namespace="ns_1", thread_id=thread_id, run_id=run_id),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={"messages": [{"id": "user-1", "role": "user", "content": "执行任务"}]},
@@ -191,14 +192,14 @@ async def test_delayed_same_run_snapshot_cannot_restore_stale_running_status(
         database, thread_id="thread-late-snapshot", run_id="run-late-snapshot"
     )
     old_view = await tracer.get(
-        context.identity.thread_id, projections=("studio.conversation.failures",)
+        context.identity.thread, projections=("studio.conversation.failures",)
     )
     read_started = asyncio.Event()
     release_read = asyncio.Event()
     original_get = tracer.get
 
     async def delayed_get(
-        thread_id: str,
+        identity: ThreadIdentity,
         *,
         head_run_id: str | None = None,
         projections: tuple[str, ...] = (),
@@ -208,7 +209,7 @@ async def test_delayed_same_run_snapshot_cannot_restore_stale_running_status(
             await release_read.wait()
             return old_view
         return await original_get(
-            thread_id,
+            identity,
             head_run_id=head_run_id,
             projections=("studio.conversation.failures",),
         )
@@ -281,7 +282,7 @@ async def test_summary_timestamp_collision_requires_a_fresh_trace_observation(
     )
     await trace_session.aclose()
     collided = await tracer.get(
-        context.identity.thread_id, projections=("studio.conversation.failures",)
+        context.identity.thread, projections=("studio.conversation.failures",)
     )
     async with database.session() as session:
         repository = ConversationRepository(session)
@@ -304,7 +305,7 @@ async def test_summary_timestamp_collision_requires_a_fresh_trace_observation(
     reads = 0
 
     async def get(
-        thread_id: str,
+        identity: ThreadIdentity,
         *,
         head_run_id: str | None = None,
         projections: tuple[str, ...] = (),
@@ -314,7 +315,7 @@ async def test_summary_timestamp_collision_requires_a_fresh_trace_observation(
         if reads == 1:
             return collided
         return await original_get(
-            thread_id,
+            identity,
             head_run_id=head_run_id,
             projections=("studio.conversation.failures",),
         )
@@ -379,7 +380,7 @@ async def test_follow_converges_the_list_when_a_writer_closes_without_a_terminal
         await trace_session.aclose()
         await _wait_for(database, thread_pk, lambda item: item.status == "error")
         current = await tracer.get(
-            context.identity.thread_id, projections=("studio.conversation.failures",)
+            context.identity.thread, projections=("studio.conversation.failures",)
         )
         assert current.as_of_seq == before
         assert current.status.execution == "unknown"
@@ -454,7 +455,7 @@ async def test_cancel_after_producer_failure_reconciles_missing_trace_tail(
         assert current is not None and current.status == "error"
         assert (
             await tracer.get(
-                context.identity.thread_id,
+                context.identity.thread,
                 projections=("studio.conversation.failures",),
             )
         ).status.execution == "unknown"
@@ -493,7 +494,7 @@ async def test_trace_coordinator_keeps_pending_state_across_unrelated_delta(
     await trace_session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(
                 NativeMessageRecord(
@@ -525,7 +526,7 @@ async def test_trace_coordinator_keeps_pending_state_across_unrelated_delta(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-pending",
@@ -544,7 +545,7 @@ async def test_trace_coordinator_keeps_pending_state_across_unrelated_delta(
     await trace_session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             interrupts=(),
             observed_at=datetime.now(UTC),
@@ -574,49 +575,29 @@ async def test_trace_coordinator_recovers_after_one_summary_write_failure(
         tracer=tracer,
         conversation_channel=channel,
     )
-    original_thread = coordinator._persist_thread
-    original_update = coordinator._persist_update
-    snapshots = 0
+    original_write = ConversationRepository.update_trace_summary
     first_snapshot = asyncio.Event()
     retry_snapshot = asyncio.Event()
     failed_update = asyncio.Event()
-    update_attempts = 0
 
-    async def record_snapshot(*, thread_pk: int, trace: TraceThread):
-        nonlocal snapshots
-        result = await original_thread(thread_pk=thread_pk, trace=trace)
-        snapshots += 1
+    async def write_summary(repository, **fields):
+        if fields["message_count"] > 1 and not failed_update.is_set():
+            failed_update.set()
+            raise RuntimeError("transient summary failure")
+        result = await original_write(repository, **fields)
         first_snapshot.set()
-        if snapshots >= 2:
+        if failed_update.is_set():
             retry_snapshot.set()
         return result
 
-    async def fail_first_update(
-        *,
-        thread_pk: int,
-        update: TraceUpdate,
-        generation: str,
-    ):
-        nonlocal update_attempts
-        update_attempts += 1
-        if update_attempts == 1:
-            failed_update.set()
-            raise RuntimeError("transient summary failure")
-        return await original_update(
-            thread_pk=thread_pk,
-            update=update,
-            generation=generation,
-        )
-
-    monkeypatch.setattr(coordinator, "_persist_thread", record_snapshot)
-    monkeypatch.setattr(coordinator, "_persist_update", fail_first_update)
+    monkeypatch.setattr(ConversationRepository, "update_trace_summary", write_summary)
     coordinator.ensure(thread_pk=thread_pk, identity=context.identity)
     await asyncio.wait_for(first_snapshot.wait(), timeout=2)
 
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-retry-1",
@@ -632,7 +613,7 @@ async def test_trace_coordinator_recovers_after_one_summary_write_failure(
     await trace_session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-retry-2",
@@ -646,7 +627,7 @@ async def test_trace_coordinator_recovers_after_one_summary_write_failure(
 
     await _finish(context, trace_session)
     await _wait_for(database, thread_pk, lambda item: item.status == "idle")
-    assert update_attempts >= 2
+    assert failed_update.is_set() and retry_snapshot.is_set()
 
     await coordinator.aclose()
     await messaging.aclose()
@@ -665,7 +646,7 @@ async def test_trace_coordinator_waits_for_not_started_run_without_corruption_wa
     )
     await _finish(context, trace_session)
     trace = await tracer.get(
-        context.identity.thread_id,
+        context.identity.thread,
         head_run_id=context.identity.run_id,
         projections=("studio.conversation.failures",),
     )
@@ -790,7 +771,7 @@ async def test_recover_preparing_preserves_a_live_messaging_owner(database) -> N
     tracer = Tracer(
         projections=(ConversationFailureProjection(),),
     )
-    identity = RunIdentity(threadId="thread-slow", runId="run-slow")
+    identity = RunIdentity(namespace="ns_1", thread_id="thread-slow", run_id="run-slow")
     async with database.session() as session:
         repository = ConversationRepository(session)
         thread = await repository.create_thread(
@@ -843,7 +824,9 @@ async def test_recover_preparing_preserves_a_live_messaging_owner(database) -> N
 async def test_owner_preflight_cas_fences_a_stale_recovery_delete(database) -> None:
     """missing 检查后的 owner 激活必须让延迟删除 CAS 失效"""
 
-    identity = RunIdentity(threadId="thread-preflight-race", runId="run-preflight-race")
+    identity = RunIdentity(
+        namespace="ns_1", thread_id="thread-preflight-race", run_id="run-preflight-race"
+    )
     async with database.session() as session:
         repository = ConversationRepository(session)
         thread = await repository.create_thread(
@@ -906,7 +889,9 @@ async def test_abandoned_trace_settles_the_complete_claim_batch_as_cancelled(
     tracer = Tracer(
         projections=(ConversationFailureProjection(),),
     )
-    identity = RunIdentity(threadId="thread-abandon", runId="run-abandon")
+    identity = RunIdentity(
+        namespace="ns_1", thread_id="thread-abandon", run_id="run-abandon"
+    )
     async with database.session() as session:
         repository = ConversationRepository(session)
         thread = await repository.create_thread(

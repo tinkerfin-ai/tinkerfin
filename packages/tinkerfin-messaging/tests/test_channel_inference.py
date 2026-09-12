@@ -23,6 +23,8 @@ from tinkerfin_messaging import (
     MessageSubscription,
     Messaging,
     MessagingError,
+)
+from tinkerfin_messaging.backend_contract import (
     MessagingTransition,
     MessagingTransitionResult,
 )
@@ -37,7 +39,7 @@ def _identity(
     thread_id: str = "thread-1",
     run_id: str = "run-1",
 ) -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 class _TextCodec:
@@ -495,7 +497,7 @@ async def test_reused_inferred_channel_revalidates_profile_before_prepare() -> N
 async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
     async with Messaging() as messaging:
         native_channel = messaging.channel(name="native-parts")
-        native_frames = await native_channel.sse(
+        native_frames = await native_channel.open_sse(
             _native_source(
                 identity=_identity(thread_id="native-stream", run_id="native-run")
             ),
@@ -505,11 +507,17 @@ async def test_name_only_channel_infers_native_and_agui_profiles() -> None:
 
         agui_channel = messaging.channel(name="agui-events")
         agui_identity = _identity()
-        events = TinkerFin().failed_agui_run(
-            RuntimeError("test initialization failure"),
-            identity=agui_identity,
+        events = (
+            TinkerFin()
+            .with_namespace((agui_identity).namespace)
+            .build(model="provider:model")
+            .open_agui_run(
+                thread_id=(agui_identity).thread_id,
+                run_id=(agui_identity).run_id,
+                messages=[],
+            )
         )
-        agui_frames = await agui_channel.sse(
+        agui_frames = await agui_channel.open_sse(
             events,
             after=0,
         )
@@ -578,9 +586,15 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
         )
         await _collect(native)
 
-        incompatible = TinkerFin().failed_agui_run(
-            RuntimeError("test initialization failure"),
-            identity=_identity(thread_id="agui", run_id="agui-run"),
+        incompatible = (
+            TinkerFin()
+            .with_namespace((_identity(thread_id="agui", run_id="agui-run")).namespace)
+            .build(model="provider:model")
+            .open_agui_run(
+                thread_id=(_identity(thread_id="agui", run_id="agui-run")).thread_id,
+                run_id=(_identity(thread_id="agui", run_id="agui-run")).run_id,
+                messages=[],
+            )
         )
         with pytest.raises(CodecMismatch):
             await channel.wrap(
@@ -595,9 +609,12 @@ async def test_name_only_channel_rejects_custom_and_incompatible_sources() -> No
 async def test_preencoded_runtime_sse_is_rejected_before_source_open() -> None:
     encoded = (
         TinkerFin()
-        .failed_agui_run(
-            RuntimeError("test initialization failure"),
-            identity=_identity(thread_id="stream-1"),
+        .with_namespace((_identity(thread_id="stream-1")).namespace)
+        .build(model="provider:model")
+        .open_agui_run(
+            thread_id=(_identity(thread_id="stream-1")).thread_id,
+            run_id=(_identity(thread_id="stream-1")).run_id,
+            messages=[],
         )
         .to_sse()
     )
@@ -625,7 +642,7 @@ async def test_explicit_custom_codec_and_renderer_remain_supported() -> None:
             after=0,
         )
         assert_type(subscription, MessageSubscription[str])
-        frames = subscription.sse()
+        frames = subscription.to_sse()
         assert [frame async for frame in frames] == [
             b"id: 1\ndata: one\n\n",
             b"id: 2\ndata: two\n\n",
@@ -641,7 +658,7 @@ async def test_channel_sse_matches_wrap_then_subscription_sse() -> None:
             codec=_TextCodec(),
             renderer=_TextRenderer(),
         )
-        direct_body = await direct_channel.sse(
+        direct_body = await direct_channel.open_sse(
             _CustomSource("one", "two"),
             identity=_identity(thread_id="stream-1"),
             after=0,
@@ -658,6 +675,6 @@ async def test_channel_sse_matches_wrap_then_subscription_sse() -> None:
             identity=_identity(thread_id="stream-1"),
             after=0,
         )
-        composed = [frame async for frame in subscription.sse()]
+        composed = [frame async for frame in subscription.to_sse()]
 
     assert direct == composed

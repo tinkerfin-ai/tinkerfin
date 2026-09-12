@@ -14,15 +14,16 @@
 | 共享运行与观察契约 | `pip install tinkerfin-contracts` |
 | 共享 Native 流契约 | `pip install tinkerfin-native-stream` |
 | 进程内语义 Trace | `pip install tinkerfin-tracing` |
-| SQLite Trace 持久化 | `pip install "tinkerfin-tracing[sqlite]"` |
-| MySQL Trace 持久化 | `pip install "tinkerfin-tracing[mysql]"` |
-| asyncmy LangGraph MySQL Store | `pip install tinkerfin-langgraph-mysql` |
+| SQL Trace 持久化 | `pip install "tinkerfin-tracing[sqlalchemy]"`，另装所选异步数据库驱动 |
+| SQLAlchemy LangGraph 长期记忆 | `pip install "tinkerfin-langgraph-store[sqlalchemy]"` 并安装异步数据库驱动 |
 | 与协议无关的内存消息流 | `pip install tinkerfin-messaging` |
 | AG-UI Messaging codec | `pip install "tinkerfin-messaging[agui]"` |
 | Native Messaging codec | `pip install "tinkerfin-messaging[native]"` |
+| SQL 消息存储 | `pip install "tinkerfin-messaging[sqlalchemy]"`，另装异步数据库驱动 |
 | Redis AG-UI 消息存储 | `pip install "tinkerfin-messaging[agui,redis]"` |
 | OpenSandbox | `pip install tinkerfin-sandbox` |
-| SQLite 持久化 Sandbox 状态 | `pip install "tinkerfin-sandbox[sqlite]"` |
-| MySQL 持久化 Sandbox 状态 | `pip install "tinkerfin-sandbox[mysql]"` |
+| SQL 持久化 Sandbox 状态 | `pip install "tinkerfin-sandbox[sqlalchemy]"`，另装异步数据库驱动 |
+| 默认内存模式的立即执行与任务调度 | `pip install tinkerfin-automation` |
+| SQL 任务持久化 | `pip install "tinkerfin-automation[sqlalchemy]"`，另选异步驱动 |
 
 不必一次安装全部组件。先安装当前要用的部分，后面需要时再增加。

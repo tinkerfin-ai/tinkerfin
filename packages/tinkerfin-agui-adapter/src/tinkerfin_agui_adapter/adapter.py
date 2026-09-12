@@ -346,7 +346,7 @@ class DeepAgentAgUiAdapter:
                 source = raw_mapping.get("source")
                 if isinstance(source, Mapping) and cast(
                     Mapping[object, object], source
-                ).get("namespace"):
+                ).get("graphNamespace"):
                     continue
                 namespace = raw_mapping.get("ns")
                 if (

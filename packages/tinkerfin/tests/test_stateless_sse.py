@@ -13,7 +13,7 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import ValidationError
 
 from tinkerfin import (
-    DeepAgentDefinition,
+    AgentRuntime,
     NativeStreamPart,
     RunIdentity,
     SseBody,
@@ -23,7 +23,7 @@ from tinkerfin import (
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 def _graph_input() -> InputAgentState:
@@ -93,7 +93,7 @@ class _BlockingParts:
 
 @pytest.mark.asyncio
 async def test_prepare_does_not_observe_or_resolve_an_event_id(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     parts = _CountingParts()
     order: list[str] = []
@@ -110,11 +110,12 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id(
 
     body = (
         definition_factory(_SourceGraph(lambda: parts))
-        .new_agui(
-            identity=_identity(),
-            on_event=on_event,
+        .open_agui_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            on_agui_event=on_event,
+            input=_graph_input(),
         )
-        .astream(_graph_input())
         .to_sse(event_id_resolver=event_id_resolver)
     )
 
@@ -123,7 +124,7 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id(
     assert order == ["preflight"]
     assert parts.pulls == 0
 
-    first = await anext(body)
+    first = (await anext(body)).decode("utf-8")
 
     assert first.startswith("id: event-3\n")
     assert '"type":"RUN_STARTED"' in first
@@ -134,7 +135,7 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id(
     ]
     assert parts.pulls == 0
 
-    remaining = [frame async for frame in body]
+    remaining = [frame.decode("utf-8") async for frame in body]
     assert len(remaining) == 2
     assert parts.pulls == 2
     assert parts.closed.is_set()
@@ -142,7 +143,7 @@ async def test_prepare_does_not_observe_or_resolve_an_event_id(
 
 @pytest.mark.asyncio
 async def test_preflight_failure_closes_the_claimed_body_without_calling_factory(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     factory_calls = 0
 
@@ -154,8 +155,11 @@ async def test_preflight_failure_closes_the_claimed_body_without_calling_factory
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse()
     )
 
@@ -172,7 +176,7 @@ async def test_preflight_failure_closes_the_claimed_body_without_calling_factory
 
 @pytest.mark.asyncio
 async def test_native_custom_mapper_filters_and_controls_payload_fields(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         yield {"type": "values", "ns": (), "data": {"value": 1}, "interrupts": ()}
@@ -197,15 +201,18 @@ async def test_native_custom_mapper_filters_and_controls_payload_fields(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(
             mapper=mapper,
             event_id_resolver=event_id_resolver,
         )
     )
 
-    assert [frame async for frame in body] == [
+    assert [frame.decode("utf-8") async for frame in body] == [
         "id: 7\nevent: custom\nretry: 1500\ndata: line-1\ndata: line-2\n\n"
     ]
 
@@ -225,7 +232,7 @@ async def test_native_custom_mapper_filters_and_controls_payload_fields(
 async def test_custom_sse_data_preserves_exact_sse_line_semantics(
     data: str,
     expected_frame: str,
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
@@ -235,12 +242,15 @@ async def test_custom_sse_data_preserves_exact_sse_line_semantics(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(mapper=mapper)
     )
 
-    assert [frame async for frame in body] == [expected_frame]
+    assert [frame.decode("utf-8") async for frame in body] == [expected_frame]
 
 
 def test_sse_payload_rejects_boolean_retry_and_multiline_event_name() -> None:
@@ -252,7 +262,7 @@ def test_sse_payload_rejects_boolean_retry_and_multiline_event_name() -> None:
 
 @pytest.mark.asyncio
 async def test_custom_mapper_must_be_async_and_return_sse_payload(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         yield {"type": "values", "ns": (), "data": {}, "interrupts": ()}
@@ -262,8 +272,11 @@ async def test_custom_mapper_must_be_async_and_return_sse_payload(
 
     body = (
         definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(mapper=cast(SseMapper[NativeStreamPart], synchronous_mapper))
     )
 
@@ -273,7 +286,7 @@ async def test_custom_mapper_must_be_async_and_return_sse_payload(
 
 @pytest.mark.asyncio
 async def test_agui_mapper_receives_validated_event_objects(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         if False:
@@ -285,14 +298,17 @@ async def test_agui_mapper_receives_validated_event_objects(
         seen.append(event.type.value)
         return SsePayload(data=json.dumps({"kind": event.type.value}))
 
-    body: SseBody[str] = (
+    body: SseBody[bytes] = (
         definition_factory(_SourceGraph(source))
-        .new_agui(identity=_identity())
-        .astream(_graph_input())
+        .open_agui_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(mapper=mapper)
     )
 
-    frames = [frame async for frame in body]
+    frames = [frame.decode("utf-8") async for frame in body]
 
     assert seen == ["RUN_STARTED", "RUN_FINISHED"]
     assert [
@@ -304,7 +320,7 @@ async def test_agui_mapper_receives_validated_event_objects(
 @pytest.mark.parametrize("event_id", [True, "bad\nid", "bad\x00id", object()])
 async def test_event_id_resolver_rejects_unsafe_or_unsupported_ids(
     event_id: object,
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     parts = _CountingParts()
 
@@ -315,8 +331,11 @@ async def test_event_id_resolver_rejects_unsafe_or_unsupported_ids(
 
     body = (
         definition_factory(_SourceGraph(lambda: parts))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(
             event_id_resolver=event_id_resolver,
         )
@@ -332,7 +351,7 @@ async def test_event_id_resolver_rejects_unsafe_or_unsupported_ids(
 
 @pytest.mark.asyncio
 async def test_native_sse_timeout_covers_mapper_and_closes_upstream(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     parts = _CountingParts()
     mapper_started = asyncio.Event()
@@ -344,8 +363,11 @@ async def test_native_sse_timeout_covers_mapper_and_closes_upstream(
 
     body = (
         definition_factory(_SourceGraph(lambda: parts))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(
             timeout=1.0,
             mapper=mapper,
@@ -362,13 +384,16 @@ async def test_native_sse_timeout_covers_mapper_and_closes_upstream(
 
 @pytest.mark.asyncio
 async def test_external_sse_close_cancels_an_active_pull_and_is_idempotent(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     parts = _BlockingParts()
     body = (
         definition_factory(_SourceGraph(lambda: parts))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse()
     )
     pull = asyncio.create_task(anext(body))
@@ -494,7 +519,7 @@ async def test_sse_body_does_not_hide_cancellation_during_failure_cleanup() -> N
 
 @pytest.mark.asyncio
 async def test_mapper_failure_closes_upstream_and_preserves_the_primary_error(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     parts = _CountingParts()
 
@@ -503,8 +528,11 @@ async def test_mapper_failure_closes_upstream_and_preserves_the_primary_error(
 
     body = (
         definition_factory(_SourceGraph(lambda: parts))
-        .new(identity=_identity())
-        .astream(_graph_input())
+        .open_run(
+            thread_id=_identity().thread_id,
+            run_id=_identity().run_id,
+            input=_graph_input(),
+        )
         .to_sse(mapper=mapper)
     )
 

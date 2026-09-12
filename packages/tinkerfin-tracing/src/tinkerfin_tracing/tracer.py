@@ -33,11 +33,13 @@ from tinkerfin_contracts import (
     RunStartedObservation,
     RunTerminalObservation,
     RuntimeObservation,
+    ThreadIdentity,
     ToolExecutionObservation,
 )
 
 from ._graph_projection import project_trace_graph_records
 from ._ids import scope_id as _scope_id
+from ._tasks import capture, join_owned_task, select_failure
 from .capture import (
     CapturedValue,
     CapturePolicy,
@@ -294,7 +296,7 @@ class _TracingSession:
             fact = event.fact
             self._advance_context_anchors((fact,), historical=True)
             if isinstance(fact, MessageFact) and fact.source_message_id is not None:
-                key = (fact.namespace, fact.source_message_id)
+                key = (fact.graph_namespace, fact.source_message_id)
                 self._message_seen.add(key)
                 if fact.phase == "removed":
                     self._message_seen.discard(key)
@@ -323,7 +325,7 @@ class _TracingSession:
                     )
                     target[key] = fact.fingerprint
             elif isinstance(fact, ReasoningFact):
-                key = (fact.namespace, fact.source_message_id)
+                key = (fact.graph_namespace, fact.source_message_id)
                 previous_extractor = self._reasoning_extractors.get(key)
                 if (
                     previous_extractor is not None
@@ -342,7 +344,7 @@ class _TracingSession:
                 if fact.phase == "completed":
                     self._reasoning_completed.add(key)
             elif isinstance(fact, ToolFact):
-                key = (fact.namespace, fact.source_tool_call_id)
+                key = (fact.graph_namespace, fact.source_tool_call_id)
                 self._tool_names[key] = fact.tool_name
                 if fact.phase == "started":
                     self._tool_started.add(key)
@@ -355,16 +357,16 @@ class _TracingSession:
             elif isinstance(fact, ModelCallFact):
                 if fact.model is not None:
                     for message_id in fact.output_message_ids:
-                        self._message_model_names[(fact.namespace, message_id)] = (
-                            fact.model
-                        )
+                        self._message_model_names[
+                            (fact.graph_namespace, message_id)
+                        ] = fact.model
                 if fact.phase == "completed":
                     self._completed_model_messages.update(
-                        (fact.namespace, message_id)
+                        (fact.graph_namespace, message_id)
                         for message_id in fact.output_message_ids
                     )
                     for tool_call_id in fact.tool_call_ids:
-                        self._tool_call_models[(fact.namespace, tool_call_id)] = (
+                        self._tool_call_models[(fact.graph_namespace, tool_call_id)] = (
                             fact.call_id
                         )
             elif (
@@ -373,10 +375,10 @@ class _TracingSession:
                 and fact.source_tool_call_id is not None
             ):
                 self._tool_execution_by_call[
-                    (fact.namespace, fact.source_tool_call_id)
+                    (fact.graph_namespace, fact.source_tool_call_id)
                 ] = fact.execution_id
             elif isinstance(fact, StateRevisionFact):
-                state = self._states.setdefault(fact.namespace, {})
+                state = self._states.setdefault(fact.graph_namespace, {})
                 for key in fact.removed_keys:
                     state.pop(key, None)
                 if fact.changes.disposition == "inline" and isinstance(
@@ -384,11 +386,11 @@ class _TracingSession:
                 ):
                     state.update(fact.changes.value)
             elif isinstance(fact, PlanRevisionFact):
-                state = self._states.setdefault(fact.namespace, {})
+                state = self._states.setdefault(fact.graph_namespace, {})
                 if fact.plan.disposition == "inline":
                     state["tinkerfin_plan"] = fact.plan.value
             elif isinstance(fact, InteractionFact):
-                key = (fact.namespace, fact.source_interaction_id)
+                key = (fact.graph_namespace, fact.source_interaction_id)
                 if fact.phase == "opened":
                     self._pending_interactions[key] = _PendingInteraction(
                         kind=fact.interaction_kind,
@@ -408,18 +410,20 @@ class _TracingSession:
                         task_input = task_input[""]
                     description = task_input.get("description")
                     if isinstance(description, str):
-                        self._subagent_task_descriptions[fact.namespace] = description
+                        self._subagent_task_descriptions[fact.graph_namespace] = (
+                            description
+                        )
                 if fact.phase in {"started", "updated"} and fact.status in {
                     "running",
                     "waiting",
                 }:
-                    self._active_subagents[fact.namespace] = (
+                    self._active_subagents[fact.graph_namespace] = (
                         fact.subagent_id,
                         fact.agent_name,
                     )
                 else:
-                    self._active_subagents.pop(fact.namespace, None)
-                    self._subagent_task_descriptions.pop(fact.namespace, None)
+                    self._active_subagents.pop(fact.graph_namespace, None)
+                    self._subagent_task_descriptions.pop(fact.graph_namespace, None)
 
     async def observe(self, observation: RuntimeObservation) -> None:
         """Map and enqueue one already ordered Runtime observation.
@@ -487,8 +491,8 @@ class _TracingSession:
         """Return the exact preceding boundary for one provider attempt."""
 
         scope = (
-            observation.namespace
-            if self._in_subagent_scope(observation.namespace)
+            observation.graph_namespace
+            if self._in_subagent_scope(observation.graph_namespace)
             else ()
         )
         anchor = self._context_anchors.get(scope)
@@ -527,7 +531,7 @@ class _TracingSession:
                 "completed",
                 "reconciled",
             }:
-                namespaces = (fact.namespace if fact.in_subagent_scope else (),)
+                namespaces = (fact.graph_namespace if fact.in_subagent_scope else (),)
             elif isinstance(fact, ModelCallFact) and fact.phase in {
                 "completed",
                 "failed",
@@ -535,7 +539,7 @@ class _TracingSession:
                 "interrupted",
                 "abandoned",
             }:
-                namespaces = (fact.namespace if fact.in_subagent_scope else (),)
+                namespaces = (fact.graph_namespace if fact.in_subagent_scope else (),)
             elif isinstance(fact, ToolExecutionFact) and fact.phase in {
                 "completed",
                 "failed",
@@ -543,20 +547,20 @@ class _TracingSession:
                 "interrupted",
                 "abandoned",
             }:
-                namespaces = (fact.namespace if fact.in_subagent_scope else (),)
+                namespaces = (fact.graph_namespace if fact.in_subagent_scope else (),)
             elif isinstance(fact, ToolFact) and fact.phase in {
                 "result",
                 "cancelled",
                 "abandoned",
             }:
-                namespaces = (fact.namespace if fact.in_subagent_scope else (),)
+                namespaces = (fact.graph_namespace if fact.in_subagent_scope else (),)
             elif isinstance(fact, SubagentFact):
                 if fact.phase == "started":
-                    namespaces = (fact.namespace,)
+                    namespaces = (fact.graph_namespace,)
                 elif fact.phase == "completed" or fact.status == "waiting":
-                    namespaces = (fact.namespace[:-1],)
+                    namespaces = (fact.graph_namespace[:-1],)
             elif isinstance(fact, InteractionFact) and fact.phase == "resolved":
-                namespaces = (fact.namespace if fact.in_subagent_scope else (),)
+                namespaces = (fact.graph_namespace if fact.in_subagent_scope else (),)
             candidate = _ContextAnchor(
                 fact.occurred_at,
                 None if historical else fact.monotonic_ns,
@@ -788,7 +792,7 @@ class _TracingSession:
                             summary.interrupt_id,
                         ),
                         source_interaction_id=summary.interrupt_id,
-                        namespace=interaction_namespace,
+                        graph_namespace=interaction_namespace,
                         in_subagent_scope=self._in_subagent_scope(
                             interaction_namespace
                         ),
@@ -822,7 +826,7 @@ class _TracingSession:
                             interrupt_id,
                         ),
                         source_interaction_id=interrupt_id,
-                        namespace=interaction_namespace,
+                        graph_namespace=interaction_namespace,
                         in_subagent_scope=self._in_subagent_scope(
                             interaction_namespace
                         ),
@@ -837,7 +841,7 @@ class _TracingSession:
                 self._failure_origin_seen = True
             call_id = _scope_id(
                 "model-call",
-                observation.namespace,
+                observation.graph_namespace,
                 observation.call_id,
             )
             component_name = observation.model or self._model_component_names.get(
@@ -858,9 +862,9 @@ class _TracingSession:
                 self._model_component_names.pop(observation.call_id, None)
             if observation.phase == "completed":
                 for tool_call_id in observation.tool_call_ids:
-                    self._tool_call_models[(observation.namespace, tool_call_id)] = (
-                        call_id
-                    )
+                    self._tool_call_models[
+                        (observation.graph_namespace, tool_call_id)
+                    ] = call_id
             request = (
                 None
                 if observation.phase != "started"
@@ -879,11 +883,11 @@ class _TracingSession:
             )
             if component_name is not None:
                 for message_id in observation.output_message_ids:
-                    self._message_model_names[(observation.namespace, message_id)] = (
-                        component_name
-                    )
+                    self._message_model_names[
+                        (observation.graph_namespace, message_id)
+                    ] = component_name
             for message_id in observation.output_message_ids:
-                message_key = (observation.namespace, message_id)
+                message_key = (observation.graph_namespace, message_id)
                 if observation.phase == "completed":
                     self._completed_model_messages.add(message_key)
                 if message_key not in self._message_completed:
@@ -892,15 +896,17 @@ class _TracingSession:
                         (
                             message_id,
                             None,
-                            self._in_subagent_scope(observation.namespace),
+                            self._in_subagent_scope(observation.graph_namespace),
                         ),
                     )
             return [
                 _make_fact(
                     ModelCallFact,
                     common,
-                    namespace=observation.namespace,
-                    in_subagent_scope=self._in_subagent_scope(observation.namespace),
+                    graph_namespace=observation.graph_namespace,
+                    in_subagent_scope=self._in_subagent_scope(
+                        observation.graph_namespace
+                    ),
                     phase=observation.phase,
                     call_id=call_id,
                     parent_call_id=(
@@ -963,7 +969,7 @@ class _TracingSession:
         if isinstance(observation, ToolExecutionObservation):
             execution_id = _scope_id(
                 "tool-execution",
-                observation.namespace,
+                observation.graph_namespace,
                 observation.execution_id,
             )
             if observation.phase == "started":
@@ -973,12 +979,12 @@ class _TracingSession:
                     raise TraceCorruption("Tool execution start has no input")
                 if observation.tool_call_id is not None:
                     self._tool_execution_by_call[
-                        (observation.namespace, observation.tool_call_id)
+                        (observation.graph_namespace, observation.tool_call_id)
                     ] = execution_id
                 traced = self._policy.traces_tool(observation.tool_name)
                 if traced and observation.tool_call_id is not None:
                     self._visible_tool_execution_calls.add(
-                        (observation.namespace, observation.tool_call_id)
+                        (observation.graph_namespace, observation.tool_call_id)
                     )
                 parent_call_id = (
                     None
@@ -988,7 +994,7 @@ class _TracingSession:
                 self._tool_executions[execution_id] = _PendingToolExecution(
                     input=observation.input if traced else None,
                     parent_call_id=parent_call_id,
-                    namespace=observation.namespace,
+                    namespace=observation.graph_namespace,
                     agent_name=observation.agent_name,
                     tool_name=observation.tool_name,
                     traced=traced,
@@ -1002,9 +1008,9 @@ class _TracingSession:
                     _make_fact(
                         ToolExecutionFact,
                         common,
-                        namespace=observation.namespace,
+                        graph_namespace=observation.graph_namespace,
                         in_subagent_scope=self._in_subagent_scope(
-                            observation.namespace
+                            observation.graph_namespace
                         ),
                         phase="started",
                         execution_id=execution_id,
@@ -1024,7 +1030,7 @@ class _TracingSession:
             if pending is None:
                 raise TraceCorruption("Tool execution terminal has no matching start")
             if (
-                pending.namespace != observation.namespace
+                pending.namespace != observation.graph_namespace
                 or pending.agent_name != observation.agent_name
                 or pending.tool_name != observation.tool_name
             ):
@@ -1046,8 +1052,10 @@ class _TracingSession:
                 _make_fact(
                     ToolExecutionFact,
                     common,
-                    namespace=observation.namespace,
-                    in_subagent_scope=self._in_subagent_scope(observation.namespace),
+                    graph_namespace=observation.graph_namespace,
+                    in_subagent_scope=self._in_subagent_scope(
+                        observation.graph_namespace
+                    ),
                     phase=observation.phase,
                     execution_id=execution_id,
                     parent_call_id=pending.parent_call_id,
@@ -1081,12 +1089,14 @@ class _TracingSession:
                 _make_fact(
                     ContextContributionFact,
                     common,
-                    namespace=observation.namespace,
-                    in_subagent_scope=self._in_subagent_scope(observation.namespace),
+                    graph_namespace=observation.graph_namespace,
+                    in_subagent_scope=self._in_subagent_scope(
+                        observation.graph_namespace
+                    ),
                     phase=observation.phase,
                     contribution_id=_scope_id(
                         "context",
-                        observation.namespace,
+                        observation.graph_namespace,
                         observation.contribution_id,
                     ),
                     parent_call_id=parent_call_id,
@@ -1170,7 +1180,7 @@ class _TracingSession:
             ]
         if isinstance(observation, NativeTaskObservation):
             self._remember_subagent_descriptors(observation)
-        namespace = observation.namespace
+        namespace = observation.graph_namespace
         facts = self._subagent_start(observation, source_id=source_id)
         if isinstance(observation, NativeMessageObservation):
             facts.extend(self._message_facts(observation, source_id=source_id))
@@ -1185,7 +1195,7 @@ class _TracingSession:
                 _make_fact(
                     NativeExtraFact,
                     common,
-                    namespace=namespace,
+                    graph_namespace=namespace,
                     in_subagent_scope=self._in_subagent_scope(namespace),
                     mode=observation.mode,
                     data_type=observation.data_type,
@@ -1255,7 +1265,7 @@ class _TracingSession:
                 _make_fact(
                     MessageFact,
                     common,
-                    namespace=namespace,
+                    graph_namespace=namespace,
                     in_subagent_scope=in_subagent_scope,
                     phase="completed" if model_completed else terminal_phase,
                     message_id=_scope_id("message", namespace, message_source_id),
@@ -1283,7 +1293,7 @@ class _TracingSession:
                 SubagentFact(
                     source_observation_id=source_id,
                     identity=observation.identity,
-                    namespace=namespace,
+                    graph_namespace=namespace,
                     occurred_at=observation.observed_at,
                     monotonic_ns=observation.monotonic_ns,
                     phase="updated" if waiting else "completed",
@@ -1303,7 +1313,7 @@ class _TracingSession:
                     _make_fact(
                         ToolFact,
                         common,
-                        namespace=namespace,
+                        graph_namespace=namespace,
                         in_subagent_scope=self._in_subagent_scope(namespace),
                         phase=(
                             "cancelled"
@@ -1330,12 +1340,12 @@ class _TracingSession:
     ) -> list[TraceSemanticFact]:
         """Reconcile one explicitly extracted reasoning delta or snapshot."""
 
-        namespace = observation.namespace
+        namespace = observation.graph_namespace
         key = (namespace, observation.message_id)
         common = {
             "source_observation_id": source_id,
             "identity": observation.identity,
-            "namespace": namespace,
+            "graph_namespace": namespace,
             "in_subagent_scope": self._in_subagent_scope(namespace),
             "occurred_at": observation.observed_at,
             "monotonic_ns": observation.monotonic_ns,
@@ -1427,12 +1437,12 @@ class _TracingSession:
             phase=phase,
             reasoning_id=_scope_id(
                 "reasoning",
-                observation.namespace,
+                observation.graph_namespace,
                 observation.message_id,
             ),
             message_id=_scope_id(
                 "message",
-                observation.namespace,
+                observation.graph_namespace,
                 observation.message_id,
             ),
             source_message_id=observation.message_id,
@@ -1455,7 +1465,7 @@ class _TracingSession:
         return _make_fact(
             ReasoningFact,
             common,
-            namespace=namespace,
+            graph_namespace=namespace,
             in_subagent_scope=self._in_subagent_scope(namespace),
             phase="completed",
             reasoning_id=_scope_id("reasoning", namespace, source_message_id),
@@ -1481,18 +1491,18 @@ class _TracingSession:
     ) -> list[TraceSemanticFact]:
         message = observation.message
         if message.message_type == "tool" and message.tool_call_id is not None:
-            tool_key = (observation.namespace, message.tool_call_id)
+            tool_key = (observation.graph_namespace, message.tool_call_id)
             tool_name = self._tool_names.get(tool_key) or message.name or "unknown"
             if not self._policy.traces_tool(tool_name):
                 self._tool_result(
                     message,
-                    namespace=observation.namespace,
+                    namespace=observation.graph_namespace,
                     common={
                         "source_observation_id": source_id,
                         "identity": observation.identity,
-                        "namespace": observation.namespace,
+                        "graph_namespace": observation.graph_namespace,
                         "in_subagent_scope": self._in_subagent_scope(
-                            observation.namespace
+                            observation.graph_namespace
                         ),
                         "occurred_at": observation.observed_at,
                         "monotonic_ns": observation.monotonic_ns,
@@ -1500,15 +1510,17 @@ class _TracingSession:
                 )
                 return []
         message_source_id = message.id or (
-            f"anonymous-{self._message_fingerprint(message, observation.namespace)}"
+            f"anonymous-{self._message_fingerprint(message, observation.graph_namespace)}"
         )
-        message_id = _scope_id("message", observation.namespace, message_source_id)
-        key = (observation.namespace, message_source_id)
+        message_id = _scope_id(
+            "message", observation.graph_namespace, message_source_id
+        )
+        key = (observation.graph_namespace, message_source_id)
         common = {
             "source_observation_id": source_id,
             "identity": observation.identity,
-            "namespace": observation.namespace,
-            "in_subagent_scope": self._in_subagent_scope(observation.namespace),
+            "graph_namespace": observation.graph_namespace,
+            "in_subagent_scope": self._in_subagent_scope(observation.graph_namespace),
             "occurred_at": observation.observed_at,
             "monotonic_ns": observation.monotonic_ns,
         }
@@ -1538,7 +1550,9 @@ class _TracingSession:
                 )
             ]
         if message.message_type == "human":
-            fingerprint = self._message_fingerprint(message, observation.namespace)
+            fingerprint = self._message_fingerprint(
+                message, observation.graph_namespace
+            )
             if (
                 key in self._subagent_task_message_keys
                 and self._message_fingerprints.get(key) == fingerprint
@@ -1546,7 +1560,7 @@ class _TracingSession:
                 return []
             if self._register_subagent_task_message(
                 message,
-                namespace=observation.namespace,
+                namespace=observation.graph_namespace,
                 key=key,
                 fingerprint=fingerprint,
             ):
@@ -1602,7 +1616,7 @@ class _TracingSession:
                 (
                     message.id,
                     message.name,
-                    self._in_subagent_scope(observation.namespace),
+                    self._in_subagent_scope(observation.graph_namespace),
                 ),
             )
         if role == "assistant" and message.content not in ("", []):
@@ -1614,7 +1628,9 @@ class _TracingSession:
             )
         if role == "assistant" and message.message_type != "assistant_chunk":
             captured_content = self._message_content(message)
-            fingerprint = self._message_fingerprint(message, observation.namespace)
+            fingerprint = self._message_fingerprint(
+                message, observation.graph_namespace
+            )
             self._delivered_message_fingerprints[key] = fingerprint
             self._message_completed.add(key)
             self._pending_assistant_messages.pop(key, None)
@@ -1635,7 +1651,7 @@ class _TracingSession:
         facts.extend(
             self._tool_facts(
                 message,
-                namespace=observation.namespace,
+                namespace=observation.graph_namespace,
                 parent_message_id=message_id,
                 common=common,
             )
@@ -1644,7 +1660,7 @@ class _TracingSession:
             facts.extend(
                 self._tool_result(
                     message,
-                    namespace=observation.namespace,
+                    namespace=observation.graph_namespace,
                     common=common,
                 )
             )
@@ -1851,11 +1867,11 @@ class _TracingSession:
         *,
         source_id: str,
     ) -> list[TraceSemanticFact]:
-        namespace = observation.namespace
+        namespace = observation.graph_namespace
         common = {
             "source_observation_id": source_id,
             "identity": observation.identity,
-            "namespace": namespace,
+            "graph_namespace": namespace,
             "in_subagent_scope": self._in_subagent_scope(namespace),
             "occurred_at": observation.observed_at,
             "monotonic_ns": observation.monotonic_ns,
@@ -2151,7 +2167,7 @@ class _TracingSession:
             ),
         ):
             return []
-        namespace = observation.namespace
+        namespace = observation.graph_namespace
         if not namespace:
             return []
         if namespace in self._active_subagents:
@@ -2216,7 +2232,7 @@ class _TracingSession:
             SubagentFact(
                 source_observation_id=source_id,
                 identity=observation.identity,
-                namespace=namespace,
+                graph_namespace=namespace,
                 occurred_at=started_at,
                 monotonic_ns=started_monotonic_ns,
                 phase="started",
@@ -2288,7 +2304,7 @@ class _TracingSession:
             suffix = (
                 f"{observation.task_id}:{index}" if multiple else observation.task_id
             )
-            namespace = (*observation.namespace, f"tools:{suffix}")
+            namespace = (*observation.graph_namespace, f"tools:{suffix}")
             descriptor = _SubagentDescriptor(
                 parent_tool_call_id=tool_call_id,
                 parent_task_id=observation.task_id,
@@ -2313,7 +2329,7 @@ class _TracingSession:
 
         if observation.phase != "result" or observation.interrupts:
             return []
-        parent = observation.namespace
+        parent = observation.graph_namespace
         # LangGraph v2 scopes encode a direct child as ``<node>:<owning-task-id>``.
         # The locked Plan fixture and the parent-task regression test verify this join.
         matches = [
@@ -2339,7 +2355,7 @@ class _TracingSession:
                 SubagentFact(
                     source_observation_id=source_id,
                     identity=observation.identity,
-                    namespace=namespace,
+                    graph_namespace=namespace,
                     occurred_at=observation.observed_at,
                     monotonic_ns=observation.monotonic_ns,
                     phase="completed",
@@ -2763,7 +2779,7 @@ class Tracer:
         self._limits = resolved_limits
         self._write_policy = write_policy or TraceWritePolicy()
         self._projections = _projection_registry(projections)
-        self._sessions: dict[str, set[_TracingSession]] = {}
+        self._sessions: dict[tuple[str, str], set[_TracingSession]] = {}
 
     @property
     def store(self) -> TraceStore:
@@ -2797,8 +2813,17 @@ class Tracer:
         if not isinstance(writer, TraceWriter):
             raise TraceStoreProtocolError("Trace Store returned an invalid writer")
         try:
+            if (
+                not isinstance(writer.key, TraceThreadKey)
+                or _thread_scope(writer.key) != _thread_scope(context.identity)
+                or writer.run_id != context.identity.run_id
+            ):
+                raise TraceStoreProtocolError("Trace writer belongs to another Run")
             snapshot = await self._store.snapshot_key(writer.key)
-            if not isinstance(snapshot, StoreThreadSnapshot):
+            if (
+                not isinstance(snapshot, StoreThreadSnapshot)
+                or snapshot.key != writer.key
+            ):
                 raise TraceStoreProtocolError(
                     "Trace Store returned an invalid thread snapshot"
                 )
@@ -2829,21 +2854,28 @@ class Tracer:
                 on_closed=self._session_closed,
                 prior_events=prior_events,
             )
-            self._sessions.setdefault(context.identity.thread_id, set()).add(session)
+            self._sessions.setdefault(_thread_scope(context.identity), set()).add(
+                session
+            )
             return session
         except BaseException as error:
             try:
-                await writer.aclose()
-            except BaseException as close_error:  # noqa: BLE001 - preserve primary error
-                error.add_note(
-                    "Trace writer cleanup failed: "
-                    f"{type(close_error).__module__}.{type(close_error).__qualname__}"
+                # The Tracer owns rejected startup even when a custom writer does
+                # not protect its cleanup. Repeated cancellation waits for this
+                # close; capture keeps process control in the calling owner.
+                cleanup = asyncio.create_task(
+                    capture(writer.aclose()), name="tinkerfin-trace-open-cleanup"
                 )
+                await join_owned_task(cleanup, cancel_operation=False)
+            except BaseException as close_error:  # noqa: BLE001 - preserve primary error
+                # Rejected startup must retain cleanup evidence as well as the
+                # invalid scope. Control and cancellation keep their precedence.
+                raise select_failure(error, close_error)
             raise
 
     async def get(
         self,
-        thread_id: str,
+        identity: ThreadIdentity,
         *,
         head_run_id: str | None = None,
         limit: int = 100,
@@ -2857,7 +2889,7 @@ class Tracer:
         prefix; it never admits facts committed after that boundary.
 
         Args:
-            thread_id: Canonical Trace thread identity.
+            identity: Namespace and thread to read, usually from ``runtime.thread_identity``.
             head_run_id: Optional explicit branch head.
             limit: Positive number of latest Turns in the initial window.
             history_cursor: Optional opaque cursor from the same fixed prefix.
@@ -2867,7 +2899,8 @@ class Tracer:
             Immutable Trace view with bounded history and a closeable follow iterator.
 
         Raises:
-            ValueError: Identity, limit, cursor, or Projection names are invalid.
+            TypeError: ``identity`` is not a ThreadIdentity.
+            ValueError: Limit, cursor, or Projection names are invalid.
             TraceThreadNotFound: The thread or cursor generation is unavailable.
             TraceRunNotFound: The explicitly selected Run has not entered the generation.
             AmbiguousTraceHead: Multiple heads exist without an explicit selection.
@@ -2875,12 +2908,8 @@ class Tracer:
             TraceProjectionFailed: A requested business Projection cannot be evaluated.
         """
 
-        if (
-            not isinstance(thread_id, str)
-            or not thread_id
-            or thread_id != thread_id.strip()
-        ):
-            raise ValueError("thread_id must be canonical non-empty text")
+        if not isinstance(identity, ThreadIdentity):
+            raise TypeError("identity must be a ThreadIdentity")
         if head_run_id is not None and (
             not isinstance(head_run_id, str)
             or not head_run_id
@@ -2898,17 +2927,19 @@ class Tracer:
             not isinstance(history_cursor, str) or not history_cursor
         ):
             raise ValueError("history_cursor must be non-empty text or None")
-        sessions = tuple(self._sessions.get(thread_id, ()))
+        sessions = tuple(self._sessions.get(_thread_scope(identity), ()))
         if sessions:
             await asyncio.gather(*(session.flush() for session in sessions))
         snapshot, resolved_head, resolved_limit = await resolve_history_request(
             self._store,
-            thread_id=thread_id,
+            identity=identity,
             head_run_id=head_run_id,
             history_cursor=history_cursor,
             limit=limit,
         )
-        if not isinstance(snapshot, StoreThreadSnapshot):
+        if not isinstance(snapshot, StoreThreadSnapshot) or _thread_scope(
+            snapshot.key
+        ) != _thread_scope(identity):
             raise TraceStoreProtocolError(
                 "Trace Store returned an invalid thread snapshot"
             )
@@ -2924,21 +2955,35 @@ class Tracer:
 
     async def query(
         self,
-        thread_id: str,
+        identity: ThreadIdentity,
         *,
         where: TraceGraphFilter | None = None,
         head_run_id: str | None = None,
         cursor: str | None = None,
         limit: int = 100,
     ) -> TraceGraphQuery:
-        """Return one directly filtered canonical Graph page."""
+        """Read the current execution graph for one namespaced conversation.
 
-        if (
-            not isinstance(thread_id, str)
-            or not thread_id
-            or thread_id != thread_id.strip()
-        ):
-            raise ValueError("thread_id must be canonical non-empty text")
+        Args:
+            identity: Complete namespace and thread identity.
+            where: Optional filters for nodes and retained public content.
+            head_run_id: Branch head, required when the conversation has several heads.
+            cursor: Cursor for the same generation, branch, filter, and current tail.
+            limit: Maximum direct matches, before their owning subagents are included.
+
+        Returns:
+            Graph page with a closeable follow iterator on its current first page.
+
+        Raises:
+            TypeError: Identity or filter has the wrong public type.
+            ValueError: Head or page limit is invalid.
+            InvalidTraceCursor: The cursor no longer names this query's current tail.
+            TraceStoreError: The graph cannot be read consistently in its namespace.
+            TraceQuotaExceeded: Search or graph expansion exceeds the query budget.
+        """
+
+        if not isinstance(identity, ThreadIdentity):
+            raise TypeError("identity must be a ThreadIdentity")
         if head_run_id is not None and (
             not isinstance(head_run_id, str)
             or not head_run_id
@@ -2958,7 +3003,7 @@ class Tracer:
             raise TypeError("where must be a TraceGraphFilter or None")
         resolved_filter = where or TraceGraphFilter()
         page, key = await self._query_graph_page(
-            thread_id,
+            identity,
             where=resolved_filter,
             head_run_id=head_run_id,
             cursor=cursor,
@@ -2968,7 +3013,7 @@ class Tracer:
 
         async def refresh() -> TraceGraphPage:
             refreshed, _key = await self._query_graph_page(
-                thread_id,
+                identity,
                 where=resolved_filter,
                 head_run_id=head_run_id,
                 cursor=None,
@@ -2986,27 +3031,40 @@ class Tracer:
             max_page_bytes=self._graph_query_limits.max_page_bytes,
         )
 
-    async def rebuild_graph(self, thread_id: str) -> int:
-        """Reconstruct current Graph nodes without changing authoritative facts."""
+    async def rebuild_graph(self, identity: ThreadIdentity) -> int:
+        """Rebuild one conversation's execution graph from its retained facts.
 
-        if (
-            not isinstance(thread_id, str)
-            or not thread_id
-            or thread_id != thread_id.strip()
-        ):
-            raise ValueError("thread_id must be canonical non-empty text")
-        sessions = tuple(self._sessions.get(thread_id, ()))
+        Args:
+            identity: Complete namespace and thread identity to rebuild.
+
+        Returns:
+            Number of reconstructed graph nodes.
+
+        Raises:
+            TypeError: ``identity`` is not a ThreadIdentity.
+            TraceThreadNotFound: No current generation exists for the identity.
+            TraceStoreError: Storage cannot rebuild or the history changes during it.
+        """
+
+        if not isinstance(identity, ThreadIdentity):
+            raise TypeError("identity must be a ThreadIdentity")
+        sessions = tuple(self._sessions.get(_thread_scope(identity), ()))
         if sessions:
             await asyncio.gather(*(session.flush() for session in sessions))
         store = self._store
-        if not isinstance(store, TraceGraphRebuildStore):
+        if (
+            not isinstance(store, TraceGraphRebuildStore)
+            or not store.supports_graph_rebuild
+        ):
             raise TraceStoreProtocolError("Trace Store does not rebuild Graph nodes")
-        snapshot = await store.snapshot(thread_id)
+        snapshot = await store.snapshot(identity)
+        if _thread_scope(snapshot.key) != _thread_scope(identity):
+            raise TraceStoreProtocolError("Trace snapshot belongs to another thread")
         return await store.rebuild_trace_graph(snapshot.key)
 
     async def _query_graph_page(
         self,
-        thread_id: str,
+        identity: ThreadIdentity,
         *,
         where: TraceGraphFilter,
         head_run_id: str | None,
@@ -3014,16 +3072,20 @@ class Tracer:
         limit: int,
         expected_key: TraceThreadKey | None,
     ) -> tuple[TraceGraphPage, TraceThreadKey]:
-        sessions = tuple(self._sessions.get(thread_id, ()))
+        sessions = tuple(self._sessions.get(_thread_scope(identity), ()))
         if sessions:
             await asyncio.gather(*(session.flush() for session in sessions))
         store = self._store
-        if not isinstance(store, TraceGraphStore):
+        if not isinstance(store, TraceGraphStore) or not store.supports_graph_queries:
             raise TraceStoreProtocolError(
                 "Trace Store does not provide indexed Graph queries"
             )
         for _attempt in range(_GRAPH_QUERY_STABILITY_ATTEMPTS):
-            snapshot = await store.snapshot(thread_id)
+            snapshot = await store.snapshot(identity)
+            if _thread_scope(snapshot.key) != _thread_scope(identity):
+                raise TraceStoreProtocolError(
+                    "Trace snapshot belongs to another thread"
+                )
             if expected_key is not None and snapshot.key != expected_key:
                 raise TraceStoreProtocolError(
                     "Trace Graph follow generation changed during the query"
@@ -3127,13 +3189,17 @@ class Tracer:
     def _session_closed(self, session: _TracingSession) -> None:
         """Remove one settled session from same-Tracer read-your-writes flushing."""
 
-        thread_id = session._context.identity.thread_id
-        sessions = self._sessions.get(thread_id)
+        scope = _thread_scope(session._context.identity)
+        sessions = self._sessions.get(scope)
         if sessions is None:
             return
         sessions.discard(session)
         if not sessions:
-            self._sessions.pop(thread_id, None)
+            self._sessions.pop(scope, None)
+
+
+def _thread_scope(identity: ThreadIdentity) -> tuple[str, str]:
+    return identity.namespace, identity.thread_id
 
 
 def _projection_registry(

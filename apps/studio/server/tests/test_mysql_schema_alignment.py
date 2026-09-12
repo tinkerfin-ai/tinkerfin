@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from langgraph.store.mysql.asyncmy import AsyncMyStore
+from tinkerfin_langgraph_store import SqlAlchemyStore
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
 from tinkerfin_studio.attachments.entity import AttachmentFile
 from tinkerfin_studio.auth.models import User
@@ -39,7 +39,10 @@ _EXPECTED_TABLES = frozenset(
         "conversation_threads",
         "conversation_run_registrations",
         "conversation_interrupt_claims",
-        "store",
+        "tinkerfin_store_namespaces",
+        "tinkerfin_store_paths",
+        "tinkerfin_store_documents",
+        "tinkerfin_store_fields",
         "tinkerfin_opensandbox_owners",
         "tinkerfin_opensandbox_workers",
         "tinkerfin_opensandbox_warm_slots",
@@ -251,20 +254,17 @@ async def _execute_ddl(engine: AsyncEngine, ddl: str) -> None:
             await connection.exec_driver_sql(statement)
 
 
-async def _create_runtime_schema(engine: AsyncEngine, database_url: URL) -> None:
+async def _create_runtime_schema(engine: AsyncEngine) -> None:
     assert {model.__tablename__ for model in _BUSINESS_MODELS} == set(
         Base.metadata.tables
     )
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
-    store_url = database_url.set(drivername="mysql").render_as_string(
-        hide_password=False
-    )
-    async with AsyncMyStore.from_conn_string(store_url) as store:
-        await store.setup()
+    async with SqlAlchemyStore(engine):
+        pass
     sandbox_schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
     await _execute_ddl(engine, sandbox_schema.ddl)
-    await SqlAlchemyTraceStore(engine, namespace="tinkerfin-studio").setup()
+    await SqlAlchemyTraceStore(engine).setup()
 
 
 async def _create_database(admin_engine: AsyncEngine, database_name: str) -> None:
@@ -317,8 +317,8 @@ async def test_business_sql_and_framework_setups_compose_the_current_mysql_schem
             business_schema = await connection.run_sync(_reflect_schema)
         assert set(business_schema.tables) == _BUSINESS_TABLES
 
-        await _create_runtime_schema(sql_engine, sql_url)
-        await _create_runtime_schema(runtime_engine, runtime_url)
+        await _create_runtime_schema(sql_engine)
+        await _create_runtime_schema(runtime_engine)
 
         async with sql_engine.connect() as connection:
             sql_schema = await connection.run_sync(_reflect_schema)
@@ -347,12 +347,12 @@ async def test_business_sql_and_framework_setups_compose_the_current_mysql_schem
             for table_name in _BUSINESS_TABLES
         }
         assert (
-            sql_schema.table_comments["store"]
-            == (runtime_schema.table_comments["store"])
+            sql_schema.table_comments["tinkerfin_store_documents"]
+            == (runtime_schema.table_comments["tinkerfin_store_documents"])
         )
         assert (
-            sql_schema.column_comments["store"]
-            == (runtime_schema.column_comments["store"])
+            sql_schema.column_comments["tinkerfin_store_documents"]
+            == (runtime_schema.column_comments["tinkerfin_store_documents"])
         )
         assert all(not table.foreign_keys for table in sql_schema.tables.values())
         assert all(not table.foreign_keys for table in runtime_schema.tables.values())

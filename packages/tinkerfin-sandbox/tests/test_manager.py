@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import unittest
@@ -22,6 +23,8 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langgraph.store.memory import InMemoryStore
 from opensandbox.config import ConnectionConfig
+from sqlalchemy.ext.asyncio import AsyncEngine
+from tests.support.sql_engines import SqlEngineFactory
 
 import tinkerfin_sandbox
 from tinkerfin_sandbox import (
@@ -61,6 +64,16 @@ from tinkerfin_sandbox import (
     UnexpectedOpenSandboxStateError,
 )
 from tinkerfin_sandbox.backends import _rooted_protocol
+
+
+def _resource_key(value: str, namespace: str | None = None) -> str:
+    """Encode the current persisted manager identity for fixture setup and checks."""
+    return json.dumps(
+        {"namespace": namespace, "key": value},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
 
 
 def _key(value: str) -> str:
@@ -400,8 +413,8 @@ class _LeakingState(_FakeState):
 class _CleanupObservedSQLState(SQLAlchemyOpenSandboxState):
     """Expose cleanup submission so tests do not depend on loop scheduling."""
 
-    def __init__(self, *, url: str, namespace: str) -> None:
-        super().__init__(url=url, namespace=namespace)
+    def __init__(self, *, engine: AsyncEngine, namespace: str) -> None:
+        super().__init__(engine=engine, namespace=namespace)
         self.cleanup_completed = asyncio.Event()
 
     async def complete_cleanup(self, claim: OpenSandboxCleanupClaim) -> None:
@@ -415,9 +428,12 @@ _SQL_CLAIM_TEST_TTL = 1.0
 class _RenewalObservedSQLState(SQLAlchemyOpenSandboxState):
     """Observe successful public claim renewals while retaining real SQL fencing."""
 
-    def __init__(self, *, url: str) -> None:
+    def __init__(self, *, engine: AsyncEngine) -> None:
         super().__init__(
-            url=url, namespace="test", lease_ttl=_SQL_CLAIM_TEST_TTL, poll_interval=0.01
+            engine=engine,
+            namespace="test",
+            lease_ttl=_SQL_CLAIM_TEST_TTL,
+            poll_interval=0.01,
         )
         self.renewed = asyncio.Event()
 
@@ -913,7 +929,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         first_handle, second_handle = await asyncio.gather(first, second)
 
         self.assertIs(first_handle, second_handle)
-        self.assertEqual(store.save_calls, [("user-1", "sandbox-1")])
+        self.assertEqual(store.save_calls, [(_resource_key("user-1"), "sandbox-1")])
 
     async def test_different_owners_can_create_sandboxes_concurrently(self) -> None:
         client = _FakeClient()
@@ -948,13 +964,13 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, other)
         self.assertEqual(client.create_calls, 1)
-        self.assertEqual(store.save_calls, [("global", "sandbox-1")])
+        self.assertEqual(store.save_calls, [(_resource_key("global"), "sandbox-1")])
 
     async def test_store_recovery_takes_priority_over_warm_sandbox(self) -> None:
         client = _FakeClient()
         restored = _FakeBackend("persisted-id")
         client.connected[restored.id] = restored
-        store = _FakeState({"user-1": restored.id})
+        store = _FakeState({_resource_key("user-1"): restored.id})
         manager = await self._manager(client, store, warm_pool_size=1)
 
         handle = await manager.get(_key("user-1"))
@@ -973,9 +989,9 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         await _eventually(lambda: client.create_calls == 2)
 
         self.assertEqual(handle.id, "sandbox-1")
-        self.assertEqual(store.consume_calls, [("user-1", "sandbox-1")])
+        self.assertEqual(store.consume_calls, [(_resource_key("user-1"), "sandbox-1")])
         self.assertEqual(store.save_calls, [])
-        self.assertEqual(store.bindings, {"user-1": "sandbox-1"})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): "sandbox-1"})
         self.assertEqual(
             [backend.id for backend in client.backends],
             [
@@ -998,7 +1014,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.backends[0].execute_calls, [("echo ok", None)])
         self.assertIn("sandbox-1", client.destroy_calls)
         self.assertEqual(client.backends[0].close_calls, 1)
-        self.assertNotIn(("user-1", "sandbox-1"), store.save_calls)
+        self.assertNotIn((_resource_key("user-1"), "sandbox-1"), store.save_calls)
 
     async def test_cached_healthy_sandbox_is_reused_and_renewed(self) -> None:
         client = _FakeClient()
@@ -1043,13 +1059,13 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(recreated, handle)
         self.assertEqual(recreated.id, "sandbox-2")
         self.assertEqual(client.destroy_calls, ["sandbox-1"])
-        self.assertEqual(store.bindings, {"user-1": "sandbox-2"})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): "sandbox-2"})
 
     async def test_unhealthy_persisted_binding_is_replaced(self) -> None:
         restored = _FakeBackend("persisted-id", healthy=False)
         client = _FakeClient()
         client.connected[restored.id] = restored
-        store = _FakeState({"user-1": restored.id})
+        store = _FakeState({_resource_key("user-1"): restored.id})
         manager = await self._manager(
             client,
             store,
@@ -1064,7 +1080,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.connect_calls, [restored.id])
         self.assertEqual(restored.close_calls, 1)
         self.assertEqual(client.destroy_calls, [restored.id])
-        self.assertEqual(store.bindings, {"user-1": handle.id})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): handle.id})
 
     async def test_unhealthy_sandbox_is_hot_replaced_on_stable_handle(self) -> None:
         client = _FakeClient()
@@ -1088,7 +1104,10 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_backend.close_calls, 1)
         self.assertEqual(
             store.save_calls,
-            [("user-1", "sandbox-1"), ("user-1", "sandbox-2")],
+            [
+                (_resource_key("user-1"), "sandbox-1"),
+                (_resource_key("user-1"), "sandbox-2"),
+            ],
         )
 
     async def test_hot_replacement_waits_for_in_flight_backend_call(self) -> None:
@@ -1165,7 +1184,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         manager._cleanup_tasks.add(stale_cleanup_task)
         await manager.aclose()
 
-        self.assertEqual(store.bindings, {"user-1": "sandbox-2"})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): "sandbox-2"})
         self.assertEqual(client.destroy_calls, ["sandbox-1"])
         self.assertEqual(old_backend.close_calls, 1)
         self.assertEqual(client.backends[1].close_calls, 1)
@@ -1196,9 +1215,9 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         handle = await manager.get(_key("user-1"))
 
         self.assertEqual(handle.id, "sandbox-1")
-        self.assertEqual(store.consume_calls, [("user-1", "sandbox-1")])
+        self.assertEqual(store.consume_calls, [(_resource_key("user-1"), "sandbox-1")])
         self.assertEqual(store.save_calls, [])
-        self.assertEqual(store.bindings, {"user-1": "sandbox-1"})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): "sandbox-1"})
         self.assertEqual(client.destroy_calls, [])
         self.assertEqual(client.backends[0].close_calls, 0)
 
@@ -1215,7 +1234,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         same_handle = await manager.get(_key("user-1"))
 
         self.assertIs(same_handle, handle)
-        self.assertEqual(store.bindings, {"user-1": "sandbox-1"})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): "sandbox-1"})
         self.assertEqual(client.create_calls, 1)
         self.assertEqual(client.destroy_calls, [])
         self.assertEqual(client.backends[0].close_calls, 0)
@@ -1231,19 +1250,19 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.destroy_calls, [backend.id])
         self.assertEqual(backend.close_calls, 1)
-        self.assertEqual(store.delete_calls, ["user-1"])
-        self.assertNotIn("user-1", store.bindings)
+        self.assertEqual(store.delete_calls, [_resource_key("user-1")])
+        self.assertNotIn(_resource_key("user-1"), store.bindings)
 
     async def test_delete_uses_store_binding_without_connecting(self) -> None:
         client = _FakeClient()
-        store = _FakeState({"user-1": "persisted-id"})
+        store = _FakeState({_resource_key("user-1"): "persisted-id"})
         manager = await self._manager(client, store)
 
         await manager.delete(_key("user-1"))
 
         self.assertEqual(client.destroy_calls, ["persisted-id"])
         self.assertEqual(client.connect_calls, [])
-        self.assertEqual(store.delete_calls, ["user-1"])
+        self.assertEqual(store.delete_calls, [_resource_key("user-1")])
 
     async def test_delete_failure_keeps_binding_and_can_be_retried(self) -> None:
         client = _FakeClient()
@@ -1256,7 +1275,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
             await manager.delete(_key("user-1"))
 
         self.assertIsInstance(context.exception.__cause__, RuntimeError)
-        self.assertEqual(store.bindings, {"user-1": handle.id})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): handle.id})
         self.assertEqual(store.delete_calls, [])
         self.assertEqual(client.backends[0].close_calls, 1)
 
@@ -1338,7 +1357,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(bound_backend.id, client.destroy_calls)
         self.assertEqual(warm_backend.close_calls, 1)
         self.assertNotIn(warm_backend.id, client.destroy_calls)
-        self.assertEqual(store.bindings, {"user-1": bound_backend.id})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): bound_backend.id})
         self.assertEqual(store.delete_calls, [])
 
     async def test_aclose_waits_for_in_flight_get_and_closes_its_backend(self) -> None:
@@ -1357,7 +1376,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         handle = await get_task
         await close_task
 
-        self.assertEqual(store.bindings, {"user-1": handle.id})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): handle.id})
         self.assertEqual(client.backends[0].close_calls, 1)
         self.assertEqual(client.destroy_calls, [])
 
@@ -1419,7 +1438,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
 
         await manager.aclose()
 
-        self.assertEqual(store.bindings, {"user-1": backend.id})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): backend.id})
         self.assertEqual(client.destroy_calls, [])
         self.assertEqual(backend.close_calls, 1)
 
@@ -1430,7 +1449,7 @@ class OpenSandboxManagerTest(unittest.IsolatedAsyncioTestCase):
         client.connected[restored.id] = restored
         manager = await self._manager(
             client,
-            _FakeState({"user-1": restored.id}),
+            _FakeState({_resource_key("user-1"): restored.id}),
         )
 
         get_task = asyncio.create_task(manager.get(_key("user-1")))
@@ -1477,7 +1496,7 @@ class OpenSandboxDetailsTest(unittest.IsolatedAsyncioTestCase):
         details = await manager.get_details(_key("user-1"))
 
         self.assertIsNone(details)
-        self.assertEqual(store.get_calls, ["user-1"])
+        self.assertEqual(store.get_calls, [_resource_key("user-1")])
         self.assertEqual(client.create_calls, 0)
         self.assertEqual(client.connect_calls, [])
         self.assertEqual(client.inspect_calls, [])
@@ -1527,7 +1546,7 @@ class OpenSandboxDetailsTest(unittest.IsolatedAsyncioTestCase):
         info = _runtime_info("persisted-id")
         client = _FakeClient()
         client.inspection_results[info.sandbox_id] = info
-        store = _FakeState({"user-1": info.sandbox_id})
+        store = _FakeState({_resource_key("user-1"): info.sandbox_id})
         manager = await self._manager(client, store)
 
         first = await manager.get_details(_key("user-1"))
@@ -1543,7 +1562,7 @@ class OpenSandboxDetailsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.create_calls, 0)
         self.assertEqual(client.connect_calls, [])
         self.assertEqual(store.save_calls, [])
-        self.assertEqual(store.bindings, {"user-1": info.sandbox_id})
+        self.assertEqual(store.bindings, {_resource_key("user-1"): info.sandbox_id})
 
     async def test_unavailable_store_details_remain_read_only(self) -> None:
         for reason in ("not_found", "unreachable"):
@@ -1556,7 +1575,7 @@ class OpenSandboxDetailsTest(unittest.IsolatedAsyncioTestCase):
                 )
                 client = _FakeClient()
                 client.inspection_results[info.sandbox_id] = info
-                store = _FakeState({"user-1": info.sandbox_id})
+                store = _FakeState({_resource_key("user-1"): info.sandbox_id})
                 manager = await self._manager(client, store)
 
                 first = await manager.get_details(_key("user-1"))
@@ -1786,7 +1805,7 @@ async def test_default_recovery_preserves_an_unhealthy_user_instance(
         with pytest.raises(OpenSandboxBackendUnavailableError):
             await manager.get("owner")
         assert handle.id == backend.id
-        assert state.bindings == {"owner": backend.id}
+        assert state.bindings == {_resource_key("owner"): backend.id}
         assert client.create_calls == 1
         assert client.destroy_calls == []
         assert backend.kill_calls == 0
@@ -2158,6 +2177,7 @@ async def test_strict_startup_replaces_a_published_but_missing_warm_sandbox() ->
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ttl", (timedelta(hours=2), None))
 async def test_sql_state_restart_reuses_verified_warm_capacity(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
     ttl: timedelta | None,
 ) -> None:
@@ -2168,7 +2188,9 @@ async def test_sql_state_restart_reuses_verified_warm_capacity(
     first_client.config = first_client.config.model_copy(update={"ttl": ttl})
     first = _new_manager(
         client=first_client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="warm-restart"),
+        state=SQLAlchemyOpenSandboxState(
+            engine=sql_engine(url), namespace="warm-restart"
+        ),
         warm_pool_size=1,
         fail_on_startup_warmup_error=True,
     )
@@ -2183,7 +2205,9 @@ async def test_sql_state_restart_reuses_verified_warm_capacity(
     second_client.connected[warm_id] = second_backend
     second = _new_manager(
         client=second_client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="warm-restart"),
+        state=SQLAlchemyOpenSandboxState(
+            engine=sql_engine(url), namespace="warm-restart"
+        ),
         warm_pool_size=1,
         fail_on_startup_warmup_error=True,
     )
@@ -2518,13 +2542,14 @@ async def test_healthy_warm_probe_keeps_published_capacity_ready() -> None:
 
 @pytest.mark.asyncio
 async def test_shared_readiness_distinguishes_verification_from_consumption(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     """A worker must observe shared capacity without treating claims as failures."""
 
     url = f"sqlite+aiosqlite:///{tmp_path / 'readiness.db'}"
-    state = SQLAlchemyOpenSandboxState(url=url, namespace="readiness")
-    peer = SQLAlchemyOpenSandboxState(url=url, namespace="readiness")
+    state = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="readiness")
+    peer = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="readiness")
     manager = _new_manager(client=_FakeClient(), state=state, warm_pool_size=1)
     await manager.start()
     await peer.start(warm_pool_size=1)
@@ -2947,7 +2972,7 @@ async def test_repeated_cancellation_cannot_interrupt_owner_claim_release() -> N
             await operation
         assert not state.release_cancelled.is_set()
         successor = await asyncio.wait_for(
-            state.acquire_owner("owner-1"),
+            state.acquire_owner(_resource_key("owner-1")),
             timeout=0.2,
         )
     finally:
@@ -3074,17 +3099,19 @@ async def test_manager_tags_on_demand_create_with_hashed_owner() -> None:
     assert "agent-b" not in owner_label
 
 
-async def test_sql_states_share_one_global_warm_pool(tmp_path: Path) -> None:
+async def test_sql_states_share_one_global_warm_pool(
+    sql_engine: SqlEngineFactory, tmp_path: Path
+) -> None:
     client = _ReconnectableFakeClient()
     url = f"sqlite+aiosqlite:///{tmp_path / 'manager-state.db'}"
     first_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="test"),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="test"),
         warm_pool_size=1,
     )
     second_manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="test"),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="test"),
         warm_pool_size=1,
     )
     await asyncio.gather(first_manager.start(), second_manager.start())
@@ -3103,6 +3130,7 @@ async def test_sql_states_share_one_global_warm_pool(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ttl", (timedelta(hours=2), None))
 async def test_manager_renews_sql_owner_claim_during_slow_create(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
     ttl: timedelta | None,
 ) -> None:
@@ -3110,7 +3138,7 @@ async def test_manager_renews_sql_owner_claim_during_slow_create(
     client.config = client.config.model_copy(update={"ttl": ttl})
     client.create_gate = asyncio.Event()
     url = f"sqlite+aiosqlite:///{tmp_path / 'owner-renewal.db'}"
-    first_state = _RenewalObservedSQLState(url=url)
+    first_state = _RenewalObservedSQLState(engine=sql_engine(url))
     first_manager = _new_manager(
         client=client,
         state=first_state,
@@ -3118,7 +3146,7 @@ async def test_manager_renews_sql_owner_claim_during_slow_create(
     )
     second_manager = _new_manager(
         client=client,
-        state=_RenewalObservedSQLState(url=url),
+        state=_RenewalObservedSQLState(engine=sql_engine(url)),
         warm_pool_size=0,
     )
     await asyncio.gather(first_manager.start(), second_manager.start())
@@ -3142,6 +3170,7 @@ async def test_manager_renews_sql_owner_claim_during_slow_create(
 
 @pytest.mark.asyncio
 async def test_manager_renews_sql_warm_claim_during_slow_create(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     client = _ReconnectableFakeClient()
@@ -3149,14 +3178,14 @@ async def test_manager_renews_sql_warm_claim_during_slow_create(
     # A duplicate creation must reach the count assertion instead of waiting on the gate.
     client.release_after_create_count = 2
     url = f"sqlite+aiosqlite:///{tmp_path / 'warm-renewal.db'}"
-    first_state = _RenewalObservedSQLState(url=url)
+    first_state = _RenewalObservedSQLState(engine=sql_engine(url))
     first_manager = _new_manager(
         client=client,
         state=first_state,
         warm_pool_size=1,
         fail_on_startup_warmup_error=True,
     )
-    second_state = _RenewalObservedSQLState(url=url)
+    second_state = _RenewalObservedSQLState(engine=sql_engine(url))
     second_manager = _new_manager(
         client=client,
         state=second_state,
@@ -3180,9 +3209,11 @@ async def test_manager_renews_sql_warm_claim_during_slow_create(
 
 
 @pytest.mark.asyncio
-async def test_manager_drains_durable_cleanup_queue_on_start(tmp_path: Path) -> None:
+async def test_manager_drains_durable_cleanup_queue_on_start(
+    sql_engine: SqlEngineFactory, tmp_path: Path
+) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-start.db'}"
-    seeded_state = SQLAlchemyOpenSandboxState(url=url, namespace="test")
+    seeded_state = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="test")
     await seeded_state.start(warm_pool_size=0)
     await seeded_state.enqueue_cleanup("orphan-sandbox")
     await seeded_state.aclose()
@@ -3190,14 +3221,16 @@ async def test_manager_drains_durable_cleanup_queue_on_start(tmp_path: Path) -> 
     client = _FakeClient()
     manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="test"),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="test"),
         warm_pool_size=0,
     )
     await manager.start()
     await manager.aclose()
 
     assert client.destroy_calls == ["orphan-sandbox"]
-    checking_state = SQLAlchemyOpenSandboxState(url=url, namespace="test")
+    checking_state = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(url), namespace="test"
+    )
     await checking_state.start(warm_pool_size=0)
     try:
         assert await checking_state.claim_cleanup() is None
@@ -3206,12 +3239,14 @@ async def test_manager_drains_durable_cleanup_queue_on_start(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_manager_persists_failed_replacement_cleanup(tmp_path: Path) -> None:
+async def test_manager_persists_failed_replacement_cleanup(
+    sql_engine: SqlEngineFactory, tmp_path: Path
+) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-replacement.db'}"
     client = _ReconnectableFakeClient()
     manager = _new_manager(
         client=client,
-        state=SQLAlchemyOpenSandboxState(url=url, namespace="test"),
+        state=SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="test"),
         warm_pool_size=0,
         recovery_policy=OpenSandboxRecoveryPolicy(
             max_attempts=1, on_failure="recreate"
@@ -3227,7 +3262,9 @@ async def test_manager_persists_failed_replacement_cleanup(tmp_path: Path) -> No
     await manager.aclose()
 
     assert replacement.id == "sandbox-2"
-    checking_state = SQLAlchemyOpenSandboxState(url=url, namespace="test")
+    checking_state = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(url), namespace="test"
+    )
     await checking_state.start(warm_pool_size=0)
     try:
         cleanup = await checking_state.claim_cleanup()
@@ -3239,10 +3276,12 @@ async def test_manager_persists_failed_replacement_cleanup(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_manager_retries_persisted_cleanup_in_background(tmp_path: Path) -> None:
+async def test_manager_retries_persisted_cleanup_in_background(
+    sql_engine: SqlEngineFactory, tmp_path: Path
+) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-background.db'}"
     client = _ReconnectableFakeClient()
-    state = _CleanupObservedSQLState(url=url, namespace="test")
+    state = _CleanupObservedSQLState(engine=sql_engine(url), namespace="test")
     manager = _new_manager(
         client=client,
         state=state,
@@ -3267,7 +3306,9 @@ async def test_manager_retries_persisted_cleanup_in_background(tmp_path: Path) -
     finally:
         await manager.aclose()
 
-    checking_state = SQLAlchemyOpenSandboxState(url=url, namespace="test")
+    checking_state = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(url), namespace="test"
+    )
     await checking_state.start(warm_pool_size=0)
     try:
         assert await checking_state.claim_cleanup() is None
@@ -3278,17 +3319,18 @@ async def test_manager_retries_persisted_cleanup_in_background(tmp_path: Path) -
 
 @pytest.mark.asyncio
 async def test_manager_renews_sql_cleanup_claim_during_slow_destroy(
+    sql_engine: SqlEngineFactory,
     tmp_path: Path,
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path / 'cleanup-renewal.db'}"
-    seeded_state = SQLAlchemyOpenSandboxState(url=url, namespace="test")
+    seeded_state = SQLAlchemyOpenSandboxState(engine=sql_engine(url), namespace="test")
     await seeded_state.start(warm_pool_size=0)
     await seeded_state.enqueue_cleanup("orphan-sandbox")
     await seeded_state.aclose()
 
     client = _FakeClient()
     client.destroy_gate = asyncio.Event()
-    first_state = _RenewalObservedSQLState(url=url)
+    first_state = _RenewalObservedSQLState(engine=sql_engine(url))
     first_manager = _new_manager(
         client=client,
         state=first_state,
@@ -3296,7 +3338,7 @@ async def test_manager_renews_sql_cleanup_claim_during_slow_destroy(
     )
     second_manager = _new_manager(
         client=client,
-        state=_RenewalObservedSQLState(url=url),
+        state=_RenewalObservedSQLState(engine=sql_engine(url)),
         warm_pool_size=0,
     )
     first_start = asyncio.create_task(first_manager.start())
@@ -3333,7 +3375,7 @@ async def test_state_get_adopts_authoritative_binding_change() -> None:
         old_backend = client.backends[0]
         authoritative = _FakeBackend("sandbox-external")
         client.connected[authoritative.id] = authoritative
-        store.bindings["user-1"] = authoritative.id
+        store.bindings[_resource_key("user-1")] = authoritative.id
 
         refreshed = await manager.get(_key("user-1"))
 
@@ -3361,7 +3403,7 @@ async def test_state_recreate_preserves_remote_without_authoritative_ownership()
     await manager.start()
     try:
         handle = await manager.get(_key("user-1"))
-        store.bindings["user-1"] = "sandbox-external"
+        store.bindings[_resource_key("user-1")] = "sandbox-external"
 
         recreated = await manager.recreate(_key("user-1"))
 
@@ -3395,7 +3437,7 @@ async def test_cancelled_recreate_tracks_distinct_authoritative_old_id() -> None
             asyncio.to_thread(handle.execute, "long-running")
         )
         assert await asyncio.to_thread(old_backend.execute_entered.wait, 1)
-        store.bindings["user-1"] = "sandbox-external"
+        store.bindings[_resource_key("user-1")] = "sandbox-external"
 
         recreate_task = asyncio.create_task(manager.recreate(_key("user-1")))
         await _eventually(lambda: handle.id == "sandbox-2")
@@ -3415,7 +3457,7 @@ async def test_cancelled_recreate_tracks_distinct_authoritative_old_id() -> None
             await asyncio.gather(recreate_task, return_exceptions=True)
         await manager.aclose()
 
-    assert store.bindings == {"user-1": "sandbox-2"}
+    assert store.bindings == {_resource_key("user-1"): "sandbox-2"}
     assert client.destroy_calls == ["sandbox-external"]
     assert "sandbox-1" not in client.destroy_calls
     assert old_backend.close_calls == 1
@@ -3433,7 +3475,7 @@ async def test_manager_uses_state_as_its_allocation_boundary() -> None:
         await manager.start()
         handle = await manager.get(_key("user-1"))
 
-        binding = await state.read_binding("user-1")
+        binding = await state.read_binding(_resource_key("user-1"))
         assert binding is not None
         assert binding.sandbox_id == handle.id
     finally:
@@ -3457,8 +3499,8 @@ async def test_committed_warm_binding_is_not_destroyed_after_owner_loss() -> Non
         await asyncio.gather(getting, return_exceptions=True)
         await manager.aclose()
 
-    assert state.consume_calls == [("user-1", "sandbox-1")]
-    assert state.bindings == {"user-1": "sandbox-1"}
+    assert state.consume_calls == [(_resource_key("user-1"), "sandbox-1")]
+    assert state.bindings == {_resource_key("user-1"): "sandbox-1"}
     assert client.destroy_calls == []
     assert warm_backend.close_calls == 1
 
@@ -3474,8 +3516,8 @@ async def test_committed_on_demand_binding_survives_lost_commit_response() -> No
         handle = await manager.get(_key("user-1"))
 
         assert handle.id == "sandbox-1"
-        assert state.bindings == {"user-1": "sandbox-1"}
-        assert state.save_calls == [("user-1", "sandbox-1")]
+        assert state.bindings == {_resource_key("user-1"): "sandbox-1"}
+        assert state.save_calls == [(_resource_key("user-1"), "sandbox-1")]
         assert len(state.get_calls) == 2
         assert client.destroy_calls == []
         assert client.backends[0].close_calls == 0
@@ -3573,7 +3615,7 @@ async def test_failed_replacement_preserves_the_committed_warm_sandbox() -> None
         assert isinstance(captured.value.cause, RuntimeError)
         assert str(captured.value.cause) == "replacement creation failed"
 
-        assert state.bindings == {"user-1": "sandbox-1"}
+        assert state.bindings == {_resource_key("user-1"): "sandbox-1"}
         assert client.destroy_calls == []
         assert warm_backend.close_calls == 1
     finally:
@@ -3644,7 +3686,7 @@ async def test_registration_failure_retains_old_resource_cleanup(
             with pytest.raises(OpenSandboxStateError):
                 await task
         await _eventually(lambda: original.close_calls == 1)
-        binding = await state.read_binding("owner")
+        binding = await state.read_binding(_resource_key("owner"))
         assert binding is not None
         assert binding.sandbox_id == handle.id
         if operation == "recreate":

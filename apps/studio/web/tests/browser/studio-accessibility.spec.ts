@@ -563,7 +563,7 @@ async function mockStudio(page: Page, {
           id: message.id,
           traceSeq: (index * 2) + 1,
           sourceId: message.id,
-          namespace: [],
+          graphNamespace: [],
           runId: 'browser-run',
           role: message.role,
           content: message.content,
@@ -578,7 +578,7 @@ async function mockStudio(page: Page, {
           id: message.id,
           traceSeq: (index * 2) + 1,
           sourceId: message.id,
-          namespace: [],
+          graphNamespace: [],
           runId: 'browser-run',
           role: 'tool' as const,
           content: message.meta.result ?? null,
@@ -647,7 +647,7 @@ async function mockStudio(page: Page, {
         status,
         name: message.meta?.toolName ?? message.meta?.agentName ?? message.content,
         runId: message.meta?.runId ?? 'browser-run',
-        namespace: message.role === 'subagent'
+        graphNamespace: message.role === 'subagent'
           ? subagentNamespacesByRunId.get(message.meta?.subRunId ?? '') ?? []
           : message.role === 'tool'
             ? subagentNamespacesByRunId.get(message.meta?.runId ?? '') ?? []
@@ -679,7 +679,7 @@ async function mockStudio(page: Page, {
           id: 'interaction-browser-approval',
           traceSeq: (historyMessages.length * 2) + 1,
           sourceId: 'browser-approval',
-          namespace: [],
+          graphNamespace: [],
           runId: 'browser-run',
           kind: 'tool_approval',
           status: 'pending' as const,
@@ -709,7 +709,7 @@ async function mockStudio(page: Page, {
             id: 'interaction-browser-plan-question',
             traceSeq: (historyMessages.length * 2) + 1,
             sourceId: 'browser-plan-question',
-            namespace: [],
+            graphNamespace: [],
             runId: 'browser-run',
             kind: 'tinkerfin:plan_clarification',
             toolCallIds: [],
@@ -724,7 +724,7 @@ async function mockStudio(page: Page, {
               id: 'interaction-browser-plan-review',
               traceSeq: (historyMessages.length * 2) + 1,
               sourceId: 'browser-plan-review',
-              namespace: [],
+              graphNamespace: [],
               runId: 'browser-run',
               kind: 'tinkerfin:plan_review',
               toolCallIds: [],

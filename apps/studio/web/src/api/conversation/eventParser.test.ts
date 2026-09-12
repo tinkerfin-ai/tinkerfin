@@ -45,9 +45,9 @@ describe('AG-UI 事件边界解析', () => {
           kind: 'deep_agent_subagent',
           agentType: 'subagent',
           agentName: 'researcher',
-          namespace: ['tools:task-1'],
+          graphNamespace: ['tools:task-1'],
           graphTaskId: 'task-1',
-          parentNamespace: [],
+          parentGraphNamespace: [],
           parentToolCallId: 'tool-1',
           subagentInput: '研究问题',
           subagentInvocationId: 'invocation-1',
@@ -109,9 +109,9 @@ describe('AG-UI 事件边界解析', () => {
     const source = {
       kind: 'compiled_subgraph',
       nodeName: 'create_plan',
-      namespace: ['create_plan:graph-task-1'],
+      graphNamespace: ['create_plan:graph-task-1'],
       graphTaskId: 'graph-task-1',
-      parentNamespace: [],
+      parentGraphNamespace: [],
     }
     const value = {
       ...event,
@@ -166,10 +166,10 @@ describe('AG-UI 事件边界解析', () => {
     ['JSON Patch add 缺少 value', { type: 'STATE_DELTA', delta: [{ op: 'add', path: '/a' }] }],
     ['JSON Patch replace 缺少 value', { type: 'STATE_DELTA', delta: [{ op: 'replace', path: '/a' }] }],
     ['工具结果缺 role', { type: 'TOOL_CALL_RESULT', messageId: 'message-1', toolCallId: 'tool-1', content: '完成' }],
-    ['来源 namespace 非字符串数组', {
+    ['来源 graphNamespace 非字符串数组', {
       type: 'RUN_ERROR',
       rawEvent: {
-        source: { kind: 'root', agentType: 'main', agentName: 'main', namespace: [1] },
+        source: { kind: 'root', agentType: 'main', agentName: 'main', graphNamespace: [1] },
       },
     }],
     ['来源 kind 未知', {
@@ -181,7 +181,7 @@ describe('AG-UI 事件边界解析', () => {
           kind: 'unknown_graph',
           agentType: 'main',
           agentName: 'main',
-          namespace: [],
+          graphNamespace: [],
         },
       },
     }],
@@ -194,7 +194,7 @@ describe('AG-UI 事件边界解析', () => {
           kind: 'compiled_subgraph',
           agentType: 'main',
           agentName: 'main',
-          namespace: ['create_plan:graph-task-1'],
+          graphNamespace: ['create_plan:graph-task-1'],
         },
       },
     }],
@@ -207,7 +207,7 @@ describe('AG-UI 事件边界解析', () => {
           kind: 'deep_agent_subagent',
           agentType: 'main',
           agentName: 'researcher',
-          namespace: ['tools:graph-task-1'],
+          graphNamespace: ['tools:graph-task-1'],
         },
       },
     }],

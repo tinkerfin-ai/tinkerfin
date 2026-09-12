@@ -14,35 +14,46 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast
+from functools import partial
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, overload
 
 from deepagents.graph import DeepAgentState
 from langchain.agents.middleware.types import InputAgentState
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.pregel.main import All, Durability, RunControl, StreamMode
 from langgraph.types import Command
+from langgraph.typing import ContextT
 
 from tinkerfin_contracts import (
     RunIdentity,
     RunSourceContext,
     RunTerminalOutcome,
     RuntimeObserver,
+    ThreadIdentity,
 )
+from tinkerfin_contracts.identity import validate_namespace
 from tinkerfin_native_stream import (
+    NativeRuntimeInterrupt,
     NativeStreamContractError,
     NativeStreamFrame,
     NativeValuesStreamPart,
 )
 
 from . import _runtime_streams
+from ._failure_evidence import select_failure
+from ._lazy_run import AgUiRunStream, NativeRunStream
 from ._observation import RuntimeObservationHub, observer_tuple, source_context
 from ._optional_dependencies import require_agui
+from ._run_owner import RunOwner
+from ._run_resources import RunResources
 from ._runtime_streams import _validate_timeout
 from ._state_schema import validate_state_schema
-from ._tasks import join_task
+from ._tasks import OwnedOperationFailures, join_task
+from ._terminal_observer import TerminalCallbackObserver, TerminalObserver
 from .coordination import RunCoordinator
-from .deep_agent import CREATE_DEEP_AGENT, DeepAgentDefinition
+from .deep_agent import BUILD_AGENT, _AgentDefinition
 from .errors import (
     AgUiSettlementTimeoutError,
     TinkerFinLifecycleError,
@@ -58,6 +69,7 @@ from .plan._config import (
     DEFAULT_ALLOWED_REVIEW_ACTIONS,
     AgentMode,
     PlanOptions,
+    resolve_agent_mode,
     validate_agent_mode,
     validate_allowed_review_actions,
 )
@@ -98,21 +110,9 @@ NativeFrameResolver = Callable[[object], NativeStreamFrame]
 _CheckpointSaver: TypeAlias = (
     BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
 )
-if TYPE_CHECKING:
-    _DefinitionAny: TypeAlias = DeepAgentDefinition[Any]
-    _AgentSource: TypeAlias = (
-        _DefinitionAny
-        | Callable[
-            [],
-            _DefinitionAny | Awaitable[_DefinitionAny],
-        ]
-    )
-else:
-    # The implementation class carries private Graph/Astream generics while the public
-    # generated stub intentionally exposes only ContextT. Runtime annotations remain
-    # inert here; static analysis sees the precise branch above.
-    _DefinitionAny: TypeAlias = DeepAgentDefinition
-    _AgentSource: TypeAlias = object
+_DefinitionAny: TypeAlias = _AgentDefinition[
+    object, Callable[..., AsyncIterator[Mapping[str, object]]]
+]
 
 
 def _translate_agui_conversion_error(error: Exception) -> Exception:
@@ -174,9 +174,10 @@ class _GraphRunStream(Generic[PartT]):
         self._stream_driver = stream_driver
         self._on_settle = on_settle
         self._native_frame: tuple[object, NativeStreamFrame] | None = None
-        self._last_root_interrupt_ids: tuple[str, ...] = ()
+        self._root_interrupt_ids: tuple[str, ...] = ()
         self._source: AsyncIterator[PartT] | None = None
         self._coordination: AbstractAsyncContextManager[None] | None = None
+        self._run_resources: RunResources | None = None
         self._started = False
         self._closed = False
         self._ready_error: Exception | None = None
@@ -188,7 +189,39 @@ class _GraphRunStream(Generic[PartT]):
         )
         self._active_observers = 0
         self._finish_task: asyncio.Task[None] | None = None
+        self._owned_finish_done = False
+        self._owned_finish_error: BaseException | None = None
+        self._owned_operation_failures, _owns_failures = (
+            OwnedOperationFailures.for_source()
+        )
         self.error: Exception | None = None
+
+    def _adopt_resources(self, resources: RunResources) -> None:
+        """Take prepared ownership before startup without acquiring coordination twice."""
+
+        if self._started or self._run_resources is not None:
+            raise TinkerFinLifecycleError("Run resources must transfer before startup")
+        resources.transfer()
+        self._coordination_factory = None
+        self._run_resources = resources
+        resources.owner.bind_close(self._settle_owned)
+        if self._observation.enabled:
+            resources.owner.watch_failure(self._observation.wait_failure)
+
+    async def _settle_owned(self, error: BaseException | None) -> None:
+        """Close an idle or interrupted native Run inside its lifetime Task."""
+
+        if isinstance(error, Exception) and not self._closed:
+            self.error = error
+            self._ready_error = error
+        await self._finish(
+            error,
+            outcome=None
+            if not self._started
+            else (
+                "cancelled" if error is None else _runtime_streams._error_outcome(error)
+            ),
+        )
 
     def _take_frame(self, part: object) -> NativeStreamFrame:
         """Consume the one canonical sidecar belonging to a delivered raw part.
@@ -219,6 +252,9 @@ class _GraphRunStream(Generic[PartT]):
     async def __anext__(self) -> PartT:
         """Pull, observe, and return the next native part."""
 
+        resources = self._run_resources
+        if resources is not None and not self._closed:
+            return await resources.owner.call(partial(_runtime_streams.__anext__, self))
         return await _runtime_streams.__anext__(
             self,
         )
@@ -230,6 +266,12 @@ class _GraphRunStream(Generic[PartT]):
         part currently being observed. An external closer cancels an active pull.
         """
 
+        resources = self._run_resources
+        if resources is not None and not resources.owner.is_current():
+            await resources.owner.aclose()
+            if self._owned_finish_error is not None:
+                raise self._owned_finish_error
+            return
         return await _runtime_streams.aclose(
             self,
         )
@@ -245,8 +287,8 @@ class _GraphRunStream(Generic[PartT]):
         timeout: float | None = None,
         mapper: SseMapper[NativeStreamPart] | None = None,
         event_id_resolver: SseEventIdResolver[NativeStreamPart] | None = None,
-    ) -> SseBody[str]:
-        """Consume this native object stream as safely framed SSE text."""
+    ) -> SseBody[bytes]:
+        """Consume this native object stream as UTF-8 SSE bytes."""
 
         return _runtime_streams.to_sse(
             self,
@@ -495,6 +537,13 @@ class AgUiEventStream:
         self._resume_abandoned = False
         self.error: Exception | None = None
 
+    def _adopt_resources(self, resources: RunResources) -> None:
+        """Transfer preparation ownership to this conversion's native stream."""
+
+        if not isinstance(self._upstream, NativeGraphRunStream):
+            raise TinkerFinLifecycleError("Runtime preparation requires a native Run")
+        self._upstream._adopt_resources(resources)
+
     def __aiter__(self) -> AgUiEventStream:
         """Return this single-use AG-UI asynchronous iterator."""
 
@@ -547,8 +596,8 @@ class AgUiEventStream:
         *,
         mapper: SseMapper[BaseEvent] | None = None,
         event_id_resolver: SseEventIdResolver[BaseEvent] | None = None,
-    ) -> SseBody[str]:
-        """Consume this AG-UI object stream as safely framed SSE text."""
+    ) -> SseBody[bytes]:
+        """Consume this AG-UI object stream as UTF-8 SSE bytes."""
 
         return self._runtime_agui.to_sse(
             self,
@@ -708,12 +757,16 @@ class AgUiEventStream:
 
 
 class TinkerFin:
-    """Globally shareable factory for request-scoped Deep Agent definitions."""
+    """Configure an agent, then build a namespace-bound Runtime.
+
+    Configuration methods return independent builders and borrow supplied resources.
+    Building validates and captures configuration without opening execution resources.
+    """
 
     __slots__ = (
         "_attachments",
         "_checkpointer",
-        "_family",
+        "_namespace",
         "_observers",
         "_plan_options",
         "_run_coordinator",
@@ -721,7 +774,7 @@ class TinkerFin:
         "_state_schema",
     )
 
-    create_deep_agent = CREATE_DEEP_AGENT
+    build = BUILD_AGENT
 
     def __init__(
         self,
@@ -731,15 +784,15 @@ class TinkerFin:
         state_schema: type[DeepAgentState] | None = None,
         runtime_profile: DeepAgentsRuntimeProfile | None = None,
     ) -> None:
-        """Initialize a shareable factory that borrows global integrations.
+        """Configure shared resources without opening an execution.
 
         Args:
-            checkpointer: Optional borrowed default saver inherited by Definitions that
-                do not provide one explicitly. TinkerFin never sets up or closes it.
+            checkpointer: Borrowed default checkpoint saver. The application opens
+                and closes it; build() can select a different saver.
             run_coordinator: Optional exclusive scope provider for run identities.
             state_schema: Optional global Deep Agent TypedDict contribution.
-            runtime_profile: Complete Deep Agents integration selected before any
-                Definition or Run is created. The default is the locked v2 Profile.
+            runtime_profile: Optional agent integration. Omit it to use the supported
+                Deep Agents integration.
 
         Raises:
             TypeError: The checkpointer, coordinator, or Runtime Profile has the wrong
@@ -777,7 +830,7 @@ class TinkerFin:
             raise TypeError("runtime_profile.astream_signature must be a Signature")
         validate_state_schema(state_schema, source="TinkerFin state_schema")
         self._checkpointer = checkpointer
-        self._family = object()
+        self._namespace: str | None = None
         self._run_coordinator = run_coordinator
         self._state_schema = state_schema
         self._runtime_profile = resolved_profile
@@ -785,14 +838,8 @@ class TinkerFin:
         self._plan_options: PlanOptions | None = None
         self._attachments: AttachmentSupport | None = None
 
-    @property
-    def runtime_profile(self) -> DeepAgentsRuntimeProfile:
-        """Return the immutable borrowed integration used by future Definitions."""
-
-        return self._runtime_profile
-
-    def attachments(self, support: AttachmentSupport) -> TinkerFin:
-        """Configure authorized attachment access for agents created by this factory.
+    def with_attachments(self, support: AttachmentSupport) -> TinkerFin:
+        """Configure authorized attachment access for the selected models.
 
         Automatic integration requires the locked native Deep Agents factory.
         Decorated or replaced factories are rejected at graph construction before
@@ -803,7 +850,7 @@ class TinkerFin:
             support: Borrowed per-model image policy and host-authorized file reader.
 
         Returns:
-            An independent factory retaining Plan, observers, and resource ownership.
+            An independent builder retaining its namespace and other options.
 
         Raises:
             TypeError: Support is not an AttachmentSupport instance.
@@ -818,28 +865,41 @@ class TinkerFin:
         )
         configured._observers = self._observers
         configured._plan_options = self._plan_options
-        configured._family = self._family
+        configured._namespace = self._namespace
         configured._attachments = support
         return configured
 
-    def observe(self, observer: RuntimeObserver) -> TinkerFin:
-        """Return a factory with one additional ordered Runtime observer.
+    def with_observer(
+        self,
+        observer: RuntimeObserver | None = None,
+        *,
+        on_terminal: TerminalObserver | None = None,
+    ) -> TinkerFin:
+        """Observe runs with a full observer or an asynchronous terminal callback.
 
-        The source factory, existing Definitions, and registered Observer objects are
-        unchanged. The same Observer instance cannot be registered twice because that
-        would duplicate one logical observation stream.
+        Callbacks run in this process and are awaited. Their failures propagate without
+        changing the selected outcome. Terminal notification can precede final cleanup.
 
         Args:
-            observer: Cross-package Observer that opens one session per Runtime Run.
+            observer: Borrowed observer opening one session per admitted run.
+            on_terminal: Callback receiving the selected run outcome once. Exclusive
+                with observer; it does not provide durable notification delivery.
 
         Returns:
-            A separate configured TinkerFin factory.
+            An independent builder retaining its namespace and other options.
 
         Raises:
-            TypeError: The object does not implement ``RuntimeObserver``.
-            ValueError: The same Observer instance is already registered.
+            TypeError: The observer or callback has an invalid type.
+            ValueError: Neither or both options are set, or an observer is duplicated.
         """
 
+        if (observer is None) == (on_terminal is None):
+            raise ValueError("provide exactly one of observer or on_terminal")
+        if on_terminal is not None:
+            if not callable(on_terminal):
+                raise TypeError("on_terminal must be an async callable")
+            observer = TerminalCallbackObserver(on_terminal)
+        assert observer is not None
         observers = observer_tuple((*self._observers, observer))
         configured = TinkerFin(
             checkpointer=self._checkpointer,
@@ -849,15 +909,583 @@ class TinkerFin:
         )
         configured._plan_options = self._plan_options
         configured._observers = observers
-        configured._family = self._family
+        configured._namespace = self._namespace
         configured._attachments = self._attachments
         return configured
 
-    async def open_run(
+    def with_plan(
+        self,
+        *,
+        enabled: bool = True,
+        default_mode: AgentMode = "default",
+        planner_model: str | BaseChatModel | None = None,
+        clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
+        clarification_types: Sequence[ClarificationType[Any, Any]] = (),
+        content_schema: type[PlanContentModel] = StructuredPlanContent,
+        allowed_review_actions: Sequence[
+            PlanReviewAction
+        ] = DEFAULT_ALLOWED_REVIEW_ACTIONS,
+    ) -> TinkerFin:
+        """Configure planning with read-only tools and human review.
+
+        Existing builders and Runtimes retain their configuration. The returned
+        builder borrows the same shared resources.
+
+        Args:
+            enabled: Whether built Runtimes support planning.
+            default_mode: Mode used when execution does not select one.
+            planner_model: Optional model dedicated to read-only planning.
+            clarification_schema: Concrete host form used by the Planner.
+            clarification_types: Additional custom semantic question types.
+            content_schema: Concrete content model used for drafts and confirmed Plans.
+            allowed_review_actions: Ordered decisions accepted for each Plan draft
+                review.
+
+        Returns:
+            An independent builder retaining its namespace and other options.
+
+        Raises:
+            TypeError: ``enabled``, a model, or a review action has the wrong type.
+            PlanModeConfigurationError: A mode or disabled configuration is invalid.
+        """
+
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a bool")
+        mode = validate_agent_mode(default_mode, name="default_mode")
+        actions = validate_allowed_review_actions(allowed_review_actions)
+        if isinstance(clarification_types, (str, bytes)) or not isinstance(
+            clarification_types, Sequence
+        ):
+            raise TypeError("clarification_types must be a sequence")
+        frozen_clarification_types = tuple(clarification_types)
+        for name, model in (("planner_model", planner_model),):
+            if model is not None and not isinstance(model, (str, BaseChatModel)):
+                raise TypeError(
+                    f"{name} must be a model string, BaseChatModel, or None"
+                )
+            if isinstance(model, str) and not model.strip():
+                raise ValueError(f"{name} must not be blank")
+        if not enabled and (
+            mode != "default"
+            or planner_model is not None
+            or clarification_schema is not DefaultClarificationForm
+            or frozen_clarification_types
+            or content_schema is not StructuredPlanContent
+            or actions != DEFAULT_ALLOWED_REVIEW_ACTIONS
+        ):
+            from .plan.errors import PlanModeConfigurationError
+
+            raise PlanModeConfigurationError(
+                "disabled Plan capability cannot configure a mode, model, form, "
+                "clarification types, content schema, or review actions"
+            )
+        configured = TinkerFin(
+            checkpointer=self._checkpointer,
+            run_coordinator=self._run_coordinator,
+            state_schema=self._state_schema,
+            runtime_profile=self._runtime_profile,
+        )
+        configured._observers = self._observers
+        configured._namespace = self._namespace
+        configured._attachments = self._attachments
+        if enabled:
+            clarification = create_clarification_binding(
+                clarification_schema,
+                custom_types=frozen_clarification_types,
+            )
+            content = create_plan_content_binding(content_schema)
+            configured._plan_options = PlanOptions(
+                clarification=clarification,
+                content=content,
+                contracts=create_plan_contract_binding(
+                    clarification,
+                    content,
+                    allowed_review_actions=actions,
+                ),
+                allowed_review_actions=actions,
+                default_mode=mode,
+                planner_model=planner_model,
+            )
+        return configured
+
+    def with_namespace(self, namespace: str) -> TinkerFin:
+        """Return an independent builder using the host's isolation namespace.
+
+        Args:
+            namespace: Opaque, case-sensitive namespace selected by the application.
+
+        Returns:
+            A builder borrowing the same resources and retaining other options.
+
+        Raises:
+            TypeError: The namespace is not a string.
+            ValueError: The namespace is empty, padded, too long, or not UTF-8 encodable.
+        """
+
+        value = validate_namespace(namespace)
+        configured = TinkerFin(
+            checkpointer=self._checkpointer,
+            run_coordinator=self._run_coordinator,
+            state_schema=self._state_schema,
+            runtime_profile=self._runtime_profile,
+        )
+        configured._namespace = value
+        configured._observers = self._observers
+        configured._plan_options = self._plan_options
+        configured._attachments = self._attachments
+        return configured
+
+    def _require_namespace(self) -> str:
+        if self._namespace is None:
+            raise ValueError("set with_namespace(...) before build()")
+        return self._namespace
+
+
+class AgentRuntime(Generic[ContextT]):
+    """Execute the agent configuration captured by TinkerFin.build().
+
+    A Runtime has one immutable namespace and borrows its model, stores, observers,
+    and coordinator. Each run owns its own preparation, graph, streams, and cleanup.
+    Direct construction is unsupported; obtain a Runtime from a configured builder.
+    """
+
+    _definition: _DefinitionAny
+    _namespace: str
+    _checkpointer: _CheckpointSaver | None
+    _observers: tuple[RuntimeObserver, ...]
+    _plan_options: PlanOptions | None
+    _run_coordinator: RunCoordinator | None
+    _runtime_profile: DeepAgentsRuntimeProfile
+
+    def __init__(self) -> None:
+        """Reject construction without a bound agent configuration.
+
+        Raises:
+            TypeError: Always; use TinkerFin.with_namespace(...).build(...).
+        """
+
+        raise TypeError("AgentRuntime is created by TinkerFin.build()")
+
+    @classmethod
+    def _create(cls, builder: TinkerFin) -> AgentRuntime[ContextT]:
+        runtime = cls.__new__(cls)
+        runtime._namespace = builder._require_namespace()
+        runtime._checkpointer = builder._checkpointer
+        runtime._observers = builder._observers
+        runtime._plan_options = builder._plan_options
+        runtime._run_coordinator = builder._run_coordinator
+        runtime._runtime_profile = builder._runtime_profile
+        return runtime
+
+    @property
+    def namespace(self) -> str:
+        """Return the immutable namespace selected when this Runtime was built."""
+
+        return self._namespace
+
+    def thread_identity(self, thread_id: str) -> ThreadIdentity:
+        """Identify a thread in this Runtime's namespace."""
+
+        return ThreadIdentity(namespace=self._namespace, thread_id=thread_id)
+
+    def run_identity(self, thread_id: str, run_id: str) -> RunIdentity:
+        """Identify a run in this Runtime's namespace."""
+
+        return RunIdentity(
+            namespace=self._namespace, thread_id=thread_id, run_id=run_id
+        )
+
+    def open_run(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        input: InputAgentState | Command[object] | None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: ContextT | None = None,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        control: RunControl | None = None,
+        debug: bool | None = None,
+    ) -> NativeRunStream:
+        """Create a lazy Native run; preparation begins at preflight or first pull.
+
+        Args:
+            thread_id: Application thread identifier within this Runtime's namespace.
+            run_id: Identifier of this run within its thread.
+            input: Agent state, native continuation command, or no new input.
+            mode: Optional execution or Plan mode for new input.
+            config: Optional graph execution settings.
+            context: Context matching the schema supplied to build().
+            on_native_part: Optional asynchronous observation of each validated part.
+            stream_mode: Optional native output selection supported by the integration.
+            print_mode: Optional upstream diagnostic output.
+            interrupt_before: Nodes to pause before executing.
+            interrupt_after: Nodes to pause after executing.
+            durability: Checkpoint persistence policy.
+            control: Optional cooperative execution control.
+            debug: Whether to enable upstream diagnostics.
+
+        Returns:
+            A single-use Native stream. Consume it under aclosing or close it explicitly.
+
+        Raises:
+            TypeError: Identifiers or callbacks have invalid types.
+            ValueError: Identity values or the selected mode are invalid.
+        """
+        stream_options: dict[str, object] = {
+            "stream_mode": stream_mode,
+            "print_mode": print_mode or None,
+            "interrupt_before": interrupt_before,
+            "interrupt_after": interrupt_after,
+            "durability": durability,
+            "control": control,
+            "debug": debug,
+        }
+
+        identity = self.run_identity(thread_id, run_id)
+        self._validate_run_binding(identity=identity, on_part=on_native_part)
+        resolve_agent_mode(mode, options=self._plan_options)
+        self._bind_native_invocation(
+            self._runtime_profile.astream_signature,
+            (input, config),
+            {key: value for key, value in stream_options.items() if value is not None},
+            identity=identity,
+        )
+        return NativeRunStream._create(
+            identity,
+            partial(
+                self._open_native_prepared,
+                identity,
+                input=input,
+                mode=mode,
+                config=config,
+                context=context,
+                on_native_part=on_native_part,
+                **{
+                    key: value
+                    for key, value in stream_options.items()
+                    if value is not None
+                },
+            ),
+            coordinator=self._run_coordinator,
+        )
+
+    async def ainvoke(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        input: InputAgentState | Command[object] | None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: ContextT | None = None,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        control: RunControl | None = None,
+        debug: bool | None = None,
+    ) -> Mapping[str, object]:
+        """Execute one run and return its final state after resource cleanup.
+
+        Args:
+            thread_id: Application thread identifier in this Runtime's namespace.
+            run_id: Identifier of this run within its thread.
+            input: Agent state, native continuation command, or no new input.
+            mode: Optional execution or Plan mode for new input.
+            config: Optional graph execution settings.
+            context: Context matching the schema supplied to build().
+            on_native_part: Optional asynchronous observer of validated Native parts.
+            stream_mode: Optional native output selection supported by the integration.
+            print_mode: Optional upstream diagnostic output.
+            interrupt_before: Nodes to pause before executing.
+            interrupt_after: Nodes to pause after executing.
+            durability: Checkpoint persistence policy.
+            control: Optional cooperative execution control.
+            debug: Whether to enable upstream diagnostics.
+
+        Returns:
+            The final root state, including interrupts when awaiting human input.
+
+        Raises:
+            TinkerFinLifecycleError: Execution produced no final root state.
+            BaseException: Execution, observation, cancellation, or cleanup fails.
+        """
+        stream = self.open_run(
+            thread_id=thread_id,
+            run_id=run_id,
+            input=input,
+            mode=mode,
+            config=config,
+            context=context,
+            on_native_part=on_native_part,
+            stream_mode=stream_mode,
+            print_mode=print_mode,
+            interrupt_before=interrupt_before,
+            interrupt_after=interrupt_after,
+            durability=durability,
+            control=control,
+            debug=debug,
+        )
+        state: dict[str, object] | None = None
+        pending: dict[str, NativeRuntimeInterrupt] = {}
+        try:
+            async for part in stream:
+                canonical = stream._take_frame(part).canonical
+                if (
+                    not isinstance(canonical, NativeValuesStreamPart)
+                    or canonical.ns != ()
+                ):
+                    continue
+                state = dict(canonical.data)
+                pending.update((item.id, item) for item in canonical.interrupts)
+        finally:
+            await stream.aclose()
+        if state is None:
+            raise TinkerFinLifecycleError(
+                "managed invocation completed without a root values boundary"
+            )
+        if pending:
+            state["__interrupt__"] = list(pending.values())
+        return state
+
+    @overload
+    def open_agui_run(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[UserMessage | Mapping[str, object]],
+        input: None = None,
+        resume: None = None,
+        parent_run_id: str | None = None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: ContextT | None = None,
+        stream_timeout: float | None = None,
+        cleanup_timeout: float | None = None,
+        include_reasoning_events: bool = False,
+        include_subagent_events: bool = True,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        on_agui_event: EventObserver | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        control: RunControl | None = None,
+        debug: bool | None = None,
+    ) -> AgUiRunStream: ...
+
+    @overload
+    def open_agui_run(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: None = None,
+        input: InputAgentState,
+        resume: None = None,
+        parent_run_id: str | None = None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: ContextT | None = None,
+        stream_timeout: float | None = None,
+        cleanup_timeout: float | None = None,
+        include_reasoning_events: bool = False,
+        include_subagent_events: bool = True,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        on_agui_event: EventObserver | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        control: RunControl | None = None,
+        debug: bool | None = None,
+    ) -> AgUiRunStream: ...
+
+    @overload
+    def open_agui_run(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: None = None,
+        input: None = None,
+        resume: AgUiResumeRequest,
+        parent_run_id: str | None = None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: ContextT | None = None,
+        on_resume_saved: AgUiResumeCheckpointObserver | None = None,
+        on_resume_not_saved: AgUiResumeNotSavedObserver | None = None,
+        stream_timeout: float | None = None,
+        cleanup_timeout: float | None = None,
+        include_reasoning_events: bool = False,
+        include_subagent_events: bool = True,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        on_agui_event: EventObserver | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        control: RunControl | None = None,
+        debug: bool | None = None,
+    ) -> AgUiRunStream: ...
+
+    def open_agui_run(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[UserMessage | Mapping[str, object]] | None = None,
+        input: InputAgentState | None = None,
+        resume: AgUiResumeRequest | None = None,
+        parent_run_id: str | None = None,
+        mode: AgentMode | None = None,
+        config: RunnableConfig | None = None,
+        context: ContextT | None = None,
+        on_resume_saved: AgUiResumeCheckpointObserver | None = None,
+        on_resume_not_saved: AgUiResumeNotSavedObserver | None = None,
+        stream_timeout: float | None = None,
+        cleanup_timeout: float | None = None,
+        include_reasoning_events: bool = False,
+        include_subagent_events: bool = True,
+        on_native_part: PartObserver[Mapping[str, object]] | None = None,
+        on_agui_event: EventObserver | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        control: RunControl | None = None,
+        debug: bool | None = None,
+    ) -> AgUiRunStream:
+        """Create a lazy AG-UI run for messages, explicit input, or resume decisions.
+
+        Args:
+            thread_id: Application thread identifier in this Runtime's namespace.
+            run_id: Identifier of this run within its thread.
+            messages: Host-authorized user messages for ordinary conversation.
+            input: Explicit graph state, exclusive with messages and resume.
+            resume: Human decisions for an interrupted run, exclusive with other inputs.
+            parent_run_id: Optional related run in the same namespace and thread.
+            mode: Optional execution or Plan mode for new input.
+            config: Optional graph execution settings.
+            context: Context matching the schema supplied to build().
+            on_resume_saved: Optional settlement after resume evidence is durable.
+            on_resume_not_saved: Optional settlement when no resume evidence was saved.
+            stream_timeout: Optional total Native pull deadline in seconds.
+            cleanup_timeout: Optional wait limit for protected cleanup in seconds.
+            include_reasoning_events: Whether to emit supported public reasoning events.
+            include_subagent_events: Whether to emit subagent events.
+            on_native_part: Optional asynchronous observer of validated Native parts.
+            on_agui_event: Optional asynchronous observer of outgoing AG-UI events.
+            stream_mode: Optional native output selection supported by the integration.
+            print_mode: Optional upstream diagnostic output.
+            interrupt_before: Nodes to pause before executing.
+            interrupt_after: Nodes to pause after executing.
+            durability: Checkpoint persistence policy.
+            control: Optional cooperative execution control.
+            debug: Whether to enable upstream diagnostics.
+
+        Returns:
+            A single-use event stream suitable for direct consumption or channel.open_sse().
+
+        Raises:
+            TypeError: Identifiers, decisions, or callbacks have invalid types.
+            ValueError: Inputs conflict or resume callbacks accompany ordinary input.
+        """
+        stream_options: dict[str, object] = {
+            "stream_mode": stream_mode,
+            "print_mode": print_mode or None,
+            "interrupt_before": interrupt_before,
+            "interrupt_after": interrupt_after,
+            "durability": durability,
+            "control": control,
+            "debug": debug,
+        }
+
+        require_agui()
+        from tinkerfin_agui_adapter import AgUiLifecycleEventFactory
+
+        from .agui_resume import AgUiResumeRequest as ResumeRequest
+
+        identity = self.run_identity(thread_id, run_id)
+        self._validate_run_binding(identity=identity, on_part=on_native_part)
+        if sum(value is not None for value in (messages, input, resume)) != 1:
+            raise ValueError(
+                "exactly one of messages, input or resume must be provided"
+            )
+        if resume is not None and not isinstance(resume, ResumeRequest):
+            raise TypeError("resume must be an AgUiResumeRequest")
+        if resume is None and (
+            on_resume_saved is not None or on_resume_not_saved is not None
+        ):
+            raise ValueError("resume settlement callbacks require resume input")
+        for name, callback in (
+            ("on_resume_saved", on_resume_saved),
+            ("on_resume_not_saved", on_resume_not_saved),
+            ("on_agui_event", on_agui_event),
+        ):
+            if callback is not None and not callable(callback):
+                raise TypeError(f"{name} must be an async callable")
+        _validate_timeout(stream_timeout, name="stream_timeout")
+        _validate_timeout(cleanup_timeout, name="cleanup_timeout")
+        resolve_agent_mode(mode, options=self._plan_options)
+        AgUiLifecycleEventFactory.validate_parent_run_id(
+            parent_run_id, identity=identity
+        )
+        self._bind_native_invocation(
+            self._runtime_profile.astream_signature,
+            (input, config),
+            {key: value for key, value in stream_options.items() if value is not None},
+            identity=identity,
+        )
+        return AgUiRunStream._create(
+            identity,
+            partial(
+                self._open_agui_prepared,
+                identity,
+                messages=messages,
+                input=input,
+                resume=resume,
+                parent_run_id=parent_run_id,
+                mode=mode,
+                config=config,
+                context=context,
+                on_resume_saved=on_resume_saved,
+                on_resume_not_saved=on_resume_not_saved,
+                stream_timeout=stream_timeout,
+                cleanup_timeout=cleanup_timeout,
+                include_reasoning_events=include_reasoning_events,
+                include_subagent_events=include_subagent_events,
+                on_native_part=on_native_part,
+                on_agui_event=on_agui_event,
+                **{
+                    key: value
+                    for key, value in stream_options.items()
+                    if value is not None
+                },
+            ),
+            coordinator=self._run_coordinator,
+        )
+
+    async def _open_native_prepared(
         self,
         identity: RunIdentity,
+        owner: RunOwner,
         *,
-        agent: _AgentSource,
         input: InputAgentState | Command[object] | None,
         mode: AgentMode | None = None,
         config: RunnableConfig | None = None,
@@ -865,188 +1493,77 @@ class TinkerFin:
         on_native_part: PartObserver[Mapping[str, object]] | None = None,
         **stream_options: object,
     ) -> NativeGraphRunStream:
-        """Open one managed native Run without exposing Definition/Runtime ordering.
+        """Prepare one bound Native execution after admission."""
 
-        ``agent`` may be a reusable Definition or a synchronous/asynchronous callable
-        that creates one after host-specific model, Sandbox, or tool preparation. Graph
-        construction uses the selected Profile's async boundary exactly once. The
-        returned stream has already committed Run start and input observations but has
-        not pulled model output. Setup exceptions become a managed native stream that
-        records failed Observation and raises when consumed; process-control exceptions
-        continue to propagate.
+        async with RunResources(owner) as resources:
+            from .plan._state import PLAN_PRIVATE_STATE_KEYS
 
-        Args:
-            identity: Canonical identity shared by Runtime, Graph, Observation, and
-                optional durable delivery.
-            agent: Existing Definition or callable returning one from this configured
-                TinkerFin family.
-            input: Ordinary Deep Agent state, native LangGraph resume command, or ``None``.
-            mode: Optional default or Plan route for new input.
-            config: Optional LangGraph execution configuration.
-            context: Optional context declared by the Definition.
-            on_native_part: Optional async observer after validation and Runtime
-                Observation, before delivery.
-            **stream_options: Advanced Profile-supported Graph stream options.
-
-        Returns:
-            A single-use managed native object stream.
-
-        Raises:
-            TypeError: Identity, agent, callback, or Definition shape is invalid.
-            ValueError: The Definition belongs to another configured TinkerFin family.
-            BaseException: Caller cancellation or process control interrupts setup.
-        """
-
-        from .plan._state import PLAN_PRIVATE_STATE_KEYS
-
-        self._validate_run_binding(identity=identity, on_part=on_native_part)
-        if not isinstance(agent, DeepAgentDefinition) and not callable(agent):
-            raise TypeError("agent must be a DeepAgentDefinition or callable")
-        requested_mode = (
-            self._plan_options.default_mode
-            if mode is None and self._plan_options is not None
-            else ("default" if mode is None else mode)
-        )
-        resolved_mode = validate_agent_mode(requested_mode, name="mode")
-        try:
-            definition = await self._resolve_agent(cast(_AgentSource, agent))
-            if not definition._belongs_to(self._family):
-                raise ValueError(
-                    "agent must come from this configured TinkerFin family"
+            self._validate_run_binding(identity=identity, on_part=on_native_part)
+            requested_mode = (
+                self._plan_options.default_mode
+                if mode is None and self._plan_options is not None
+                else ("default" if mode is None else mode)
+            )
+            resolved_mode = validate_agent_mode(requested_mode, name="mode")
+            try:
+                owner.require_admission()
+                definition = self._definition
+                stream = await definition._open_native_run(
+                    identity=identity,
+                    resources=resources,
+                    input=input,
+                    mode=mode,
+                    config=config,
+                    context=context,
+                    on_part=on_native_part,
+                    stream_options=stream_options,
                 )
-            stream = await definition._open_native_run(
-                identity=identity,
-                input=input,
-                mode=mode,
-                config=config,
-                context=context,
-                on_part=on_native_part,
-                stream_options=stream_options,
-            )
-            await stream._ready()
-            return stream
-        except Exception as error:  # noqa: BLE001 - Runtime owns failed Observation
-            setup_error = error
-            input_kind = (
-                "resume"
-                if isinstance(input, Command) and input.resume is not None
-                else "ordinary"
-            )
-            source = source_context(
-                identity=identity,
-                runtime_profile=self._runtime_profile.profile_id,
-                input_kind=input_kind,
-                parent_run_id=None,
-                mode=resolved_mode,
-                graph_input=input,
-                config={} if config is None else config,
-                private_state_keys=frozenset(
-                    {"_tinkerfin_lineage", "_tinkerfin_resume"}
+                stream._adopt_resources(resources)
+                await stream._ready()
+                return stream
+            except Exception as error:  # noqa: BLE001 - Runtime owns failed Observation
+                setup_error = error
+                input_kind = (
+                    "resume"
+                    if isinstance(input, Command) and input.resume is not None
+                    else "ordinary"
                 )
-                | PLAN_PRIVATE_STATE_KEYS,
-            )
-            observation = self._observation_hub(
-                source, initialization_error=setup_error
-            )
+                source = source_context(
+                    identity=identity,
+                    runtime_profile=self._runtime_profile.profile_id,
+                    input_kind=input_kind,
+                    parent_run_id=None,
+                    mode=resolved_mode,
+                    graph_input=input,
+                    config={} if config is None else config,
+                    private_state_keys=frozenset({"_tinkerfin_resume"})
+                    | PLAN_PRIVATE_STATE_KEYS,
+                )
+                observation = self._observation_hub(
+                    source, initialization_error=setup_error
+                )
 
-            async def failed_source() -> AsyncIterator[Mapping[str, object]]:
-                if False:  # pragma: no cover - establish async iterator shape
-                    yield {}
-                raise setup_error
+                async def failed_source() -> AsyncIterator[Mapping[str, object]]:
+                    if False:  # pragma: no cover - establish async iterator shape
+                        yield {}
+                    raise setup_error
 
-            failed_stream = self._run_native(
-                failed_source,
-                identity=identity,
-                on_part=on_native_part,
-                observation=observation,
-            )
-            await failed_stream._ready()
-            return failed_stream
+                failed_stream = self._run_native(
+                    failed_source,
+                    identity=identity,
+                    on_part=on_native_part,
+                    observation=observation,
+                )
+                failed_stream.error = setup_error
+                failed_stream._adopt_resources(resources)
+                await failed_stream._ready()
+                return failed_stream
 
-    async def ainvoke(
+    async def _open_agui_prepared(
         self,
         identity: RunIdentity,
+        owner: RunOwner,
         *,
-        agent: _AgentSource,
-        input: InputAgentState | Command[object] | None,
-        mode: AgentMode | None = None,
-        config: RunnableConfig | None = None,
-        context: object | None = None,
-        on_native_part: PartObserver[Mapping[str, object]] | None = None,
-        **stream_options: object,
-    ) -> Mapping[str, object]:
-        """Run one managed invocation and return its final root state.
-
-        This facade consumes the same Profile-owned canonical source as
-        :meth:`open_run`, so Runtime observations, model and Tool callbacks,
-        cancellation, and terminal settlement do not depend on whether the caller wants
-        a stream or one final result.
-
-        Args:
-            identity: Canonical identity shared by Runtime, Graph, and Observation.
-            agent: Existing Definition or lazy Definition factory from this family.
-            input: Ordinary Deep Agent state, native resume command, or ``None``.
-            mode: Optional default or Plan route.
-            config: Optional LangGraph configuration.
-            context: Optional context declared by the Definition.
-            on_native_part: Optional observer after validation and Observation.
-            **stream_options: Advanced options supported by the selected Profile.
-
-        Returns:
-            A defensive copy of the latest root values state. Interrupted output retains
-            the current normalized ``__interrupt__`` list.
-
-        Raises:
-            TinkerFinLifecycleError: The managed source emits no root values boundary.
-            BaseException: Profile binding, execution, observation, or cleanup fails.
-        """
-
-        stream = await self.open_run(
-            identity,
-            agent=agent,
-            input=input,
-            mode=mode,
-            config=config,
-            context=context,
-            on_native_part=on_native_part,
-            **stream_options,
-        )
-        state: dict[str, object] | None = None
-        async for part in stream:
-            canonical = stream._take_frame(part).canonical
-            if not isinstance(canonical, NativeValuesStreamPart) or canonical.ns != ():
-                continue
-            state = dict(canonical.data)
-            if canonical.interrupts:
-                state["__interrupt__"] = list(canonical.interrupts)
-            else:
-                state.pop("__interrupt__", None)
-        if state is None:
-            raise TinkerFinLifecycleError(
-                "managed invocation completed without a root values boundary"
-            )
-        return state
-
-    async def _resolve_agent(
-        self,
-        agent: _AgentSource,
-    ) -> _DefinitionAny:
-        """Resolve one existing or lazily created Definition exactly once."""
-
-        if isinstance(agent, DeepAgentDefinition):
-            return cast(_DefinitionAny, agent)
-        resolved = agent()
-        if inspect.isawaitable(resolved):
-            resolved = await resolved
-        if not isinstance(resolved, DeepAgentDefinition):
-            raise TypeError("agent callable must return DeepAgentDefinition")
-        return resolved
-
-    async def open_agui_run(
-        self,
-        identity: RunIdentity,
-        *,
-        agent: _AgentSource,
         messages: Sequence[UserMessage | Mapping[str, object]] | None = None,
         input: InputAgentState | None = None,
         resume: AgUiResumeRequest | None = None,
@@ -1056,7 +1573,6 @@ class TinkerFin:
         context: object | None = None,
         on_resume_saved: AgUiResumeCheckpointObserver | None = None,
         on_resume_not_saved: AgUiResumeNotSavedObserver | None = None,
-        resume_checkpointer: _CheckpointSaver | None = None,
         stream_timeout: float | None = None,
         cleanup_timeout: float | None = None,
         include_reasoning_events: bool = False,
@@ -1065,199 +1581,92 @@ class TinkerFin:
         on_agui_event: EventObserver | None = None,
         **stream_options: object,
     ) -> AgUiEventStream:
-        """Open one managed ordinary or resumed AG-UI Run through a single Graph.
+        """Prepare one bound AG-UI execution and settle resume failures."""
 
-        The facade owns asynchronous Agent preparation, Graph construction,
-        authoritative checkpoint resolution, durable resume settlement, failed lifecycle
-        conversion, and stream creation. Before returning, it commits Run start and input
-        observations without consuming the first public event. Existing Definitions and
-        low-level Runtime APIs remain available for advanced orchestration.
+        async with RunResources(owner) as resources:
+            require_agui()
 
-        Args:
-            identity: Canonical identity shared by Runtime, Graph, Observation, AG-UI,
-                checkpoint lineage, and optional durable delivery.
-            agent: Existing Definition or synchronous/asynchronous callable returning one
-                from this configured TinkerFin family.
-            messages: Standard AG-UI user messages with final, distinct host-assigned
-                IDs. The framework validates and converts text and media before Agent
-                preparation. Hosts authorize durable attachment references first.
-            input: Advanced explicit Graph state; mutually exclusive with ``messages``
-                and ``resume``. Use ``messages`` for ordinary chat input.
-            resume: Untrusted AG-UI decisions resolved from the Definition checkpointer;
-                mutually exclusive with ``input``.
-            parent_run_id: Optional branch or interrupted source in the same thread.
-            mode: Optional default or Plan route for new input.
-            config: Optional LangGraph execution configuration.
-            context: Optional context declared by the Definition.
-            on_resume_saved: Optional idempotent callback after the exact marker is
-                saver-readable and Trace Observation is forced.
-            on_resume_not_saved: Optional idempotent settlement invoked only when no
-                prepared or accepted marker exists.
-            resume_checkpointer: Optional authoritative saver for a lazy resumed Agent
-                that intentionally overrides this TinkerFin factory's default. The
-                callable must return a Definition borrowing this exact object.
-            stream_timeout: Optional total native pull deadline in seconds.
-            cleanup_timeout: Optional caller wait for protected stream cleanup.
-            include_reasoning_events: Whether verified public reasoning emits AG-UI
-                reasoning events.
-            include_subagent_events: Whether validated subagent events are emitted.
-            on_native_part: Optional observer after native validation and Observation.
-            on_agui_event: Optional observer before each public AG-UI event is delivered.
-            **stream_options: Advanced Profile-supported Graph stream options.
-
-        Returns:
-            A single-use AG-UI event stream with one main lifecycle.
-
-        Raises:
-            TypeError: Identity, agent, request, or callback shape is invalid.
-            ValueError: Input/resume selection or configured factory ownership is invalid.
-            BaseException: Caller cancellation or process control interrupts setup.
-        """
-
-        require_agui()
-        from .agui_resume import AgUiResumeRequest as AgUiResumeRequestType
-
-        self._validate_run_binding(identity=identity, on_part=on_native_part)
-        if not isinstance(agent, DeepAgentDefinition) and not callable(agent):
-            raise TypeError("agent must be a DeepAgentDefinition or callable")
-        if sum(value is not None for value in (messages, input, resume)) != 1:
-            raise ValueError(
-                "exactly one of messages, input or resume must be provided"
+            definition = self._definition
+            settlement_checkpointer = (
+                None if resume is None else definition._resume_checkpointer()
             )
-        if resume is not None and not isinstance(resume, AgUiResumeRequestType):
-            raise TypeError("resume must be an AgUiResumeRequest or None")
-        if resume_checkpointer is not None and not isinstance(
-            resume_checkpointer,
-            BaseCheckpointSaver,
-        ):
-            raise TypeError("resume_checkpointer must be a BaseCheckpointSaver or None")
-        if resume_checkpointer is not None and resume is None:
-            raise ValueError("resume_checkpointer requires a resume request")
-        for name, callback in (
-            ("on_resume_saved", on_resume_saved),
-            ("on_resume_not_saved", on_resume_not_saved),
-            ("on_agui_event", on_agui_event),
-        ):
-            if callback is not None and not callable(callback):
-                raise TypeError(f"{name} must be an async callable or None")
-        if (
-            resume is not None
-            and resume_checkpointer is None
-            and self._checkpointer is None
-            and not isinstance(agent, DeepAgentDefinition)
-        ):
-            raise ValueError(
-                "resume with a lazy agent requires TinkerFin(checkpointer=...)"
+            settlement_authority_proven = settlement_checkpointer is not None
+            requested_mode = (
+                self._plan_options.default_mode
+                if mode is None and self._plan_options is not None
+                else ("default" if mode is None else mode)
             )
-        lazy_agent = not isinstance(agent, DeepAgentDefinition)
-        settlement_checkpointer = (
-            None
-            if resume is None
-            else (
-                (
-                    resume_checkpointer
-                    if resume_checkpointer is not None
-                    else self._checkpointer
+            resolved_mode = validate_agent_mode(requested_mode, name="mode")
+            try:
+                owner.require_admission()
+                if messages is not None:
+                    from .agui_input import _user_messages_to_input
+
+                    input = _user_messages_to_input(messages)
+                stream = await definition._open_agui_run(
+                    identity=identity,
+                    resources=resources,
+                    input=input,
+                    resume_request=resume,
+                    parent_run_id=parent_run_id,
+                    mode=mode,
+                    config=config,
+                    context=context,
+                    on_resume_checkpointed=on_resume_saved,
+                    on_resume_not_saved=on_resume_not_saved,
+                    timeout=stream_timeout,
+                    settlement_timeout=cleanup_timeout,
+                    expose_reasoning_events=include_reasoning_events,
+                    expose_subagent_events=include_subagent_events,
+                    on_part=on_native_part,
+                    on_event=on_agui_event,
+                    stream_options=stream_options,
                 )
-                if lazy_agent
-                else agent._resume_checkpointer()
-            )
-        )
-        if (
-            resume is not None
-            and not lazy_agent
-            and resume_checkpointer is not None
-            and resume_checkpointer is not settlement_checkpointer
-        ):
-            raise ValueError(
-                "resume_checkpointer must be the Definition's effective checkpointer"
-            )
-        settlement_authority_proven = settlement_checkpointer is not None
-        requested_mode = (
-            self._plan_options.default_mode
-            if mode is None and self._plan_options is not None
-            else ("default" if mode is None else mode)
-        )
-        resolved_mode = validate_agent_mode(requested_mode, name="mode")
-        definition: _DefinitionAny | None = None
-        try:
-            if messages is not None:
-                from .agui_input import _user_messages_to_input
-
-                input = _user_messages_to_input(messages)
-            definition = await self._resolve_agent(cast(_AgentSource, agent))
-            if resume is not None and lazy_agent:
-                effective_checkpointer = definition._resume_checkpointer()
-                if effective_checkpointer is not settlement_checkpointer:
-                    settlement_authority_proven = False
-                    raise ValueError(
-                        "lazy resume agent must use the declared resume_checkpointer"
-                    )
-            if not definition._belongs_to(self._family):
-                raise ValueError(
-                    "agent must come from this configured TinkerFin family"
-                )
-            stream = await definition._open_agui_run(
-                identity=identity,
-                input=input,
-                resume_request=resume,
-                parent_run_id=parent_run_id,
-                mode=mode,
-                config=config,
-                context=context,
-                on_resume_checkpointed=on_resume_saved,
-                on_resume_not_saved=on_resume_not_saved,
-                timeout=stream_timeout,
-                settlement_timeout=cleanup_timeout,
-                expose_reasoning_events=include_reasoning_events,
-                expose_subagent_events=include_subagent_events,
-                on_part=on_native_part,
-                on_event=on_agui_event,
-                stream_options=stream_options,
-            )
-            await stream._ready()
-            return stream
-        # Resume claim settlement covers every setup exit before a request Runtime can
-        # install its own marker guard. Ordinary failures become one AG-UI error
-        # lifecycle; cancellation and process control settle first and then propagate.
-        except BaseException as error:
-            if (
-                resume is not None
-                and on_resume_not_saved is not None
-                and settlement_authority_proven
-            ):
-                try:
-                    await self._settle_resume_not_saved(
-                        identity=identity,
-                        checkpointer=settlement_checkpointer,
-                        callback=on_resume_not_saved,
-                    )
-                except BaseException as settlement_error:
-                    if isinstance(error, Exception) and not isinstance(
-                        settlement_error,
-                        Exception,
-                    ):
-                        settlement_error.add_note(
-                            f"AG-UI setup also failed: {type(error).__name__}: {error}"
+                stream._adopt_resources(resources)
+                await stream._ready()
+                return stream
+            # Resume claim settlement covers every setup exit before a request Runtime can
+            # install its own marker guard. Ordinary failures become one AG-UI error
+            # lifecycle; cancellation and process control settle first and then propagate.
+            except BaseException as error:
+                if (
+                    resume is not None
+                    and on_resume_not_saved is not None
+                    and settlement_authority_proven
+                ):
+                    try:
+                        await self._settle_resume_not_saved(
+                            identity=identity,
+                            checkpointer=settlement_checkpointer,
+                            callback=on_resume_not_saved,
                         )
-                        raise settlement_error from error
-                    error.add_note(
-                        "resume not-saved settlement also failed: "
-                        f"{type(settlement_error).__name__}: {settlement_error}"
-                    )
-            if not isinstance(error, Exception):
-                raise
-            failed_stream = self.failed_agui_run(
-                error,
-                identity=identity,
-                parent_run_id=parent_run_id,
-                mode=resolved_mode,
-                input=input,
-                config=config,
-                resume_request=resume,
-            )
-            await failed_stream._ready()
-            return failed_stream
+                    except BaseException as settlement_error:  # noqa: BLE001 - retain both initialization and resume-release failures
+                        selected = select_failure(
+                            error,
+                            settlement_error,
+                            label="resume not-saved settlement also failed",
+                        )
+                        if selected is not error:
+                            raise selected
+                if not isinstance(error, Exception):
+                    raise
+                failed_stream = self._failed_agui_run(
+                    error,
+                    identity=identity,
+                    parent_run_id=parent_run_id,
+                    mode=resolved_mode,
+                    input=input,
+                    config=config,
+                    resume_request=resume,
+                )
+                failed_stream._adopt_resources(resources)
+                await failed_stream._ready()
+                # Keep construction failures in the owning preparation scope until
+                # observation startup succeeds. No await separates this handoff from
+                # returning the stream that retains the original error.
+                failures, _owns_failures = OwnedOperationFailures.for_source()
+                failures.transfer(error)
+                return failed_stream
 
     async def _settle_resume_not_saved(
         self,
@@ -1290,7 +1699,7 @@ class TinkerFin:
         )
         await join_task(task)
 
-    def failed_agui_run(
+    def _failed_agui_run(
         self,
         error: Exception,
         *,
@@ -1304,11 +1713,9 @@ class TinkerFin:
     ) -> AgUiEventStream:
         """Create one observed AG-UI lifecycle for a pre-Graph setup failure.
 
-        Hosts call this boundary after accepting a semantic run but failing to build
-        its model, Sandbox, Definition, or Graph. The Runtime records the real input,
-        failed terminal, and close without requiring host code to invoke Observer
-        methods directly. A framework-owned resume request preserves the real input
-        kind when checkpoint resolution itself fails before a private binding exists.
+        The Runtime records the input, failed terminal, and close when preparation
+        fails before execution. A resume request preserves the input kind even when
+        checkpoint resolution fails before a validated binding exists.
 
         Args:
             error: Original setup failure retained as trusted causal evidence.
@@ -1405,102 +1812,8 @@ class TinkerFin:
         )
         stream._runtime_error_code = "runtime_initialization_error"
         stream._initialization_failed = True
+        stream.error = error
         return stream
-
-    def plan(
-        self,
-        *,
-        enabled: bool = True,
-        default_mode: AgentMode = "default",
-        planner_model: str | BaseChatModel | None = None,
-        clarification_schema: type[ClarificationFormBase] = DefaultClarificationForm,
-        clarification_types: Sequence[ClarificationType[Any, Any]] = (),
-        content_schema: type[PlanContentModel] = StructuredPlanContent,
-        allowed_review_actions: Sequence[
-            PlanReviewAction
-        ] = DEFAULT_ALLOWED_REVIEW_ACTIONS,
-    ) -> TinkerFin:
-        """Return a factory with immutable Plan-capability options.
-
-        The returned factory borrows the same coordinator and global state schema.
-        Existing Definitions and this source factory are unchanged.
-
-        Args:
-            enabled: Whether subsequent Deep Agent Definitions support Plan runs.
-            default_mode: Run mode used when ``new`` or ``new_agui`` omits one.
-            planner_model: Optional model dedicated to read-only planning.
-            clarification_schema: Concrete host form used by the Planner.
-            clarification_types: Additional custom semantic question types.
-            content_schema: Concrete content model used for drafts and confirmed Plans.
-            allowed_review_actions: Ordered decisions accepted for each Plan draft
-                review.
-
-        Returns:
-            A separate configured TinkerFin factory.
-
-        Raises:
-            TypeError: ``enabled``, a model, or a review action has the wrong type.
-            PlanModeConfigurationError: A mode or disabled configuration is invalid.
-        """
-
-        if type(enabled) is not bool:
-            raise TypeError("enabled must be a bool")
-        mode = validate_agent_mode(default_mode, name="default_mode")
-        actions = validate_allowed_review_actions(allowed_review_actions)
-        if isinstance(clarification_types, (str, bytes)) or not isinstance(
-            clarification_types, Sequence
-        ):
-            raise TypeError("clarification_types must be a sequence")
-        frozen_clarification_types = tuple(clarification_types)
-        for name, model in (("planner_model", planner_model),):
-            if model is not None and not isinstance(model, (str, BaseChatModel)):
-                raise TypeError(
-                    f"{name} must be a model string, BaseChatModel, or None"
-                )
-            if isinstance(model, str) and not model.strip():
-                raise ValueError(f"{name} must not be blank")
-        if not enabled and (
-            mode != "default"
-            or planner_model is not None
-            or clarification_schema is not DefaultClarificationForm
-            or frozen_clarification_types
-            or content_schema is not StructuredPlanContent
-            or actions != DEFAULT_ALLOWED_REVIEW_ACTIONS
-        ):
-            from .plan.errors import PlanModeConfigurationError
-
-            raise PlanModeConfigurationError(
-                "disabled Plan capability cannot configure a mode, model, form, "
-                "clarification types, content schema, or review actions"
-            )
-        configured = TinkerFin(
-            checkpointer=self._checkpointer,
-            run_coordinator=self._run_coordinator,
-            state_schema=self._state_schema,
-            runtime_profile=self._runtime_profile,
-        )
-        configured._observers = self._observers
-        configured._family = self._family
-        configured._attachments = self._attachments
-        if enabled:
-            clarification = create_clarification_binding(
-                clarification_schema,
-                custom_types=frozen_clarification_types,
-            )
-            content = create_plan_content_binding(content_schema)
-            configured._plan_options = PlanOptions(
-                clarification=clarification,
-                content=content,
-                contracts=create_plan_contract_binding(
-                    clarification,
-                    content,
-                    allowed_review_actions=actions,
-                ),
-                allowed_review_actions=actions,
-                default_mode=mode,
-                planner_model=planner_model,
-            )
-        return configured
 
     def _validate_run_binding(
         self,
@@ -1515,6 +1828,8 @@ class TinkerFin:
             raise TypeError("identity must be a RunIdentity or None")
         if coordinator is not None and identity is None:
             raise ValueError("identity is required when run_coordinator is configured")
+        if identity is not None and identity.namespace != self._namespace:
+            raise ValueError("run identity belongs to another namespace")
         if on_part is not None and not callable(on_part):
             raise TypeError("on_part must be an async callable or None")
 
@@ -1624,9 +1939,12 @@ class TinkerFin:
 
 __all__ = [
     "AgUiEventStream",
+    "AgUiRunStream",
     "AgUiSettlementTimeoutError",
+    "AgentRuntime",
     "EventObserver",
     "NativeGraphRunStream",
+    "NativeRunStream",
     "NativeStreamPart",
     "PartObserver",
     "SseBody",

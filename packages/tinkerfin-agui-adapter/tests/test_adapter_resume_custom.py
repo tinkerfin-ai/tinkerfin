@@ -38,7 +38,7 @@ def test_mixed_resolved_and_cancelled_resume_preserves_every_native_slot() -> No
             ),
         ),
         interrupts=(interrupt,),
-        messages_by_namespace={
+        messages_by_graph_namespace={
             (): (
                 AIMessage(
                     id="message-root",
@@ -94,7 +94,7 @@ def test_mixed_resume_uses_cancelled_actions_to_disambiguate_resolved_calls() ->
             ),
         ),
         interrupts=(interrupt,),
-        messages_by_namespace={
+        messages_by_graph_namespace={
             (): (
                 AIMessage(
                     id="message-root",
@@ -154,7 +154,7 @@ def test_mixed_resume_collapses_ambiguity_confined_to_cancelled_calls() -> None:
             ),
         ),
         interrupts=(interrupt,),
-        messages_by_namespace={
+        messages_by_graph_namespace={
             (): (
                 AIMessage(
                     id="message-root",
@@ -215,7 +215,7 @@ def test_mixed_resume_rejects_distinct_resolved_call_projections() -> None:
                 ResumeEntry(interrupt_id="root#1", status="cancelled"),
             ),
             interrupts=(interrupt,),
-            messages_by_namespace={
+            messages_by_graph_namespace={
                 (): (
                     AIMessage(
                         id="message-root",
@@ -319,7 +319,7 @@ def test_multi_group_resume_bounds_dead_end_correlation_search() -> None:
         ResumeMapper().map(
             entries=entries,
             interrupts=(repeated_interrupt, second_interrupt),
-            messages_by_namespace={(): messages},
+            messages_by_graph_namespace={(): messages},
         )
 
     assert raised.value.__cause__ is not None

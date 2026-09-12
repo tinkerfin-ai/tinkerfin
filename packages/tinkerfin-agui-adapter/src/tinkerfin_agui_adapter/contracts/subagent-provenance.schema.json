@@ -1,5 +1,5 @@
 {
-  "$id": "https://github.com/tinkerfin-ai/tinkerfin/blob/main/packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/contracts/subagent-provenance.schema.json",
+  "$id": "https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/packages/tinkerfin-agui-adapter/src/tinkerfin_agui_adapter/contracts/subagent-provenance.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Stable identity and native provenance for one logical subagent invocation.",
@@ -16,27 +16,27 @@
       "title": "Description",
       "type": "string"
     },
+    "graphNamespace": {
+      "description": "Complete native child graph namespace",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Graphnamespace",
+      "type": "array"
+    },
     "graphTaskId": {
       "description": "Native LangGraph task ID that opened the child graph",
       "minLength": 1,
       "title": "Graphtaskid",
       "type": "string"
     },
-    "namespace": {
-      "description": "Complete native child graph namespace",
+    "parentGraphNamespace": {
+      "description": "Complete graph namespace that issued the parent task Tool",
       "items": {
         "type": "string"
       },
-      "minItems": 1,
-      "title": "Namespace",
-      "type": "array"
-    },
-    "parentNamespace": {
-      "description": "Complete namespace that issued the parent task Tool",
-      "items": {
-        "type": "string"
-      },
-      "title": "Parentnamespace",
+      "title": "Parentgraphnamespace",
       "type": "array"
     },
     "parentToolCallId": {
@@ -67,8 +67,8 @@
   "required": [
     "schema",
     "subagentInvocationId",
-    "namespace",
-    "parentNamespace",
+    "graphNamespace",
+    "parentGraphNamespace",
     "graphTaskId",
     "agentName",
     "parentToolCallId",

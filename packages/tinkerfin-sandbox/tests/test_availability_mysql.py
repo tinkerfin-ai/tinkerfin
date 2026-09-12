@@ -9,6 +9,7 @@ from dataclasses import replace
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+from tests.support.sql_engines import SqlEngineFactory
 
 from tinkerfin_sandbox import (
     OpenSandboxStateError,
@@ -47,10 +48,11 @@ async def test_mysql_availability_service_identity(
 
 
 async def test_mysql_all_holders_acknowledge_while_pause_claim_is_held(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
 ) -> None:
-    owner = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
-    observer = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
+    owner = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
+    observer = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
     await owner.start(warm_pool_size=0)
     await observer.start(warm_pool_size=0)
     claim = await owner.acquire_owner("owner")
@@ -87,10 +89,11 @@ async def test_mysql_all_holders_acknowledge_while_pause_claim_is_held(
 
 
 async def test_mysql_stale_intents_and_binding_releases_cannot_affect_successors(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
 ) -> None:
-    first = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
-    second = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
+    first = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
+    second = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
     await first.start(warm_pool_size=0)
     await second.start(warm_pool_size=0)
     claim = await first.acquire_owner("owner")
@@ -150,11 +153,12 @@ async def test_mysql_stale_intents_and_binding_releases_cannot_affect_successors
 
 @pytest.mark.parametrize("register_first", [True, False])
 async def test_mysql_registration_and_drain_are_atomic_across_states(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
     register_first: bool,
 ) -> None:
-    first = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
-    second = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
+    first = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
+    second = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
     await first.start(warm_pool_size=0)
     await second.start(warm_pool_size=0)
     try:
@@ -184,10 +188,11 @@ async def test_mysql_registration_and_drain_are_atomic_across_states(
         await asyncio.gather(first.aclose(), second.aclose())
 
 
-async def test_mysql_reopen_retains_unconfirmed_holders_after_worker_expiry(
+async def test_mysql_reopen_retains_unconfirmed_holders_after_worker_closes(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
 ) -> None:
-    first = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url, lease_ttl=2.0)
+    first = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
     await first.start(warm_pool_size=0)
     claim = await first.acquire_owner("owner")
     try:
@@ -196,8 +201,7 @@ async def test_mysql_reopen_retains_unconfirmed_holders_after_worker_expiry(
     finally:
         await first.release_owner(claim)
         await first.aclose()
-    await asyncio.sleep(2.1)
-    reopened = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
+    reopened = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
     await reopened.start(warm_pool_size=0)
     current = await reopened.acquire_owner("owner")
     try:
@@ -292,11 +296,12 @@ async def test_mysql_expired_owner_claim_cannot_dispatch_or_cancel(
 
 
 async def test_mysql_distinct_owners_publish_availability_concurrently(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
 ) -> None:
     """Unrelated bindings can initialize an empty availability table in parallel."""
-    first = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
-    second = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url)
+    first = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
+    second = SQLAlchemyOpenSandboxState(engine=sql_engine(mysql_sandbox_url))
     await first.start(warm_pool_size=0)
     await second.start(warm_pool_size=0)
     try:
@@ -325,10 +330,15 @@ async def test_mysql_distinct_owners_publish_availability_concurrently(
 
 
 async def test_mysql_namespaces_keep_holder_registration_and_drain_independent(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
 ) -> None:
-    first = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url, namespace="namespace-a")
-    second = SQLAlchemyOpenSandboxState(url=mysql_sandbox_url, namespace="namespace-b")
+    first = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(mysql_sandbox_url), namespace="namespace-a"
+    )
+    second = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(mysql_sandbox_url), namespace="namespace-b"
+    )
     await first.start(warm_pool_size=0)
     await second.start(warm_pool_size=0)
     first_claim = await first.acquire_owner("same-owner")

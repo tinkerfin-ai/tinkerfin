@@ -6,11 +6,11 @@ from tinkerfin_messaging import (
     AgUiCodec,
     MemoryBackend,
     MessageCodec,
-    MessagingBackend,
     NativeStreamPartCodec,
     RedisBackend,
     SseRenderer,
 )
+from tinkerfin_messaging.backend_contract import MessagingBackend
 
 
 async def test_messaging_builtin_implementations_declare_their_protocols() -> None:

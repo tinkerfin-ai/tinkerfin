@@ -330,28 +330,28 @@ def _process_ai_chunk(
         and not reasoning_events
     ):
         if chunk.chunk_position == "last":
-            events.extend(self._close_tools(source.namespace, raw_event))
-            events.extend(self._close_reasoning(source.namespace, raw_event))
-            events.extend(self._close_message(source.namespace, raw_event))
+            events.extend(self._close_tools(source.graph_namespace, raw_event))
+            events.extend(self._close_reasoning(source.graph_namespace, raw_event))
+            events.extend(self._close_message(source.graph_namespace, raw_event))
         return events
 
-    active_message_id = self._active_messages.get(source.namespace)
+    active_message_id = self._active_messages.get(source.graph_namespace)
     if (
         chunk.id is not None
         and active_message_id is not None
-        and self._message_id(source.namespace, chunk.id) != active_message_id
+        and self._message_id(source.graph_namespace, chunk.id) != active_message_id
     ):
-        events.extend(self._close_message(source.namespace, raw_event))
+        events.extend(self._close_message(source.graph_namespace, raw_event))
 
     events.extend(reasoning_events)
 
     text = visible_content
     if text:
         # Visible answer text closes reasoning for this message before text starts.
-        events.extend(self._close_reasoning(source.namespace, raw_event))
+        events.extend(self._close_reasoning(source.graph_namespace, raw_event))
         raw_message_id = self._stable_message_id(chunk)
-        message_id = self._message_id(source.namespace, raw_message_id)
-        active_message_id = self._active_messages.get(source.namespace)
+        message_id = self._message_id(source.graph_namespace, raw_message_id)
+        active_message_id = self._active_messages.get(source.graph_namespace)
         if active_message_id != message_id:
             if active_message_id is not None:
                 events.append(
@@ -360,7 +360,7 @@ def _process_ai_chunk(
                         raw_event=raw_event,
                     )
                 )
-            self._active_messages[source.namespace] = message_id
+            self._active_messages[source.graph_namespace] = message_id
             events.append(
                 TextMessageStartEvent(
                     message_id=message_id,
@@ -378,11 +378,13 @@ def _process_ai_chunk(
         )
 
     if attachments:
-        message_id = self._message_id(source.namespace, self._stable_message_id(chunk))
-        events.extend(self._close_reasoning(source.namespace, raw_event))
-        if self._active_messages.get(source.namespace) != message_id:
-            events.extend(self._close_message(source.namespace, raw_event))
-            self._active_messages[source.namespace] = message_id
+        message_id = self._message_id(
+            source.graph_namespace, self._stable_message_id(chunk)
+        )
+        events.extend(self._close_reasoning(source.graph_namespace, raw_event))
+        if self._active_messages.get(source.graph_namespace) != message_id:
+            events.extend(self._close_message(source.graph_namespace, raw_event))
+            self._active_messages[source.graph_namespace] = message_id
             events.append(
                 TextMessageStartEvent(
                     message_id=message_id,
@@ -402,7 +404,7 @@ def _process_ai_chunk(
         )
 
     if chunk.tool_call_chunks:
-        events.extend(self._close_reasoning(source.namespace, raw_event))
+        events.extend(self._close_reasoning(source.graph_namespace, raw_event))
         for tool_chunk in chunk.tool_call_chunks:
             events.extend(
                 self._process_tool_chunk(
@@ -413,9 +415,9 @@ def _process_ai_chunk(
                 )
             )
     if chunk.chunk_position == "last":
-        events.extend(self._close_tools(source.namespace, raw_event))
-        events.extend(self._close_reasoning(source.namespace, raw_event))
-        events.extend(self._close_message(source.namespace, raw_event))
+        events.extend(self._close_tools(source.graph_namespace, raw_event))
+        events.extend(self._close_reasoning(source.graph_namespace, raw_event))
+        events.extend(self._close_message(source.graph_namespace, raw_event))
     return events
 
 
@@ -436,13 +438,13 @@ def _process_tool_chunk(
     index = tool_chunk.get("index")
     raw_source_message_id = self._stable_message_id(chunk)
     source_message_id = self._message_id(
-        source.namespace,
+        source.graph_namespace,
         raw_source_message_id,
     )
-    index_key = (source.namespace, source_message_id, index)
+    index_key = (source.graph_namespace, source_message_id, index)
     chunk_id = tool_chunk.get("id")
     tool_call_id = (
-        self._tool_call_id(source.namespace, str(chunk_id))
+        self._tool_call_id(source.graph_namespace, str(chunk_id))
         if chunk_id
         else self._tool_ids_by_index.get(index_key)
     )
@@ -466,12 +468,14 @@ def _process_tool_chunk(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             parent_message_id=source_message_id,
-            namespace=source.namespace,
+            namespace=source.graph_namespace,
             index=index,
         )
         self._active_tools[tool_call_id] = active
         self._tool_names_by_id[tool_call_id] = tool_name
-        self._tool_history.setdefault((source.namespace, tool_name), []).append(active)
+        self._tool_history.setdefault((source.graph_namespace, tool_name), []).append(
+            active
+        )
         self._tool_ids_by_index[index_key] = tool_call_id
         self._tool_id_history_by_index[index_key] = tool_call_id
         self._started_tool_ids.add(tool_call_id)
@@ -512,11 +516,11 @@ def _process_tool_result(
     """
 
     tool_call_id = self._tool_call_id(
-        source.namespace,
+        source.graph_namespace,
         str(message.tool_call_id),
     )
     message_id = self._message_id(
-        source.namespace,
+        source.graph_namespace,
         str(message.id or f"tool-result:{message.tool_call_id}"),
     )
     normalized_content = _normalize_tool_content(
@@ -552,8 +556,8 @@ def _process_tool_result(
     events: list[BaseEvent] = []
     # A Tool result is a hard message boundary, including for providers that omit
     # the `last` marker on their final AI chunk.
-    events.extend(self._close_reasoning(source.namespace, raw_event))
-    events.extend(self._close_message(source.namespace, raw_event))
+    events.extend(self._close_reasoning(source.graph_namespace, raw_event))
+    events.extend(self._close_message(source.graph_namespace, raw_event))
     if tool_call_id not in self._started_tool_ids:
         self._tool_names_by_id[tool_call_id] = effective_tool_name
         events.append(
@@ -637,19 +641,19 @@ def _emit_reasoning(
 
     raw_source_message_id = self._stable_message_id(chunk)
     source_message_id = self._message_id(
-        source.namespace,
+        source.graph_namespace,
         raw_source_message_id,
     )
     run_id = self._identity.run_id
     key = (run_id, source_message_id)
-    events = self._close_message(source.namespace, raw_event)
+    events = self._close_message(source.graph_namespace, raw_event)
     active = self._active_reasoning.get(key)
     if active is None:
         # Model calls are sequential within a run, so a new source message closes
         # the previous reasoning stream.
         events.extend(
             self._close_reasoning(
-                source.namespace,
+                source.graph_namespace,
                 raw_event,
             )
         )
@@ -658,15 +662,15 @@ def _emit_reasoning(
             source_message_id=source_message_id,
             reasoning_id=self._ids.encode(
                 "reasoning",
-                source.namespace,
+                source.graph_namespace,
                 raw_source_message_id,
             ),
             message_id=self._ids.encode(
                 "reasoning-message",
-                source.namespace,
+                source.graph_namespace,
                 raw_source_message_id,
             ),
-            namespace=source.namespace,
+            namespace=source.graph_namespace,
         )
         self._active_reasoning[key] = active
         events.append(
@@ -819,10 +823,10 @@ def _record_agent_name(
 def _require_started_source(self: DeepAgentAgUiAdapter, source: AgentSource) -> None:
     if source.kind == "root":
         return
-    if source.namespace not in self._graph_scopes:
+    if source.graph_namespace not in self._graph_scopes:
         raise RuntimeError(
             "subgraph stream arrived before its native task-start correlation: "
-            f"namespace={source.namespace!r}"
+            f"namespace={source.graph_namespace!r}"
         )
 
 
@@ -842,14 +846,14 @@ def _source(
             kind="root",
             agent_type="main",
             agent_name="main",
-            namespace=namespace,
+            graph_namespace=namespace,
         )
     invocation = self._subagent_invocations.get(namespace)
     if invocation is not None:
         return AgentSource(
             kind="deep_agent_subagent",
-            namespace=namespace,
-            parent_namespace=invocation.parent_namespace,
+            graph_namespace=namespace,
+            parent_graph_namespace=invocation.parent_namespace,
             graph_task_id=invocation.graph_task_id,
             node_name="tools",
             agent_type="subagent",
@@ -862,11 +866,11 @@ def _source(
         )
     scope = self._graph_scopes.get(namespace)
     if scope is None:
-        return AgentSource(kind="compiled_subgraph", namespace=namespace)
+        return AgentSource(kind="compiled_subgraph", graph_namespace=namespace)
     return AgentSource(
         kind="compiled_subgraph",
-        namespace=namespace,
-        parent_namespace=scope.parent_namespace,
+        graph_namespace=namespace,
+        parent_graph_namespace=scope.parent_namespace,
         graph_task_id=scope.graph_task_id,
         node_name=scope.node_name,
     )
@@ -894,7 +898,7 @@ def _event_context(
         stream_mode=stream_mode,
         source=source,
         run_id=self._identity.run_id,
-        related_namespace=related_namespace,
+        related_graph_namespace=related_namespace,
         related_subagent_invocation_id=related_subagent_invocation_id,
         parent_tool_call_id=parent_tool_call_id,
         langgraph_node=langgraph_node,

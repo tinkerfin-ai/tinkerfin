@@ -74,7 +74,7 @@ const traceDetail = (
     id: 'message-authoritative',
     traceSeq: 1,
     sourceId: 'assistant-authoritative',
-    namespace: [],
+    graphNamespace: [],
     runId: RUN_ID,
     role: 'assistant',
     content: 'Trace 最终内容',

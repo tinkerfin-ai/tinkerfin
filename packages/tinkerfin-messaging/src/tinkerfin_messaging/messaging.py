@@ -33,6 +33,7 @@ from ._messaging_boundary import (
 from ._messaging_ledger import PreparedRun as _PreparedRun
 from ._messaging_ledger import _MessagingLedger
 from ._producer_runtime import _OwnerLease, _ProducedMessage
+from ._tasks import TaskOutcome, capture, join_owned_task, select_failure
 from .backend import MemoryBackend, RunStatus
 from .backend_contract import MessagingBackend
 from .errors import (
@@ -68,6 +69,7 @@ class _PreflightRegistration:
 
     owner: asyncio.Task[object]
     settled: asyncio.Future[None]
+    owner_close_requested: asyncio.Future[None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,10 +199,10 @@ class MessageSubscription(Generic[ReplayT]):
                     raise
                 primary.add_note(f"Messaging follow cleanup also failed: {close_error}")
 
-    def sse(self) -> AsyncGenerator[bytes, None]:
-        """Render committed messages in a caller-owned, closeable SSE body."""
+    def to_sse(self) -> AsyncGenerator[bytes, None]:
+        """Return committed messages as single-use UTF-8 SSE frames."""
 
-        return _messaging_boundary.sse(
+        return _messaging_boundary.to_sse(
             self,
         )
 
@@ -475,6 +477,9 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     ) -> MessageSubscription[ReplayT] | MessageSubscription[ProfileReplayT]:
         """Start or attach one source and return its run-bounded subscription.
 
+        Once a delivery callback starts, caller cancellation waits for it to finish.
+        Callbacks must bound database and network operations with resource timeouts.
+
         The producing request transfers its single-use source to Messaging, which
         closes it after terminal settlement. An attachment never opens its unused
         candidate source; Messaging closes that candidate once before returning the
@@ -493,8 +498,8 @@ class MessageChannel(Generic[SourceT, ReplayT]):
                 producer outcome.
             on_source_ready: Owner-only async callback after the source is ready and
                 before the producer task is created.
-            on_delivery_not_started: Async cleanup callback used only when neither a
-                producer nor a valid attachment was established.
+            on_delivery_not_started: Async cleanup callback used only when source readiness and a
+                valid attachment were both absent.
 
         Returns:
             Detachable subscription over committed, decoded messages.
@@ -568,7 +573,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         )
 
     @overload
-    async def sse(
+    async def open_sse(
         self,
         source: MessageSource[SourceT],
         *,
@@ -581,7 +586,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
     ) -> AsyncGenerator[bytes, None]: ...
 
     @overload
-    async def sse(
+    async def open_sse(
         self,
         source: ProfiledMessageSource[ProfileSourceT, ProfileReplayT],
         *,
@@ -593,7 +598,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[bytes, None]: ...
 
-    async def sse(
+    async def open_sse(
         self,
         source: MessageSource[object],
         *,
@@ -604,7 +609,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
         on_source_ready: Callable[[], Awaitable[None]] | None = None,
         on_delivery_not_started: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncGenerator[bytes, None]:
-        """Prepare durable publication and return its SSE response body.
+        """Start or attach a run and return its committed messages as UTF-8 SSE bytes.
 
         Args:
             source: Single-use object source owned and eventually closed by Messaging.
@@ -630,7 +635,7 @@ class MessageChannel(Generic[SourceT, ReplayT]):
             ValueError: The explicit and source identities conflict.
         """
 
-        return await _message_channel.sse(
+        return await _message_channel.open_sse(
             self,
             source,
             identity=identity,
@@ -780,7 +785,8 @@ class Messaging:
         self._preflight_tasks: set[_PreflightRegistration] = set()
         self._producer_tasks: set[asyncio.Task[None]] = set()
         self._settling_producers: set[asyncio.Task[None]] = set()
-        self._close_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[TaskOutcome[None]] | None = None
+        self._producers_stopped: asyncio.Future[TaskOutcome[None]] | None = None
 
     @property
     def backend(self) -> MessagingBackend:
@@ -879,105 +885,96 @@ class Messaging:
             )
 
     async def aclose(self) -> None:
-        """Close all owned producers through one reusable settlement task.
+        """Stop producers and finish accepted delivery cleanup.
 
-        A finite construction-time settlement timeout limits only this caller's wait.
-        The close task remains strongly owned, the facade stays unavailable to new
-        operations, and a later call resumes waiting for the same task.
+        Calls from a preparation callback wait for producers to stop; the callback
+        then returns to finish its own delivery cleanup. Other callers wait for both.
+        A finite settlement timeout limits only this caller's wait.
 
         Raises:
             MessagingSettlementTimeout: The configured caller wait expires.
-            BaseException: Owned producer settlement fails before closure completes.
+            BaseException: Owned work fails during shutdown.
         """
 
+        caller = asyncio.current_task()
+        owned = tuple(item for item in self._preflight_tasks if item.owner is caller)
+        for registration in owned:
+            if not registration.owner_close_requested.done():
+                registration.owner_close_requested.set_result(None)
         task = self._close_task
         if task is None:
-            caller = cast(asyncio.Task[object] | None, asyncio.current_task())
             self._state = "closing"
+            self._producers_stopped = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(
-                self._close_once(caller),
-                name="tinkerfin-messaging-close",
+                capture(self._close_once()), name="tinkerfin-messaging-close"
             )
             self._close_task = task
-            task.add_done_callback(self._close_finished)
-
+        stopped = self._producers_stopped
+        assert stopped is not None
+        completion = stopped if owned else task
         timeout = self._settlement_timeout
-        if timeout is None:
-            await _join_owned_task(task)
-            return
-        if task.done():
-            task.result()
+        if timeout is None or completion.done():
+            await join_owned_task(completion)
             return
         deadline = asyncio.timeout(timeout)
         try:
             async with deadline:
-                await asyncio.shield(task)
+                await asyncio.shield(completion)
         except TimeoutError as error:
             if deadline.expired():
                 raise MessagingSettlementTimeout(timeout=timeout) from error
             raise
+        await join_owned_task(completion)
 
-    async def _close_once(
-        self,
-        initiating_caller: asyncio.Task[object] | None,
-    ) -> None:
-        """Wait preflight work, settle producers, and close the facade exactly once."""
+    async def _close_once(self) -> None:
+        """Let preparation owners finish after production stops, then join them."""
 
-        primary: BaseException | None = None
+        outcome = await capture(self._stop_producers())
+        stopped = self._producers_stopped
+        assert stopped is not None
+        # This signal is not the facade's completion: a callback waiting for close
+        # must resume before its real registration.settled can become ready.
+        stopped.set_result(outcome)
         try:
-            setup_task = self._storage_setup_task
-            if setup_task is not None:
-                try:
-                    await _join_owned_task(setup_task)
-                except BaseException as setup_error:  # noqa: BLE001 - preserve outcome
-                    primary = setup_error
-
-            # A cancellation preflight can be waiting for the producer's durable
-            # terminal. Signal existing producers before joining preflights so close,
-            # cancel, and settlement cannot form a wait cycle.
-            for producer in tuple(self._producer_tasks):
-                if not producer.done() and producer not in self._settling_producers:
-                    producer.cancel()
-            preflights = tuple(
-                registration.settled
-                for registration in self._preflight_tasks
-                if registration.owner is not initiating_caller
-            )
-            if preflights:
-                await asyncio.gather(*preflights, return_exceptions=True)
-
-            # A startup preflight may have published a producer before observing the
-            # closing state. Re-snapshot after it settles and cancel any such owner.
-            producers = tuple(self._producer_tasks)
-            for producer in producers:
-                if not producer.done() and producer not in self._settling_producers:
-                    producer.cancel()
-            if producers:
-                results = await asyncio.gather(
-                    *producers,
-                    return_exceptions=True,
-                )
-                for result in results:
-                    if not isinstance(result, BaseException):
-                        continue
-                    if primary is None:
-                        primary = result
-                    elif result is not primary:
-                        primary.add_note(
-                            "Another Messaging producer also failed during close: "
-                            f"{type(result).__name__}: {result}"
-                        )
+            pending = tuple(item.settled for item in self._preflight_tasks)
+            if pending:
+                await asyncio.gather(*pending)
         finally:
             self._state = "closed"
+        if isinstance(outcome, BaseException):
+            raise outcome
+
+    async def _stop_producers(self) -> None:
+        primary: BaseException | None = None
+        setup_task = self._storage_setup_task
+        if setup_task is not None:
+            try:
+                await _join_owned_task(setup_task)
+            except BaseException as setup_error:  # noqa: BLE001 - settle remaining work
+                primary = setup_error
+        for producer in tuple(self._producer_tasks):
+            if not producer.done() and producer not in self._settling_producers:
+                producer.cancel()
+        for registration in tuple(self._preflight_tasks):
+            await asyncio.wait(
+                (registration.settled, registration.owner_close_requested),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        # A preflight that finished without requesting close may have started a
+        # producer. No owner waiting on producers_stopped can start one while closing.
+        producers = tuple(self._producer_tasks)
+        for producer in producers:
+            if not producer.done() and producer not in self._settling_producers:
+                producer.cancel()
+        if producers:
+            results = await asyncio.gather(*producers, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    primary = (
+                        result if primary is None else select_failure(primary, result)
+                    )
         if primary is not None:
-            raise primary.with_traceback(primary.__traceback__)
-
-    @staticmethod
-    def _close_finished(task: asyncio.Task[None]) -> None:
-        """Consume a retained close failure when no caller waits again."""
-
-        if not task.cancelled():
-            task.exception()
+            raise primary
 
     def _begin_preflight(self) -> _PreflightRegistration:
         """Register one explicit lifecycle before shutdown can take its snapshot."""
@@ -989,6 +986,7 @@ class Messaging:
         registration = _PreflightRegistration(
             owner=cast(asyncio.Task[object], current),
             settled=asyncio.get_running_loop().create_future(),
+            owner_close_requested=asyncio.get_running_loop().create_future(),
         )
         self._preflight_tasks.add(registration)
         return registration

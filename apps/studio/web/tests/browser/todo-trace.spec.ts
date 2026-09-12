@@ -81,7 +81,7 @@ const traceEntities = (groups: readonly TodoGroup[], visibleGroups: readonly Tod
       id: group.userMessageId,
       traceSeq: sequence,
       sourceId: group.userMessageId,
-      namespace: [],
+      graphNamespace: [],
       runId: group.id.slice('todo-group:'.length),
       role: 'user',
       content: group.userMessagePreview,

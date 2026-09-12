@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TypedDict
-from uuid import uuid4
 
 import pytest
 from pydantic import JsonValue
@@ -136,6 +136,7 @@ def _facts(
         "memory",
         "sqlite",
         pytest.param("mysql", marks=pytest.mark.docker_integration),
+        pytest.param("postgresql", marks=pytest.mark.docker_integration),
     )
 )
 async def graph_store(
@@ -144,20 +145,30 @@ async def graph_store(
     if request.param == "memory":
         yield InMemoryTraceStore(), None
         return
-    url = (
-        request.getfixturevalue("mysql_admin_url")
-        if request.param == "mysql"
-        else f"sqlite+aiosqlite:///{tmp_path / 'model-evidence.db'}"
-    )
-    assert isinstance(url, str)
-    engine = create_async_engine(url, hide_parameters=True)
-    try:
-        yield (
-            SqlAlchemyTraceStore(engine, namespace=f"model-evidence-{uuid4().hex}"),
-            engine,
+    async with AsyncExitStack() as databases:
+        if request.param == "postgresql":
+            engine = await databases.enter_async_context(
+                request.getfixturevalue("trace_postgresql_database")()
+            )
+            assert isinstance(engine, AsyncEngine)
+            yield SqlAlchemyTraceStore(engine), engine
+            return
+        url = (
+            await databases.enter_async_context(
+                request.getfixturevalue("trace_mysql_database")()
+            )
+            if request.param == "mysql"
+            else f"sqlite+aiosqlite:///{tmp_path / 'model-evidence.db'}"
         )
-    finally:
-        await engine.dispose()
+        assert isinstance(url, str)
+        engine = create_async_engine(url, hide_parameters=True)
+        try:
+            yield (
+                SqlAlchemyTraceStore(engine),
+                engine,
+            )
+        finally:
+            await engine.dispose()
 
 
 @pytest.mark.parametrize("same_commit", (False, True))
@@ -166,7 +177,7 @@ async def test_tool_execution_retains_model_proof_and_actual_input(
 ) -> None:
     store, _ = graph_store
     assert isinstance(store, TraceGraphStore)
-    identity = RunIdentity(threadId="model-evidence", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="model-evidence", run_id="run")
     tracer = Tracer(store=store)
     initial, model_completed, execution_started, execution_completed = _facts(identity)
     writer = await store.open_writer(identity)
@@ -174,7 +185,7 @@ async def test_tool_execution_retains_model_proof_and_actual_input(
         await writer.append(initial)
         if not same_commit:
             await writer.append((model_completed,))
-        before = await tracer.query(identity.thread_id)
+        before = await tracer.query(identity.thread)
         follow = before.follow()
         pending = asyncio.create_task(anext(follow))
         try:
@@ -198,7 +209,7 @@ async def test_tool_execution_retains_model_proof_and_actual_input(
             await asyncio.gather(pending, return_exceptions=True)
             await follow.aclose()
 
-        current = await tracer.query(identity.thread_id)
+        current = await tracer.query(identity.thread)
         tool = next(
             node for node in current.nodes if node.kind is TraceGraphNodeKind.TOOL
         )
@@ -206,9 +217,9 @@ async def test_tool_execution_retains_model_proof_and_actual_input(
         assert tool.started_at == execution_started.occurred_at
         assert tool.model_call_id == model_completed.call_id
         assert not current.completeness.relationship_evidence_missing
-        history = await tracer.get(identity.thread_id)
+        history = await tracer.get(identity.thread)
         assert history.graph.nodes == current.nodes
-        snapshot = await store.snapshot(identity.thread_id)
+        snapshot = await store.snapshot(identity.thread)
         records = await store.query_trace_graph(
             snapshot.key,
             run_ids=(identity.run_id,),
@@ -232,7 +243,7 @@ async def test_tool_execution_retains_model_proof_and_actual_input(
             ),
             mandatory=True,
         )
-        complete = await tracer.query(identity.thread_id)
+        complete = await tracer.query(identity.thread)
         finished_tool = next(
             node for node in complete.nodes if node.kind is TraceGraphNodeKind.TOOL
         )
@@ -240,8 +251,8 @@ async def test_tool_execution_retains_model_proof_and_actual_input(
         assert finished_tool.request == {"value": "edited"}
         assert finished_tool.result == {"result": "done"}
         assert finished_tool.status is TraceGraphNodeStatus.SUCCEEDED
-        await tracer.rebuild_graph(identity.thread_id)
-        assert (await tracer.query(identity.thread_id)).snapshot == complete.snapshot
+        await tracer.rebuild_graph(identity.thread)
+        assert (await tracer.query(identity.thread)).snapshot == complete.snapshot
     finally:
         await writer.aclose()
 
@@ -253,15 +264,17 @@ async def test_sql_rejects_missing_wrong_or_unavailable_model_proof(
     store, engine = graph_store
     if engine is None:
         pytest.skip("SQL corruption requires the SQL fixture")
-    identity = RunIdentity(threadId="model-evidence-corruption", runId="run")
+    identity = RunIdentity(
+        namespace="test", thread_id="model-evidence-corruption", run_id="run"
+    )
     initial, model_completed, execution_started, _ = _facts(identity)
     writer = await store.open_writer(identity)
     tracer = Tracer(store=store)
     try:
         await writer.append((*initial, model_completed, execution_started))
-        good = await tracer.query(identity.thread_id)
+        good = await tracer.query(identity.thread)
         tool = next(node for node in good.nodes if node.kind is TraceGraphNodeKind.TOOL)
-        snapshot = await store.snapshot(identity.thread_id)
+        snapshot = await store.snapshot(identity.thread)
         original_events = await store.read_events(
             snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
         )
@@ -274,11 +287,11 @@ async def test_sql_rejects_missing_wrong_or_unavailable_model_proof(
                 {
                     "sequence": bad_sequence,
                     "generation": snapshot.key.generation,
-                    "node_id": tool.id,
+                    "node_id": json.dumps(tool.id, ensure_ascii=False),
                 },
             )
         with pytest.raises(TraceStoreProtocolError):
-            await tracer.query(identity.thread_id)
+            await tracer.query(identity.thread)
         assert (
             await store.read_events(
                 snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
@@ -294,9 +307,9 @@ async def test_mysql_graph_cache_rebuild_preserves_ledger_and_core_checkpoints(
     mysql_sandbox_url: str,
 ) -> None:
     engine = create_async_engine(mysql_sandbox_url, hide_parameters=True)
-    store = SqlAlchemyTraceStore(engine, namespace="model-evidence-rebuild")
+    store = SqlAlchemyTraceStore(engine)
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="cache-rebuild", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="cache-rebuild", run_id="run")
     initial, model_completed, execution_started, execution_completed = _facts(identity)
     writer = await store.open_writer(identity)
     try:
@@ -311,9 +324,9 @@ async def test_mysql_graph_cache_rebuild_preserves_ledger_and_core_checkpoints(
             mandatory=True,
         )
         await writer.aclose()
-        before = await tracer.query(identity.thread_id)
-        await tracer.get(identity.thread_id)
-        snapshot = await store.snapshot(identity.thread_id)
+        before = await tracer.query(identity.thread)
+        await tracer.get(identity.thread)
+        snapshot = await store.snapshot(identity.thread)
         original_events = await store.read_events(
             snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
         )
@@ -335,16 +348,14 @@ async def test_mysql_graph_cache_rebuild_preserves_ledger_and_core_checkpoints(
                 "ALTER TABLE tinkerfin_trace_graph_nodes ADD COLUMN model_call_seq "
                 "BIGINT NULL COMMENT 'Ledger sequence proving the emitting Model relationship'"
             )
-        fresh_store = SqlAlchemyTraceStore(engine, namespace=store.namespace)
+        fresh_store = SqlAlchemyTraceStore(engine)
         await fresh_store.setup()
         fresh_tracer = Tracer(store=fresh_store)
         with pytest.raises(TraceStoreProtocolError):
-            await fresh_tracer.query(identity.thread_id)
-        await fresh_tracer.rebuild_graph(identity.thread_id)
-        assert (
-            await fresh_tracer.query(identity.thread_id)
-        ).snapshot == before.snapshot
-        assert (await fresh_tracer.get(identity.thread_id)).graph.nodes == before.nodes
+            await fresh_tracer.query(identity.thread)
+        await fresh_tracer.rebuild_graph(identity.thread)
+        assert (await fresh_tracer.query(identity.thread)).snapshot == before.snapshot
+        assert (await fresh_tracer.get(identity.thread)).graph.nodes == before.nodes
         assert (
             await fresh_store.read_events(
                 snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100

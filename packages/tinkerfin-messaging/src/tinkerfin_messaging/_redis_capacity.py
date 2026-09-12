@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 
 from ._redis_control import (
     _redis_call,
@@ -36,12 +36,16 @@ async def reclaim_expired(backend: RedisBackend) -> None:
         )
         try:
             channel = values[b"channel"].decode()
-            thread = values[b"stream"].decode()
-        except (KeyError, UnicodeDecodeError) as error:
+            thread = ThreadIdentity.model_validate_json(values[b"stream"])
+        except (KeyError, ValueError) as error:
             raise _redis_protocol_error(
                 "Redis expiry index has no valid thread identity", cause=error
             ) from error
-        identity = RunIdentity(threadId=thread, runId="expiry-cleanup")
+        identity = RunIdentity(
+            namespace=thread.namespace,
+            thread_id=thread.thread_id,
+            run_id="expiry-cleanup",
+        )
         if backend._scope(channel, identity).control != control:
             raise _redis_protocol_error("Redis expiry index escapes its storage scope")
         await complete_generation_cleanup(

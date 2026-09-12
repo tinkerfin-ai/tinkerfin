@@ -5,13 +5,12 @@ from __future__ import annotations
 from tinkerfin import (
     AgUiResumeBindingError,
     AgUiSettlementTimeoutError,
-    RedisLeaseError,
-    RedisLeaseUnavailableError,
-    RunCoordinationError,
     TinkerFinError,
     TinkerFinErrorCode,
     TinkerFinLifecycleError,
 )
+from tinkerfin.coordination import RunCoordinationError
+from tinkerfin.redis import RedisLeaseError, RedisLeaseUnavailableError
 
 
 def test_error_codes_are_unique_and_namespaced() -> None:

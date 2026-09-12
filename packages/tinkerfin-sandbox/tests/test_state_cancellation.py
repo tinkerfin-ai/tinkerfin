@@ -6,6 +6,7 @@ import asyncio
 import gc
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Literal
 
@@ -31,7 +32,7 @@ def _release_writer(connection: sqlite3.Connection) -> None:
 
 
 def _check_database(path: Path) -> None:
-    with sqlite3.connect(path, timeout=0.1) as connection:
+    with closing(sqlite3.connect(path, timeout=0.1)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         connection.rollback()
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)

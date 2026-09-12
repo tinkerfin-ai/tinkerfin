@@ -9,14 +9,15 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from pydantic import JsonValue
 
 from tinkerfin import (
-    DeepAgentsRuntimeProfile,
-    DeepAgentsV2RuntimeProfile,
-    DeepAgentsV3RuntimeProfile,
     RunIdentity,
-    TinkerFin,
     TinkerFinStreamProtocolError,
 )
 from tinkerfin.native_driver import DeepAgentsV2StreamDriver, DeepAgentsV3StreamDriver
+from tinkerfin.runtime_profile import (
+    DeepAgentsRuntimeProfile,
+    DeepAgentsV2RuntimeProfile,
+    DeepAgentsV3RuntimeProfile,
+)
 from tinkerfin_contracts import (
     NativeMessageObservation,
     NativeReasoningObservation,
@@ -49,7 +50,9 @@ class _ProviderReasoningExtractor:
 
 def _context() -> RunSourceContext:
     return RunSourceContext(
-        identity=RunIdentity(threadId="thread-driver", runId="run-driver"),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-driver", run_id="run-driver"
+        ),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={"messages": []},
@@ -89,11 +92,12 @@ def _astream_shape(
 def test_v2_profile_owns_factory_identity_and_complete_invocation_binding() -> None:
     profile = DeepAgentsV2RuntimeProfile()
     driver = profile.stream_driver
-    identity = RunIdentity(threadId="thread-profile", runId="run-profile")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-profile", run_id="run-profile"
+    )
 
     assert isinstance(profile, DeepAgentsRuntimeProfile)
     assert profile.profile_id == "deepagents-v2"
-    assert TinkerFin().runtime_profile.profile_id == "deepagents-v2"
     bound = driver.bind_invocation(
         inspect.signature(_astream_shape),
         ({"messages": []},),
@@ -125,7 +129,9 @@ def test_v2_profile_owns_factory_identity_and_complete_invocation_binding() -> N
 def test_v3_profile_owns_explicit_event_stream_binding_without_fallback() -> None:
     profile = DeepAgentsV3RuntimeProfile()
     driver = profile.stream_driver
-    identity = RunIdentity(threadId="thread-profile-v3", runId="run-profile-v3")
+    identity = RunIdentity(
+        namespace="test", thread_id="thread-profile-v3", run_id="run-profile-v3"
+    )
 
     assert isinstance(profile, DeepAgentsRuntimeProfile)
     assert isinstance(driver, DeepAgentsV3StreamDriver)
@@ -167,6 +173,18 @@ def test_default_driver_emits_no_provider_reasoning_observation() -> None:
     encoded = frame.replay.model_dump_json(by_alias=True)
     assert "visible" in encoded
     assert "private" not in encoded
+
+
+def test_native_replay_keeps_graph_position_outside_message_payload() -> None:
+    part = _message_part(AIMessageChunk(id="message", content="visible"))
+    part["ns"] = ("tools:child",)
+    frame = DeepAgentsV2StreamDriver().normalize(part, context=_context())
+
+    assert frame.replay.graph_namespace == ("tools:child",)
+    assert isinstance(frame.replay.data, dict)
+    assert "graphNamespace" not in frame.replay.data
+    assert "identity" not in frame.replay.data
+    assert frame.observations[0].identity.namespace == "test"
 
 
 def test_v3_host_extractor_ignores_another_provider_reasoning_delta() -> None:

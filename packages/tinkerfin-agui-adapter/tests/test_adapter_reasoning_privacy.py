@@ -17,7 +17,7 @@ from tinkerfin_agui_adapter import RunIdentity, astream_events
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 @pytest.mark.parametrize("expose_reasoning_events", [False, True])

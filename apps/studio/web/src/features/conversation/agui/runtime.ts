@@ -640,7 +640,7 @@ const rawEventOrMain = (
     kind: "root",
     agentType: "main",
     agentName: "main",
-    namespace: [],
+    graphNamespace: [],
   },
   runId: rawEvent?.runId ?? conversation.activeRunId,
 })

@@ -38,6 +38,7 @@ from ..models import (
     OpenSandboxRuntimeInfo,
     _normalize_workspace_root,
 )
+from ._identity import SandboxResourceIdentity
 from ._manager_recovery import _check_health, recover_binding
 from ._manager_resources import _ManagedBackend
 from ._notifications import failure_reason
@@ -298,7 +299,9 @@ def build_agent_middleware(
     return (cast(AgentMiddleware[Any, Any, Any], middleware),)
 
 
-async def get(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
+async def get(
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
+) -> _ManagedBackend:
     """Return the healthy stable backend for one caller-defined key.
 
     Resolution checks the local handle, committed State binding, warm pool, and
@@ -308,6 +311,7 @@ async def get(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
 
     Args:
         key: Opaque application identity accepted by ``key_resolver``.
+        namespace: Logical resource scope, or None for standalone use.
 
     Returns:
         A manager-owned backend view whose remote Sandbox can be replaced.
@@ -317,7 +321,7 @@ async def get(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
         OpenSandboxStateError: State acquisition, renewal, or commit failed.
         Exception: The OpenSandbox client could not create a remote instance.
     """
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
             await self._availability.require_running(owner_key)
@@ -350,9 +354,11 @@ async def _get_locked(
     )
 
 
-async def reconnect(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
+async def reconnect(
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
+) -> _ManagedBackend:
     """Open a verified connection to an existing binding without recreating it."""
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
             await self._availability.require_running(owner_key)
@@ -373,7 +379,9 @@ async def _close_replaced_backend(
     await self._close_backend(backend)
 
 
-async def recreate(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend:
+async def recreate(
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
+) -> _ManagedBackend:
     """Create and commit a replacement Sandbox for one caller-defined key.
 
     An open handle is updated in place. The previous remote instance is retired
@@ -381,11 +389,12 @@ async def recreate(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend
 
     Args:
         key: Opaque application identity accepted by ``key_resolver``.
+        namespace: Logical resource scope, or None for standalone use.
 
     Returns:
         The stable backend view pointing at the replacement instance.
     """
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
             self._ensure_open()
@@ -419,7 +428,9 @@ async def recreate(self: OpenSandboxManager[KeyT], key: KeyT) -> _ManagedBackend
             return self._backend_view(owner_key, replaced)
 
 
-async def reset(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
+async def reset(
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
+) -> None:
     """Clear the configured workspace while retaining identity and binding.
 
     ``workspace_root`` is the only permitted deletion boundary. Reset is refused
@@ -428,11 +439,12 @@ async def reset(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
 
     Args:
         key: Opaque application identity accepted by ``key_resolver``.
+        namespace: Logical resource scope, or None for standalone use.
 
     Raises:
         OpenSandboxResetError: No safe workspace is configured or cleanup fails.
     """
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
     workspace_root = self._workspace_root()
     if workspace_root is None:
         raise OpenSandboxResetError(
@@ -471,18 +483,21 @@ async def reset(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
                 ) from exc
 
 
-async def is_healthy(self: OpenSandboxManager[KeyT], key: KeyT) -> bool:
+async def is_healthy(
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
+) -> bool:
     """Check only the currently cached local handle for one key.
 
     This method does not read State, create, reconnect, or renew a Sandbox.
 
     Args:
         key: Opaque application identity accepted by ``key_resolver``.
+        namespace: Logical resource scope, or None for standalone use.
 
     Returns:
         Whether the open cached handle passes its health command.
     """
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
     async with self._operation():
         handle = self._handles.get(owner_key)
         if handle is None or handle.is_closed:
@@ -506,7 +521,7 @@ async def is_healthy(self: OpenSandboxManager[KeyT], key: KeyT) -> bool:
 
 
 async def get_details(
-    self: OpenSandboxManager[KeyT], key: KeyT
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
 ) -> OpenSandboxDetails | None:
     """Read stable details for the Sandbox committed to one key.
 
@@ -516,6 +531,7 @@ async def get_details(
 
     Args:
         key: Opaque application identity accepted by ``key_resolver``.
+        namespace: Logical resource scope, or None for standalone use.
 
     Returns:
         Owner-aware details, or ``None`` when no binding exists.
@@ -523,7 +539,8 @@ async def get_details(
     Raises:
         OpenSandboxStateError: The authoritative binding could not be read.
     """
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
+    resource = SandboxResourceIdentity.from_key(owner_key)
     async with self._operation():
         check = self._notifications.begin_check(owner_key)
         try:
@@ -559,7 +576,8 @@ async def get_details(
                     )
                 return OpenSandboxDetails.from_runtime(
                     runtime,
-                    owner_key=owner_key,
+                    owner_key=resource.key,
+                    namespace=resource.namespace,
                     cached=handle is not None and not handle.is_closed,
                     access_state=availability.phase
                     if availability is not None
@@ -592,7 +610,8 @@ async def get_details(
                 )
             return OpenSandboxDetails.from_runtime(
                 runtime,
-                owner_key=owner_key,
+                owner_key=resource.key,
+                namespace=resource.namespace,
                 cached=cached,
                 access_state="running" if availability is not None else None,
             )
@@ -649,7 +668,9 @@ async def _delete_locked(
         self._notifications.destroyed(owner_key, notification_id)
 
 
-async def delete(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
+async def delete(
+    self: OpenSandboxManager[KeyT], key: KeyT, *, namespace: str | None = None
+) -> None:
     """Destroy all known instances and remove one key binding.
 
     Once destruction starts, caller cancellation waits for the internal operation
@@ -657,13 +678,14 @@ async def delete(self: OpenSandboxManager[KeyT], key: KeyT) -> None:
 
     Args:
         key: Opaque application identity accepted by ``key_resolver``.
+        namespace: Logical resource scope, or None for standalone use.
 
     Raises:
         OpenSandboxDestroyError: Destruction is unconfirmed and can be retried.
         OpenSandboxStateError: The State claim or binding mutation failed.
         OpenSandboxManagerClosedError: The manager has begun closing.
     """
-    owner_key = self._resolve_owner_key(key)
+    owner_key = self._resolve_resource_key(key, namespace)
     async with self._operation():
         async with self._claim_owner(owner_key) as claim:
             self._ensure_open()

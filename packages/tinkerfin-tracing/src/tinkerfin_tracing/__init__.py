@@ -1,4 +1,4 @@
-"""Semantic Runtime tracing with bounded and optional SQL persistence."""
+"""Semantic Runtime tracing with bounded memory and optional database persistence."""
 
 from __future__ import annotations
 
@@ -36,9 +36,6 @@ from .errors import TraceStoreTimeout as TraceStoreTimeout
 from .errors import TraceThreadNotFound as TraceThreadNotFound
 from .errors import TracingError as TracingError
 from .errors import TracingErrorCode as TracingErrorCode
-from .examples import FactCountProjection as FactCountProjection
-from .examples import FactCountResult as FactCountResult
-from .examples import FactCountState as FactCountState
 from .facts import CallTrackingFact as CallTrackingFact
 from .facts import ContextContributionFact as ContextContributionFact
 from .facts import InteractionFact as InteractionFact
@@ -115,9 +112,6 @@ __all__ = [
     "ContextContributionFact",
     "DurableTraceStore",
     "EncodedTracePayload",
-    "FactCountProjection",
-    "FactCountResult",
-    "FactCountState",
     "InMemoryTraceStore",
     "InteractionFact",
     "InvalidTraceCursor",
@@ -206,19 +200,18 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
-    """Load SQLAlchemy integrations only when their public symbol is requested."""
+    """Load optional database integrations when their public symbol is requested."""
 
     if name == "SqlAlchemyTraceStore":
         try:
             from .sql_store import SqlAlchemyTraceStore
         except ModuleNotFoundError as error:
-            if error.name != "sqlalchemy" and not str(error.name).startswith(
-                "sqlalchemy."
-            ):
+            if error.name not in {"sqlalchemy", "tinkerfin_sqlalchemy"} and not str(
+                error.name
+            ).startswith("sqlalchemy."):
                 raise
             raise ImportError(
-                f"{name} requires a SQL extra; install "
-                '"tinkerfin-tracing[sqlite]" or "tinkerfin-tracing[mysql]"'
+                f'{name} requires "tinkerfin-tracing[sqlalchemy]"'
             ) from error
         globals()["SqlAlchemyTraceStore"] = SqlAlchemyTraceStore
         return SqlAlchemyTraceStore
@@ -226,13 +219,12 @@ def __getattr__(name: str) -> object:
         try:
             from .sql_schema import TraceStoreSchema, get_trace_store_schema
         except ModuleNotFoundError as error:
-            if error.name != "sqlalchemy" and not str(error.name).startswith(
-                "sqlalchemy."
-            ):
+            if error.name not in {"sqlalchemy", "tinkerfin_sqlalchemy"} and not str(
+                error.name
+            ).startswith("sqlalchemy."):
                 raise
             raise ImportError(
-                f"{name} requires a SQL extra; install "
-                '"tinkerfin-tracing[sqlite]" or "tinkerfin-tracing[mysql]"'
+                f'{name} requires "tinkerfin-tracing[sqlalchemy]"'
             ) from error
         globals()["TraceStoreSchema"] = TraceStoreSchema
         globals()["get_trace_store_schema"] = get_trace_store_schema

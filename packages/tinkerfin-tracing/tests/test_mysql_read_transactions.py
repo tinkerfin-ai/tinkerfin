@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Literal
-from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, text
@@ -16,7 +16,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 from tinkerfin_tracing import (
     RunFact,
     SqlAlchemyTraceStore,
@@ -43,7 +43,7 @@ pytestmark = pytest.mark.docker_integration
     )
 )
 async def reader_engine(
-    mysql_admin_url: str, request: pytest.FixtureRequest
+    trace_mysql_url: str, request: pytest.FixtureRequest
 ) -> AsyncIterator[AsyncEngine]:
     mode = request.param
     assert isinstance(mode, str)
@@ -53,7 +53,7 @@ async def reader_engine(
         else mode.removesuffix(" without rollback")
     )
     base = create_async_engine(
-        mysql_admin_url,
+        trace_mysql_url,
         pool_size=1,
         max_overflow=0,
         isolation_level=isolation,
@@ -114,13 +114,12 @@ def _assert_pool_returned(reader: AsyncEngine) -> None:
 
 
 async def test_mysql_read_snapshot_and_host_settings_survive_concurrent_commit(
-    mysql_admin_url: str, reader_engine: AsyncEngine
+    trace_mysql_url: str, reader_engine: AsyncEngine
 ) -> None:
-    producer_engine = create_async_engine(mysql_admin_url)
-    namespace = f"read-consistency-{uuid4().hex}"
-    producer = SqlAlchemyTraceStore(producer_engine, namespace=namespace)
-    reader = SqlAlchemyTraceStore(reader_engine, namespace=namespace)
-    identity = RunIdentity(threadId="snapshot", runId="first")
+    producer_engine = create_async_engine(trace_mysql_url)
+    producer = SqlAlchemyTraceStore(producer_engine)
+    reader = SqlAlchemyTraceStore(reader_engine)
+    identity = RunIdentity(namespace="test", thread_id="snapshot", run_id="first")
     writer = await producer.open_writer(identity)
     changed = False
 
@@ -154,7 +153,7 @@ async def test_mysql_read_snapshot_and_host_settings_survive_concurrent_commit(
             reader_engine.sync_engine, "after_cursor_execute", change_between_reads
         )
         try:
-            snapshot = await reader.snapshot(identity.thread_id)
+            snapshot = await reader.snapshot(identity.thread)
         finally:
             event.remove(
                 reader_engine.sync_engine, "after_cursor_execute", change_between_reads
@@ -173,9 +172,9 @@ async def test_mysql_read_snapshot_and_host_settings_survive_concurrent_commit(
                     "UPDATE tinkerfin_trace_threads SET next_seq = next_seq "
                     "WHERE namespace = :namespace"
                 ),
-                {"namespace": namespace},
+                {"namespace": json.dumps(identity.namespace, ensure_ascii=False)},
             )
-        current = await reader.snapshot(identity.thread_id)
+        current = await reader.snapshot(identity.thread)
         assert current.as_of_seq == 2
         assert current.active_writers == ()
     finally:
@@ -185,12 +184,12 @@ async def test_mysql_read_snapshot_and_host_settings_survive_concurrent_commit(
 
 @pytest.mark.parametrize("failure_phase", ("start", "after-start", "read"))
 async def test_mysql_failed_reads_return_clean_host_connection(
-    mysql_admin_url: str, reader_engine: AsyncEngine, failure_phase: str
+    trace_mysql_url: str, reader_engine: AsyncEngine, failure_phase: str
 ) -> None:
-    store = SqlAlchemyTraceStore(reader_engine, namespace=f"read-failure-{uuid4().hex}")
-    producer_engine = create_async_engine(mysql_admin_url)
-    producer = SqlAlchemyTraceStore(producer_engine, namespace=store.namespace)
-    identity = RunIdentity(threadId="failure", runId="first")
+    store = SqlAlchemyTraceStore(reader_engine)
+    producer_engine = create_async_engine(trace_mysql_url)
+    producer = SqlAlchemyTraceStore(producer_engine)
+    identity = RunIdentity(namespace="test", thread_id="failure", run_id="first")
     writer = await producer.open_writer(identity)
     failure = SQLAlchemyError("test-owned database command failure")
     failed = False
@@ -228,7 +227,7 @@ async def test_mysql_failed_reads_return_clean_host_connection(
         event.listen(reader_engine.sync_engine, event_name, fail_command)
         try:
             with pytest.raises(TraceStoreError) as captured:
-                await store.snapshot(identity.thread_id)
+                await store.snapshot(identity.thread)
             assert captured.value.cause is failure
         finally:
             event.remove(reader_engine.sync_engine, event_name, fail_command)
@@ -245,9 +244,9 @@ async def test_mysql_failed_reads_return_clean_host_connection(
                     "UPDATE tinkerfin_trace_threads SET next_seq = next_seq "
                     "WHERE namespace = :namespace"
                 ),
-                {"namespace": store.namespace},
+                {"namespace": json.dumps(identity.namespace, ensure_ascii=False)},
             )
-        assert (await store.snapshot(identity.thread_id)).as_of_seq == 1
+        assert (await store.snapshot(identity.thread)).as_of_seq == 1
     finally:
         await writer.aclose()
         await producer_engine.dispose()
@@ -258,7 +257,7 @@ async def test_mysql_failed_reads_return_clean_host_connection(
 async def test_mysql_interrupted_read_start_discards_pending_settings(
     reader_engine: AsyncEngine, after_start: bool, timeout: bool
 ) -> None:
-    store = SqlAlchemyTraceStore(reader_engine, namespace=f"read-start-{uuid4().hex}")
+    store = SqlAlchemyTraceStore(reader_engine)
     await store.setup()
     await reader_engine.dispose()
     settings = await _session_settings(reader_engine)
@@ -284,7 +283,9 @@ async def test_mysql_interrupted_read_start_discards_pending_settings(
         adapted.run_async(lambda _driver: release.wait())
 
     event.listen(reader_engine.sync_engine, event_name, delay_start)
-    pending = asyncio.create_task(store.snapshot("absent"))
+    pending = asyncio.create_task(
+        store.snapshot(ThreadIdentity(namespace="test", thread_id="absent"))
+    )
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         if timeout:
@@ -314,20 +315,19 @@ async def test_mysql_interrupted_read_start_discards_pending_settings(
 
 @pytest.mark.parametrize("rollback_fails", (False, True))
 async def test_mysql_autocommit_read_cleanup_settles_before_pool_return(
-    mysql_admin_url: str, rollback_fails: bool
+    trace_mysql_url: str, rollback_fails: bool
 ) -> None:
     reader_engine = create_async_engine(
-        mysql_admin_url,
+        trace_mysql_url,
         pool_size=1,
         max_overflow=0,
         isolation_level="AUTOCOMMIT",
         skip_autocommit_rollback=True,
     )
-    producer_engine = create_async_engine(mysql_admin_url)
-    namespace = f"read-cleanup-{uuid4().hex}"
-    producer = SqlAlchemyTraceStore(producer_engine, namespace=namespace)
-    store = SqlAlchemyTraceStore(reader_engine, namespace=namespace)
-    identity = RunIdentity(threadId="cleanup", runId="first")
+    producer_engine = create_async_engine(trace_mysql_url)
+    producer = SqlAlchemyTraceStore(producer_engine)
+    store = SqlAlchemyTraceStore(reader_engine)
+    identity = RunIdentity(namespace="test", thread_id="cleanup", run_id="first")
     writer = await producer.open_writer(identity)
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -358,7 +358,7 @@ async def test_mysql_autocommit_read_cleanup_settles_before_pool_return(
         event.listen(
             reader_engine.sync_engine, "before_cursor_execute", delay_or_fail_rollback
         )
-        pending = asyncio.create_task(store.snapshot(identity.thread_id))
+        pending = asyncio.create_task(store.snapshot(identity.thread))
         try:
             await asyncio.wait_for(entered.wait(), timeout=2)
             if rollback_fails:
@@ -392,9 +392,9 @@ async def test_mysql_autocommit_read_cleanup_settles_before_pool_return(
                     "UPDATE tinkerfin_trace_threads SET next_seq = next_seq "
                     "WHERE namespace = :namespace"
                 ),
-                {"namespace": namespace},
+                {"namespace": json.dumps(identity.namespace, ensure_ascii=False)},
             )
-        assert (await store.snapshot(identity.thread_id)).as_of_seq == 1
+        assert (await store.snapshot(identity.thread)).as_of_seq == 1
     finally:
         await writer.aclose()
         await reader_engine.dispose()
@@ -402,21 +402,20 @@ async def test_mysql_autocommit_read_cleanup_settles_before_pool_return(
 
 
 async def test_mysql_graph_follow_observes_next_remote_run_and_releases_pool(
-    mysql_admin_url: str,
+    trace_mysql_url: str,
 ) -> None:
-    reader_engine = create_async_engine(mysql_admin_url, pool_size=1, max_overflow=0)
-    producer_engine = create_async_engine(mysql_admin_url)
-    namespace = f"graph-next-run-{uuid4().hex}"
+    reader_engine = create_async_engine(trace_mysql_url, pool_size=1, max_overflow=0)
+    producer_engine = create_async_engine(trace_mysql_url)
     options = TraceStoreOptions(follow_poll_seconds=0.02)
-    reader = SqlAlchemyTraceStore(reader_engine, namespace=namespace, options=options)
-    producer = SqlAlchemyTraceStore(producer_engine, namespace=namespace)
-    first = RunIdentity(threadId="graph", runId="first")
+    reader = SqlAlchemyTraceStore(reader_engine, options=options)
+    producer = SqlAlchemyTraceStore(producer_engine)
+    first = RunIdentity(namespace="test", thread_id="graph", run_id="first")
     writer = await producer.open_writer(first)
     try:
         await writer.append((_fact(first, "started"),))
         await writer.append((_fact(first, "terminal"),), mandatory=True)
         await writer.aclose()
-        graph = await Tracer(store=reader).query(first.thread_id)
+        graph = await Tracer(store=reader).query(first.thread)
         returned = asyncio.Event()
 
         def observe_pool_return(_connection: object, _entry: object) -> None:
@@ -431,7 +430,9 @@ async def test_mysql_graph_follow_observes_next_remote_run_and_releases_pool(
                 await asyncio.wait_for(returned.wait(), timeout=2)
                 _assert_pool_returned(reader_engine)
             assert not pending.done()
-            second = RunIdentity(threadId=first.thread_id, runId="second")
+            second = RunIdentity(
+                namespace="test", thread_id=first.thread_id, run_id="second"
+            )
             writer = await producer.open_writer(second)
             await writer.append(
                 (
@@ -465,19 +466,19 @@ async def test_mysql_graph_follow_observes_next_remote_run_and_releases_pool(
         await producer_engine.dispose()
 
 
-async def test_mysql_idle_page_bounds_all_server_commands(mysql_admin_url: str) -> None:
+async def test_mysql_idle_page_bounds_all_server_commands(trace_mysql_url: str) -> None:
     reader = create_async_engine(
-        mysql_admin_url, pool_size=1, max_overflow=0, pool_pre_ping=True
+        trace_mysql_url, pool_size=1, max_overflow=0, pool_pre_ping=True
     )
-    observer_engine = create_async_engine(mysql_admin_url)
-    store = SqlAlchemyTraceStore(reader, namespace=f"read-budget-{uuid4().hex}")
-    identity = RunIdentity(threadId="idle", runId="first")
+    observer_engine = create_async_engine(trace_mysql_url)
+    store = SqlAlchemyTraceStore(reader)
+    identity = RunIdentity(namespace="test", thread_id="idle", run_id="first")
     writer = await store.open_writer(identity)
     try:
         await writer.append((_fact(identity, "started"),))
         await writer.append((_fact(identity, "terminal"),), mandatory=True)
         await writer.aclose()
-        snapshot = await store.snapshot(identity.thread_id)
+        snapshot = await store.snapshot(identity.thread)
         async with reader.connect() as connection:
             connection_id = await connection.scalar(text("SELECT CONNECTION_ID()"))
             assert isinstance(connection_id, int)
@@ -509,7 +510,9 @@ async def test_mysql_idle_page_bounds_all_server_commands(mysql_admin_url: str) 
                     "statement/sql/set_option": 4,
                     "statement/sql/begin": 4,
                     "statement/sql/select": 4,
-                    "statement/sql/rollback": 4,
+                    # Each read acknowledges rollback and then returns its checkout
+                    # through the host pool's normal reset. Count both commands.
+                    "statement/sql/rollback": 8,
                 }
             ), dict(commands)
     finally:

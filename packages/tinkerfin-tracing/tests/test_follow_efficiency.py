@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 from tinkerfin_tracing import (
     DurableTraceStore,
     InMemoryTraceStore,
@@ -35,17 +36,20 @@ from tinkerfin_tracing.backend import StoredTraceEventPage, TraceEventPageReques
 async def trace_engine(
     request: pytest.FixtureRequest, tmp_path: Path
 ) -> AsyncIterator[AsyncEngine]:
-    url = (
-        request.getfixturevalue("mysql_admin_url")
-        if request.param == "mysql"
-        else f"sqlite+aiosqlite:///{tmp_path / 'follow.db'}"
-    )
-    assert isinstance(url, str)
-    engine = create_async_engine(url)
-    try:
-        yield engine
-    finally:
-        await engine.dispose()
+    async with AsyncExitStack() as databases:
+        url = (
+            await databases.enter_async_context(
+                request.getfixturevalue("trace_mysql_database")()
+            )
+            if request.param == "mysql"
+            else f"sqlite+aiosqlite:///{tmp_path / 'follow.db'}"
+        )
+        assert isinstance(url, str)
+        engine = create_async_engine(url)
+        try:
+            yield engine
+        finally:
+            await engine.dispose()
 
 
 def _fact(identity: RunIdentity, phase: Literal["started", "terminal"]) -> RunFact:
@@ -61,7 +65,7 @@ def _fact(identity: RunIdentity, phase: Literal["started", "terminal"]) -> RunFa
 
 
 async def _write_run(store: TraceStore, *, thread: str, run: str) -> None:
-    identity = RunIdentity(threadId=thread, runId=run)
+    identity = RunIdentity(namespace="test", thread_id=thread, run_id=run)
     writer = await store.open_writer(identity)
     try:
         await writer.append((_fact(identity, "started"),))
@@ -84,10 +88,12 @@ async def test_idle_follow_uses_one_tail_read_and_stops_on_cancel(
     trace_engine: AsyncEngine,
     graph_follow: bool,
 ) -> None:
-    store = SqlAlchemyTraceStore(trace_engine, namespace=f"idle-{uuid4().hex}")
+    store = SqlAlchemyTraceStore(trace_engine)
     await _write_run(store, thread="idle", run="first")
-    snapshot = await store.snapshot("idle")
-    graph = await Tracer(store=store).query("idle")
+    snapshot = await store.snapshot(ThreadIdentity(namespace="test", thread_id="idle"))
+    graph = await Tracer(store=store).query(
+        ThreadIdentity(namespace="test", thread_id="idle")
+    )
     statements: list[str] = []
     first_select = asyncio.Event()
 
@@ -144,7 +150,9 @@ async def test_commit_between_empty_read_and_wait_is_not_lost(
         InMemoryTraceStore().backend, options=TraceStoreOptions(follow_poll_seconds=10)
     )
     await _write_run(store, thread="followed", run="first")
-    snapshot = await store.snapshot("followed")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="followed")
+    )
     empty_read = asyncio.Event()
     release_read = asyncio.Event()
     original_read = store.backend.read_event_page
@@ -185,7 +193,9 @@ async def test_other_threads_do_not_wake_an_idle_follower(
         InMemoryTraceStore().backend, options=TraceStoreOptions(follow_poll_seconds=10)
     )
     await _write_run(store, thread="followed", run="first")
-    snapshot = await store.snapshot("followed")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="followed")
+    )
     first_read = asyncio.Event()
     original_read = store.backend.read_event_page
     reads = 0
@@ -222,7 +232,9 @@ async def test_closing_one_follower_preserves_the_other_local_notification(
         InMemoryTraceStore().backend, options=TraceStoreOptions(follow_poll_seconds=10)
     )
     await _write_run(store, thread="shared", run="first")
-    snapshot = await store.snapshot("shared")
+    snapshot = await store.snapshot(
+        ThreadIdentity(namespace="test", thread_id="shared")
+    )
     ready = asyncio.Event()
     original_read = store.backend.read_event_page
     reads = 0
@@ -270,10 +282,10 @@ async def test_follow_reports_a_writer_close_without_inventing_terminal_facts(
 ) -> None:
     store = InMemoryTraceStore()
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="unsettled", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="unsettled", run_id="run")
     writer = await store.open_writer(identity)
     await writer.append((_fact(identity, "started"),))
-    trace = await tracer.get(identity.thread_id)
+    trace = await tracer.get(identity.thread)
     assert trace.summary.status.execution == "running"
     follower = trace.follow()
     if close_before_follow:
@@ -283,7 +295,7 @@ async def test_follow_reports_a_writer_close_without_inventing_terminal_facts(
         if not close_before_follow:
             await asyncio.sleep(0.02)
             await writer.aclose()
-        current = await tracer.get(identity.thread_id)
+        current = await tracer.get(identity.thread)
         assert current.summary.status.execution == "unknown"
         update = await asyncio.wait_for(pending, timeout=0.5)
         assert update.as_of_seq == trace.as_of_seq
@@ -300,20 +312,15 @@ async def test_follow_reports_a_writer_close_without_inventing_terminal_facts(
 async def test_sql_follow_observes_expired_remote_writer_without_new_events(
     trace_engine: AsyncEngine,
 ) -> None:
-    namespace = f"expired-{uuid4().hex}"
     options = TraceStoreOptions(follow_poll_seconds=0.02)
-    writer_store = SqlAlchemyTraceStore(
-        trace_engine, namespace=namespace, options=options
-    )
-    reader_store = SqlAlchemyTraceStore(
-        trace_engine, namespace=namespace, options=options
-    )
+    writer_store = SqlAlchemyTraceStore(trace_engine, options=options)
+    reader_store = SqlAlchemyTraceStore(trace_engine, options=options)
     tracer = Tracer(store=reader_store)
-    identity = RunIdentity(threadId="expired", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="expired", run_id="run")
     writer = await writer_store.open_writer(identity)
     await writer.append((_fact(identity, "started"),))
-    trace = await tracer.get(identity.thread_id)
-    graph = await tracer.query(identity.thread_id)
+    trace = await tracer.get(identity.thread)
+    graph = await tracer.query(identity.thread)
     follower = trace.follow()
     pending = asyncio.create_task(anext(follower))
     try:
@@ -328,7 +335,7 @@ async def test_sql_follow_observes_expired_remote_writer_without_new_events(
                 {
                     "expired": datetime(2000, 1, 1),
                     "generation": trace.key.generation,
-                    "run_id": identity.run_id,
+                    "run_id": json.dumps(identity.run_id, ensure_ascii=False),
                 },
             )
         update = await asyncio.wait_for(pending, timeout=1)
@@ -336,8 +343,8 @@ async def test_sql_follow_observes_expired_remote_writer_without_new_events(
         assert update.summary.completeness.missing_tail
         assert update.as_of_seq == trace.as_of_seq
         assert update.events == update.facts == ()
-        assert (await tracer.query(identity.thread_id)).snapshot == graph.snapshot
-        current = await tracer.get(identity.thread_id)
+        assert (await tracer.query(identity.thread)).snapshot == graph.snapshot
+        current = await tracer.get(identity.thread)
         assert update.summary == current.summary
     finally:
         if not pending.done():
@@ -353,14 +360,13 @@ async def test_follow_observes_same_sequence_writer_recovery_and_one_terminal(
 ) -> None:
     store = SqlAlchemyTraceStore(
         trace_engine,
-        namespace=f"recovered-{uuid4().hex}",
         options=TraceStoreOptions(follow_poll_seconds=0.02),
     )
     tracer = Tracer(store=store)
-    identity = RunIdentity(threadId="resumed-owner", runId="run")
+    identity = RunIdentity(namespace="test", thread_id="resumed-owner", run_id="run")
     writer = await store.open_writer(identity)
     await writer.append((_fact(identity, "started"),))
-    trace = await tracer.get(identity.thread_id)
+    trace = await tracer.get(identity.thread)
     follower = trace.follow()
     try:
         async with trace_engine.begin() as connection:
@@ -373,7 +379,7 @@ async def test_follow_observes_same_sequence_writer_recovery_and_one_terminal(
                 {
                     "expired": datetime(2000, 1, 1),
                     "generation": trace.key.generation,
-                    "run_id": identity.run_id,
+                    "run_id": json.dumps(identity.run_id, ensure_ascii=False),
                 },
             )
         lost = await asyncio.wait_for(anext(follower), 1)

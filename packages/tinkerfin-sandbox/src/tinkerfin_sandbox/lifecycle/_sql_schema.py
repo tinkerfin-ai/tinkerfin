@@ -4,7 +4,7 @@ from __future__ import annotations
 
 __all__ = ["_initialize_schema", "_validate_schema"]
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
@@ -20,9 +20,18 @@ from sqlalchemy import (
 )
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects import mysql as mysql_dialect
+from sqlalchemy.dialects import postgresql as postgresql_dialect
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.engine import Connection
-from sqlalchemy.schema import CreateIndex, CreateTable, DefaultClause
+from sqlalchemy.schema import (
+    CreateIndex,
+    CreateTable,
+    DefaultClause,
+    SetColumnComment,
+    SetTableComment,
+)
+
+from tinkerfin_sqlalchemy import SqlDialect
 
 from ..errors import OpenSandboxStateError
 
@@ -30,6 +39,11 @@ if TYPE_CHECKING:
     from .sqlalchemy import SQLAlchemyOpenSandboxStateSchema
 
 _metadata = MetaData()
+# Fractional lease durations must survive storage. MySQL DATETIME otherwise drops
+# them; test_sql_state_preserves_subsecond_leases checks the persisted deadlines.
+_DATABASE_TIMESTAMP = DateTime(timezone=False).with_variant(
+    mysql_dialect.DATETIME(fsp=6), "mysql"
+)
 
 
 _owners = Table(
@@ -75,13 +89,13 @@ _owners = Table(
     ),
     Column(
         "lease_expires_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=True,
         comment="UTC expiry of the current owner transition lease",
     ),
     Column(
         "updated_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=False,
         comment="UTC time of the latest owner state mutation",
     ),
@@ -97,21 +111,32 @@ Index(
 )
 
 
-def _type_signature(column_type: object) -> tuple[str, int | None]:
-    """Normalize reflected SQLite/MySQL types into the schema contract."""
+def _type_signature(
+    column_type: object, *, dialect_name: str
+) -> tuple[str, int | None]:
+    """Normalize reflected SQLAlchemy types into the schema contract."""
     if isinstance(column_type, String):
         return ("string", column_type.length)
     if isinstance(column_type, BigInteger):
         return ("bigint", None)
     if isinstance(column_type, Integer):
         return ("integer", None)
+    if isinstance(column_type, mysql_dialect.DATETIME):
+        return ("datetime", column_type.fsp or 0)
+    if isinstance(column_type, postgresql_dialect.TIMESTAMP):
+        precision = 6 if column_type.precision is None else column_type.precision
+        return ("datetime_timezone" if column_type.timezone else "datetime", precision)
     if isinstance(column_type, DateTime):
-        return ("datetime", None)
+        # An unqualified PostgreSQL TIMESTAMP preserves six fractional digits.
+        return (
+            "datetime_timezone" if column_type.timezone else "datetime",
+            6 if dialect_name == "postgresql" else None,
+        )
     return (type(column_type).__name__.lower(), None)
 
 
 def _default_signature(value: object | None) -> str | None:
-    """Normalize equivalent SQLite/MySQL reflected server defaults."""
+    """Normalize equivalent SQLAlchemy reflected server defaults."""
     if value is None:
         return None
     normalized = str(value).strip()
@@ -144,6 +169,11 @@ def _validate_schema(sync_connection: Connection) -> None:
             issues.append(f"{table.name}: missing table")
             continue
 
+        if (
+            sync_connection.dialect.name != "sqlite"
+            and inspector.get_table_comment(table.name).get("text") != table.comment
+        ):
+            issues.append(f"{table.name}: incompatible comment")
         reflected_columns = {
             str(column["name"]): column for column in inspector.get_columns(table.name)
         }
@@ -160,7 +190,17 @@ def _validate_schema(sync_connection: Connection) -> None:
 
         for expected in table.columns:
             actual = reflected_columns[expected.name]
-            if _type_signature(actual["type"]) != _type_signature(expected.type):
+            if (
+                sync_connection.dialect.name != "sqlite"
+                and actual.get("comment") != expected.comment
+            ):
+                issues.append(f"{table.name}.{expected.name}: incompatible comment")
+            if _type_signature(
+                actual["type"], dialect_name=sync_connection.dialect.name
+            ) != _type_signature(
+                expected.type.dialect_impl(sync_connection.dialect),
+                dialect_name=sync_connection.dialect.name,
+            ):
                 issues.append(f"{table.name}.{expected.name}: incompatible type")
             if bool(actual["nullable"]) != bool(expected.nullable):
                 issues.append(f"{table.name}.{expected.name}: incompatible nullable")
@@ -259,13 +299,13 @@ _workers = Table(
     ),
     Column(
         "lease_expires_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=False,
         comment="UTC expiry used to ignore workers that exited without cleanup",
     ),
     Column(
         "updated_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=False,
         comment="UTC time of the latest Worker registration mutation",
     ),
@@ -317,13 +357,13 @@ _warm_slots = Table(
     ),
     Column(
         "lease_expires_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=True,
         comment="UTC expiry of the current warm-slot fill lease",
     ),
     Column(
         "updated_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=False,
         comment="UTC time of the latest warm-slot mutation",
     ),
@@ -370,7 +410,7 @@ _cleanup = Table(
     ),
     Column(
         "lease_expires_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=True,
         comment="UTC expiry of the current cleanup lease",
     ),
@@ -383,13 +423,13 @@ _cleanup = Table(
     ),
     Column(
         "created_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=False,
         comment="UTC time when this cleanup target was first enqueued",
     ),
     Column(
         "updated_at",
-        DateTime(timezone=False),
+        _DATABASE_TIMESTAMP,
         nullable=False,
         comment="UTC time of the latest cleanup mutation",
     ),
@@ -507,7 +547,7 @@ Index(
 
 def get_sqlalchemy_opensandbox_state_schema(
     *,
-    dialect: Literal["mysql", "sqlite"],
+    dialect: SqlDialect,
 ) -> SQLAlchemyOpenSandboxStateSchema:
     """Build the complete OpenSandbox State schema without database I/O.
 
@@ -519,7 +559,7 @@ def get_sqlalchemy_opensandbox_state_schema(
         An immutable descriptor containing deterministic full-database DDL.
 
     Raises:
-        ValueError: The requested dialect is not ``mysql`` or ``sqlite``.
+        ValueError: The requested dialect is unsupported.
     """
 
     from .sqlalchemy import SQLAlchemyOpenSandboxStateSchema
@@ -529,8 +569,10 @@ def get_sqlalchemy_opensandbox_state_schema(
         compiler.server_version_info = (5, 7, 0)
     elif dialect == "sqlite":
         compiler = sqlite_dialect.dialect()
+    elif dialect == "postgresql":
+        compiler = postgresql_dialect.dialect()
     else:
-        raise ValueError("dialect must be 'mysql' or 'sqlite'")
+        raise ValueError("dialect must be 'mysql', 'sqlite', or 'postgresql'")
 
     tables = tuple(_metadata.sorted_tables)
     statements = [
@@ -543,6 +585,18 @@ def get_sqlalchemy_opensandbox_state_schema(
     statements.extend(
         str(CreateIndex(index).compile(dialect=compiler)).strip() for index in indexes
     )
+    if dialect == "postgresql":
+        statements.extend(
+            str(SetTableComment(table).compile(dialect=compiler)).strip()
+            for table in tables
+            if table.comment
+        )
+        statements.extend(
+            str(SetColumnComment(column).compile(dialect=compiler)).strip()
+            for table in tables
+            for column in table.columns
+            if column.comment
+        )
     normalized = tuple(
         "\n".join(line.rstrip() for line in statement.splitlines())
         for statement in statements

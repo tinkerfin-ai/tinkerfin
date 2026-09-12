@@ -27,7 +27,7 @@ const page = (): TraceGraphPage => ({
       status: 'succeeded',
       name: 'HumanMessage',
       runId: 'run-1',
-      namespace: [],
+      graphNamespace: [],
       startedAt: '2026-08-31T00:00:00Z',
       completedAt: '2026-08-31T00:00:00Z',
       startedSeq: 2,
@@ -48,7 +48,7 @@ const page = (): TraceGraphPage => ({
       status: 'succeeded',
       name: 'deepseek-chat',
       runId: 'run-1',
-      namespace: [],
+      graphNamespace: [],
       provider: 'deepseek',
       model: 'deepseek-chat',
       startedAt: '2026-08-31T00:00:00Z',
@@ -121,7 +121,7 @@ describe('Trace Graph client', () => {
       expect(url.searchParams.getAll('kind')).toEqual(['model', 'subagent'])
       expect(url.searchParams.getAll('status')).toEqual(['failed'])
       expect(url.searchParams.getAll('provider')).toEqual(['deepseek'])
-      expect(url.searchParams.get('namespace')).toBe('root')
+      expect(url.searchParams.get('graph_namespace')).toBe('root')
       expect(url.searchParams.get('query')).toBe('deepseek')
       expect(url.searchParams.has('includeTechnicalNodes')).toBe(false)
       expect(url.searchParams.has('includeAncestorNodes')).toBe(false)
@@ -134,7 +134,7 @@ describe('Trace Graph client', () => {
       kinds: ['model', 'subagent'],
       statuses: ['failed'],
       providers: ['deepseek'],
-      namespaces: [[]],
+      graphNamespaces: [[]],
       query: 'deepseek',
     }, { limit: 1000 })) events.push(event)
 
@@ -284,7 +284,7 @@ describe('Trace Graph client', () => {
       parentSubagentId: index === 0 ? null : `subagent-${index - 1}`,
       kind: 'subagent' as const,
       name: `subagent-${index}`,
-      namespace: Array.from({ length: index + 1 }, (__, part) => `tools:${part}`),
+      graphNamespace: Array.from({ length: index + 1 }, (__, part) => `tools:${part}`),
       startedSeq: index + 1,
       updatedSeq: index + 1,
     }))
@@ -325,7 +325,7 @@ describe('Trace Graph client', () => {
       parentSubagentId: 'subagent-b',
       kind: 'subagent' as const,
       name: 'subagent-a',
-      namespace: ['tools:a'],
+      graphNamespace: ['tools:a'],
       startedSeq: 1,
       updatedSeq: 1,
     }
@@ -334,7 +334,7 @@ describe('Trace Graph client', () => {
       id: 'subagent-b',
       parentSubagentId: 'subagent-a',
       name: 'subagent-b',
-      namespace: ['tools:a', 'tools:b'],
+      graphNamespace: ['tools:a', 'tools:b'],
       startedSeq: 2,
       updatedSeq: 2,
     }

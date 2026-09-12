@@ -12,12 +12,17 @@ pip install tinkerfin-contracts
 ## Run identity
 
 ```python
-from tinkerfin_contracts import RunIdentity
+from tinkerfin_contracts import RunIdentity, ThreadIdentity
 
-identity = RunIdentity(threadId="thread-1", runId="run-1")
+identity = RunIdentity(namespace="company-a", thread_id="thread-1", run_id="run-1")
+assert identity.thread == ThreadIdentity(namespace="company-a", thread_id="thread-1")
 ```
 
-Both canonical identifiers are non-empty, immutable, and limited to 1,024 characters.
+The namespace is required and limited to 128 Unicode characters; thread and run IDs
+are limited to 1,024 characters each. All identifiers are non-empty, immutable,
+case-sensitive UTF-8 strings without surrounding whitespace. Hosts choose namespace
+ownership and enforce authorization. JSON uses flat `namespace`, `threadId`, and
+`runId` fields; the derived `thread` property is not serialized.
 
 ## Runtime observers
 
@@ -35,7 +40,11 @@ The observation union contains:
 - Run start, input, resume-checkpoint, Observer-failure, terminal, and close values;
 - validated Native message, task, root/subgraph state, interrupt, and declared extra-mode
   values;
-- stable full namespace, IDs, UTC time, and monotonic clock evidence.
+- stable full graph namespace, IDs, UTC time, and monotonic clock evidence.
+
+`identity.namespace` identifies the application-defined isolation scope.
+`graph_namespace` identifies a position within the execution graph; `()` is the root.
+Observation JSON uses `graphNamespace` for that position.
 
 Runtime observers receive validated models rather than captured Python `repr`.
 JSON fields reject non-finite numbers during Python and JSON validation. Model fields
@@ -47,4 +56,4 @@ protocol-neutral Run source summary and checkpoint Observation.
 ## License
 
 Apache License 2.0. See
-[LICENSE](https://github.com/tinkerfin-ai/tinkerfin/blob/main/LICENSE).
+[LICENSE](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/LICENSE).

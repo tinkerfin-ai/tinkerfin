@@ -27,6 +27,7 @@ from tinkerfin_contracts import (
     RunStartedObservation,
     RunTerminalObservation,
     RunTerminalOutcome,
+    ThreadIdentity,
     ToolExecutionObservation,
 )
 from tinkerfin_tracing import (
@@ -58,7 +59,9 @@ def _context(
     resume: tuple[RunResumeSummary, ...] = (),
 ) -> RunSourceContext:
     return RunSourceContext(
-        identity=RunIdentity(threadId="thread-semantic", runId=run_id),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-semantic", run_id=run_id
+        ),
         runtime_profile="deepagents-v2",
         input_kind=input_kind,
         parent_run_id=parent_run_id,
@@ -145,7 +148,7 @@ async def _record_state_run(
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"value": value, "shared": shared},
             observed_at=datetime.now(UTC),
             monotonic_ns=3,
@@ -174,7 +177,10 @@ async def test_branch_state_hydrates_only_the_selected_ancestor_lineage() -> Non
         input_kind="branch",
     )
 
-    branch = await tracer.get("thread-semantic", head_run_id="branch-b")
+    branch = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic"),
+        head_run_id="branch-b",
+    )
 
     assert branch.state.root == {"value": "b", "shared": 2}
 
@@ -200,7 +206,7 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant_chunk",
                 id="assistant-tool",
@@ -221,7 +227,7 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant_chunk",
                 id="assistant-tool",
@@ -245,7 +251,13 @@ async def test_tool_allowlist_is_applied_to_the_complete_arguments_snapshot() ->
         )
     )
     await _finish(session, context)
-    events = (await (await tracer.get("thread-semantic")).events(limit=100)).items
+    events = (
+        await (
+            await tracer.get(
+                ThreadIdentity(namespace="test", thread_id="thread-semantic")
+            )
+        ).events(limit=100)
+    ).items
     argument_facts = [
         event.fact
         for event in events
@@ -264,7 +276,7 @@ async def test_root_tool_capture_populates_bounded_node_input_and_result() -> No
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-root-capture",
@@ -284,7 +296,7 @@ async def test_root_tool_capture_populates_bounded_node_input_and_result() -> No
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="tool",
                 id="tool-root-capture-result",
@@ -299,7 +311,9 @@ async def test_root_tool_capture_populates_bounded_node_input_and_result() -> No
     )
     await _finish(session, context)
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     node = next(item for item in thread.graph.nodes if item.kind == "tool")
     result = next(item for item in thread.messages if item.role == "tool")
 
@@ -327,7 +341,7 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-disabled-tool",
@@ -371,7 +385,7 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="tool",
                 id="disabled-tool-result",
@@ -385,7 +399,9 @@ async def test_disabled_tool_emits_no_tool_or_result_message_facts() -> None:
     )
     await _finish(session, context)
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     events = (await thread.events(limit=100)).items
 
     assert not any(isinstance(event.fact, ToolFact) for event in events)
@@ -409,7 +425,7 @@ async def test_subgraph_tool_message_uses_its_scoped_tool_name_for_capture() -> 
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-subgraph",
@@ -425,7 +441,7 @@ async def test_subgraph_tool_message_uses_its_scoped_tool_name_for_capture() -> 
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             message=NativeMessageRecord(
                 message_type="tool",
                 id="tool-subgraph",
@@ -437,7 +453,9 @@ async def test_subgraph_tool_message_uses_its_scoped_tool_name_for_capture() -> 
         )
     )
     await _finish(session, context)
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     tool_message = next(
         message for message in thread.messages if message.role == "tool"
     )
@@ -473,7 +491,7 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id=parent_task_id,
             name="tools",
@@ -495,7 +513,7 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             phase="start",
             task_id="child-task",
             name="model",
@@ -508,7 +526,7 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             phase="result",
             task_id="child-task",
             name="model",
@@ -520,7 +538,7 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="result",
             task_id=parent_task_id,
             name="tools",
@@ -531,7 +549,9 @@ async def test_parent_task_result_completes_its_direct_subagent_before_interrupt
     )
     await _finish(session, context, outcome="interrupted")
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     facts = [
         event.fact
         for event in (await thread.events(limit=100)).items
@@ -578,7 +598,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-task-call",
@@ -598,7 +618,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id="parent-task",
             name="tools",
@@ -612,7 +632,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             phase="start",
             task_id="child-model",
             name="model",
@@ -631,7 +651,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             state={},
             messages=(child_input,),
             observed_at=now,
@@ -641,7 +661,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             message=NativeMessageRecord(
                 message_type="human",
                 id="child-follow-up",
@@ -654,7 +674,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             state={},
             messages=(
                 child_input,
@@ -671,7 +691,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="result",
             task_id="parent-task",
             name="tools",
@@ -683,7 +703,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="tool",
                 id="task-result",
@@ -698,7 +718,9 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
     )
     await _finish(session, context)
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     facts = [
         event.fact
         for event in (await thread.events(limit=100)).items
@@ -714,7 +736,7 @@ async def test_verified_task_tool_adds_subagent_identity_and_input(
         event.fact
         for event in (await thread.events(limit=100)).items
         if isinstance(event.fact, MessageFact)
-        and event.fact.namespace == namespace
+        and event.fact.graph_namespace == namespace
         and event.fact.role == "user"
     ]
 
@@ -766,7 +788,7 @@ async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id="delegation",
             name="tools",
@@ -787,7 +809,7 @@ async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             state={},
             messages=(message,),
             observed_at=datetime.now(UTC),
@@ -801,7 +823,7 @@ async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
         await session.observe(
             NativeStateObservation(
                 identity=context.identity,
-                namespace=namespace,
+                graph_namespace=namespace,
                 state={},
                 messages=(message,),
                 observed_at=datetime.now(UTC),
@@ -820,7 +842,7 @@ async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
     await resumed_session.observe(
         NativeStateObservation(
             identity=resumed.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             state={},
             messages=(message,),
             observed_at=datetime.now(UTC),
@@ -830,7 +852,7 @@ async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
     await resumed_session.observe(
         NativeStateObservation(
             identity=resumed.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             state={},
             messages=(),
             observed_at=datetime.now(UTC),
@@ -839,11 +861,15 @@ async def test_resumed_subagent_keeps_its_task_input_in_one_fact(
     )
     await _finish(resumed_session, resumed, outcome="interrupted")
     events = (
-        await (await resumed_tracer.get("thread-semantic")).events(limit=100)
+        await (
+            await resumed_tracer.get(
+                ThreadIdentity(namespace="test", thread_id="thread-semantic")
+            )
+        ).events(limit=100)
     ).items
     assert not any(
         isinstance(event.fact, MessageFact)
-        and event.fact.namespace == namespace
+        and event.fact.graph_namespace == namespace
         and event.fact.source_message_id == "initial"
         for event in events
     )
@@ -898,7 +924,7 @@ async def test_grouped_parallel_task_result_completes_every_direct_subagent() ->
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="start",
             task_id=parent_task_id,
             name="tools",
@@ -911,7 +937,7 @@ async def test_grouped_parallel_task_result_completes_every_direct_subagent() ->
         await session.observe(
             NativeTaskObservation(
                 identity=context.identity,
-                namespace=(f"tools:{parent_task_id}:{index}",),
+                graph_namespace=(f"tools:{parent_task_id}:{index}",),
                 phase="start",
                 task_id=f"child-{index}",
                 name="model",
@@ -923,7 +949,7 @@ async def test_grouped_parallel_task_result_completes_every_direct_subagent() ->
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="result",
             task_id=parent_task_id,
             name="tools",
@@ -934,7 +960,9 @@ async def test_grouped_parallel_task_result_completes_every_direct_subagent() ->
     )
     await _finish(session, context)
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     subagents = [node for node in thread.graph.nodes if node.kind == "subagent"]
 
     assert len(subagents) == 2
@@ -963,7 +991,7 @@ async def test_private_state_and_provider_reasoning_never_enter_the_ledger() -> 
     await session.observe(
         NativeTaskObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             phase="result",
             task_id="privacy-task",
             name="model",
@@ -981,7 +1009,7 @@ async def test_private_state_and_provider_reasoning_never_enter_the_ledger() -> 
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={
                 "public": "visible-state",
                 "_private_runtime": "private-state-value",
@@ -991,7 +1019,9 @@ async def test_private_state_and_provider_reasoning_never_enter_the_ledger() -> 
         )
     )
     await _finish(session, context)
-    page = await (await tracer.get("thread-semantic")).events(limit=100)
+    page = await (
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-semantic"))
+    ).events(limit=100)
     encoded = page.model_dump_json(by_alias=True)
 
     assert "provider-private-reasoning" not in encoded
@@ -1010,14 +1040,16 @@ async def test_plan_payload_is_stored_once_and_still_projects_into_state() -> No
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"tinkerfin_plan": plan, "other": "value"},
             observed_at=datetime.now(UTC),
             monotonic_ns=3,
         )
     )
     await _finish(session, context)
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     events = (await thread.events(limit=100)).items
     plan_facts = [
         event.fact for event in events if isinstance(event.fact, PlanRevisionFact)
@@ -1039,7 +1071,7 @@ async def test_interaction_resolves_across_resume_and_keeps_one_turn() -> None:
     await first.observe(
         NativeStateObservation(
             identity=initial.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"todos": [{"content": "Wait", "status": "pending"}]},
             interrupts=(
                 NativeInterruptRecord(
@@ -1052,7 +1084,9 @@ async def test_interaction_resolves_across_resume_and_keeps_one_turn() -> None:
         )
     )
     await _finish(first, initial, outcome="interrupted")
-    interrupted = await tracer.get("thread-semantic")
+    interrupted = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     assert [item.source_id for item in interrupted.summary.pending_interactions] == [
         "interrupt-1"
     ]
@@ -1082,14 +1116,16 @@ async def test_interaction_resolves_across_resume_and_keeps_one_turn() -> None:
     await second.observe(
         NativeStateObservation(
             identity=resumed.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"todos": [{"content": "Continue", "status": "completed"}]},
             observed_at=datetime.now(UTC),
             monotonic_ns=4,
         )
     )
     await _finish(second, resumed)
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     events = (await thread.events(limit=100)).items
     interaction_facts = [
         event.fact for event in events if isinstance(event.fact, InteractionFact)
@@ -1138,14 +1174,16 @@ async def test_root_and_colliding_subgraph_paths_remain_separate_state_scopes() 
         await session.observe(
             NativeStateObservation(
                 identity=context.identity,
-                namespace=namespace,
+                graph_namespace=namespace,
                 state={"value": value},
                 observed_at=now,
                 monotonic_ns=index,
             )
         )
     await _finish(session, context)
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     state = thread.state
 
     assert state.root == {"value": "root"}
@@ -1175,7 +1213,7 @@ async def test_tool_review_interaction_applies_the_tool_argument_allowlist() -> 
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(
                 NativeMessageRecord(
@@ -1222,7 +1260,9 @@ async def test_tool_review_interaction_applies_the_tool_argument_allowlist() -> 
         )
     )
     await _finish(session, context, outcome="interrupted")
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     interaction = thread.interactions[0]
     encoded = (await thread.events(limit=100)).model_dump_json(by_alias=True)
 
@@ -1253,7 +1293,7 @@ async def test_same_name_review_actions_keep_exact_checkpoint_tool_ids() -> None
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(
                 NativeMessageRecord(
@@ -1306,7 +1346,9 @@ async def test_same_name_review_actions_keep_exact_checkpoint_tool_ids() -> None
     )
     await _finish(session, context, outcome="interrupted")
 
-    interaction = (await tracer.get("thread-semantic")).interactions[0]
+    interaction = (
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-semantic"))
+    ).interactions[0]
     assert interaction.tool_call_ids == ("call-write-a", "call-write-b")
 
 
@@ -1327,7 +1369,7 @@ async def test_tool_review_ignores_a_completed_historical_duplicate() -> None:
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(
                 NativeMessageRecord(
@@ -1375,7 +1417,9 @@ async def test_tool_review_ignores_a_completed_historical_duplicate() -> None:
     )
     await _finish(session, context, outcome="interrupted")
 
-    interaction = (await tracer.get("thread-semantic")).interactions[0]
+    interaction = (
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-semantic"))
+    ).interactions[0]
     assert interaction.tool_call_ids == ("call-current-review",)
 
 
@@ -1386,7 +1430,7 @@ async def test_resumed_tool_result_does_not_repeat_pre_interrupt_lifecycle() -> 
     await first.observe(
         NativeMessageObservation(
             identity=initial.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="assistant-tool-interrupt",
@@ -1406,7 +1450,7 @@ async def test_resumed_tool_result_does_not_repeat_pre_interrupt_lifecycle() -> 
     await first.observe(
         NativeStateObservation(
             identity=initial.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             interrupts=(
                 NativeInterruptRecord(
@@ -1436,7 +1480,7 @@ async def test_resumed_tool_result_does_not_repeat_pre_interrupt_lifecycle() -> 
     await second.observe(
         NativeMessageObservation(
             identity=resumed.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="tool",
                 id="resumed-tool-result",
@@ -1450,7 +1494,13 @@ async def test_resumed_tool_result_does_not_repeat_pre_interrupt_lifecycle() -> 
         )
     )
     await _finish(second, resumed)
-    events = (await (await tracer.get("thread-semantic")).events(limit=100)).items
+    events = (
+        await (
+            await tracer.get(
+                ThreadIdentity(namespace="test", thread_id="thread-semantic")
+            )
+        ).events(limit=100)
+    ).items
     tool_facts = [
         event.fact
         for event in events
@@ -1474,7 +1524,7 @@ async def test_tool_review_arguments_are_metadata_only_without_an_allowlist() ->
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(
                 NativeMessageRecord(
@@ -1515,7 +1565,9 @@ async def test_tool_review_arguments_are_metadata_only_without_an_allowlist() ->
         )
     )
     await _finish(session, context, outcome="interrupted")
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     payload = thread.interactions[0].payload
     encoded = (await thread.events(limit=100)).model_dump_json(by_alias=True)
 
@@ -1548,7 +1600,7 @@ async def test_oversized_pending_interaction_fails_before_an_unrecoverable_pause
         await session.observe(
             NativeStateObservation(
                 identity=context.identity,
-                namespace=(),
+                graph_namespace=(),
                 state={},
                 interrupts=(
                     NativeInterruptRecord(
@@ -1580,7 +1632,7 @@ async def _omitted_tool_result_fingerprint(secret: str) -> str:
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=message,
             observed_at=now,
             monotonic_ns=3,
@@ -1589,7 +1641,7 @@ async def _omitted_tool_result_fingerprint(secret: str) -> str:
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(message,),
             observed_at=now,
@@ -1597,7 +1649,13 @@ async def _omitted_tool_result_fingerprint(secret: str) -> str:
         )
     )
     await _finish(session, context)
-    events = (await (await tracer.get("thread-semantic")).events(limit=100)).items
+    events = (
+        await (
+            await tracer.get(
+                ThreadIdentity(namespace="test", thread_id="thread-semantic")
+            )
+        ).events(limit=100)
+    ).items
     return next(
         fact.fingerprint
         for event in events
@@ -1628,7 +1686,7 @@ async def test_removed_message_can_be_readded_once_with_the_same_id() -> None:
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(first,),
             observed_at=now,
@@ -1638,7 +1696,7 @@ async def test_removed_message_can_be_readded_once_with_the_same_id() -> None:
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(),
             observed_at=now,
@@ -1648,7 +1706,7 @@ async def test_removed_message_can_be_readded_once_with_the_same_id() -> None:
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             messages=(second,),
             observed_at=now,
@@ -1656,7 +1714,9 @@ async def test_removed_message_can_be_readded_once_with_the_same_id() -> None:
         )
     )
     await _finish(session, context)
-    messages = (await tracer.get("thread-semantic")).messages
+    messages = (
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-semantic"))
+    ).messages
 
     reused = [message for message in messages if message.source_id == "reused-message"]
     assert len(reused) == 1
@@ -1671,7 +1731,7 @@ async def test_resume_resolves_the_original_subgraph_interaction_scope() -> None
     await first.observe(
         NativeStateObservation(
             identity=initial.identity,
-            namespace=namespace,
+            graph_namespace=namespace,
             state={},
             interrupts=(
                 NativeInterruptRecord(
@@ -1699,10 +1759,12 @@ async def test_resume_resolves_the_original_subgraph_interaction_scope() -> None
     )
     second = await _start(tracer, resumed)
     await _finish(second, resumed)
-    interactions = (await tracer.get("thread-semantic")).interactions
+    interactions = (
+        await tracer.get(ThreadIdentity(namespace="test", thread_id="thread-semantic"))
+    ).interactions
 
     assert len(interactions) == 1
-    assert interactions[0].namespace == namespace
+    assert interactions[0].graph_namespace == namespace
     assert interactions[0].status == "resolved"
 
 
@@ -1713,7 +1775,7 @@ async def test_native_resume_resolves_one_unambiguous_pending_interrupt() -> Non
     await first.observe(
         NativeStateObservation(
             identity=initial.identity,
-            namespace=(),
+            graph_namespace=(),
             state={},
             interrupts=(
                 NativeInterruptRecord(
@@ -1734,7 +1796,9 @@ async def test_native_resume_resolves_one_unambiguous_pending_interrupt() -> Non
     )
     second = await _start(tracer, resumed)
     await _finish(second, resumed)
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     run_facts = [
         event.fact
         for event in (await thread.events(limit=100)).items
@@ -1751,7 +1815,9 @@ async def test_native_resume_resolves_one_unambiguous_pending_interrupt() -> Non
 async def test_turn_uses_only_the_authoritative_top_level_messages_channel() -> None:
     tracer = Tracer()
     context = RunSourceContext(
-        identity=RunIdentity(threadId="thread-semantic", runId="authoritative-user"),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-semantic", run_id="authoritative-user"
+        ),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={
@@ -1773,7 +1839,9 @@ async def test_turn_uses_only_the_authoritative_top_level_messages_channel() -> 
     session = await _start(tracer, context)
     await _finish(session, context)
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     encoded = "".join(
         event.model_dump_json(by_alias=True)
         for event in (await thread.events(limit=100)).items
@@ -1796,7 +1864,7 @@ async def test_private_state_filter_removes_only_declared_top_level_channels() -
     await session.observe(
         NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={
                 "_tinkerfin_resume": "private runtime value",
                 "business": {"_tinkerfin_resume": "public business value"},
@@ -1807,7 +1875,9 @@ async def test_private_state_filter_removes_only_declared_top_level_channels() -
     )
     await _finish(session, context)
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     encoded = "".join(
         event.model_dump_json(by_alias=True)
         for event in (await thread.events(limit=100)).items
@@ -1845,7 +1915,9 @@ async def test_terminal_fact_does_not_duplicate_an_unbounded_interrupt_batch() -
     )
     await session.aclose()
 
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
     run_facts = [
         event.fact
         for event in (await thread.events(limit=100)).items
@@ -1860,7 +1932,9 @@ async def test_maximal_run_identity_remains_usable_by_the_tracer() -> None:
     run_id = "r" * 1024
     tracer = Tracer()
     context = RunSourceContext(
-        identity=RunIdentity(threadId="thread-maximal-identity", runId=run_id),
+        identity=RunIdentity(
+            namespace="test", thread_id="thread-maximal-identity", run_id=run_id
+        ),
         runtime_profile="deepagents-v2",
         input_kind="ordinary",
         input={"messages": []},
@@ -1869,7 +1943,9 @@ async def test_maximal_run_identity_remains_usable_by_the_tracer() -> None:
     session = await _start(tracer, context)
     await _finish(session, context)
 
-    thread = await tracer.get("thread-maximal-identity")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-maximal-identity")
+    )
     assert thread.status.head_run_id == run_id
     assert thread.status.execution == "succeeded"
 
@@ -1886,7 +1962,7 @@ async def test_concurrent_runs_have_disjoint_bounded_source_observation_ids() ->
     first_events = (
         await (
             await tracer.get(
-                "thread-semantic",
+                ThreadIdentity(namespace="test", thread_id="thread-semantic"),
                 head_run_id="concurrent-source-a",
             )
         ).events(limit=100)
@@ -1894,7 +1970,7 @@ async def test_concurrent_runs_have_disjoint_bounded_source_observation_ids() ->
     second_events = (
         await (
             await tracer.get(
-                "thread-semantic",
+                ThreadIdentity(namespace="test", thread_id="thread-semantic"),
                 head_run_id="concurrent-source-b",
             )
         ).events(limit=100)
@@ -1916,7 +1992,7 @@ async def test_native_remove_message_removes_the_target_without_waiting_for_stat
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="assistant",
                 id="remove-target",
@@ -1929,7 +2005,7 @@ async def test_native_remove_message_removes_the_target_without_waiting_for_stat
     await session.observe(
         NativeMessageObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             message=NativeMessageRecord(
                 message_type="remove",
                 id="remove-target",
@@ -1940,6 +2016,8 @@ async def test_native_remove_message_removes_the_target_without_waiting_for_stat
         )
     )
     await _finish(session, context)
-    thread = await tracer.get("thread-semantic")
+    thread = await tracer.get(
+        ThreadIdentity(namespace="test", thread_id="thread-semantic")
+    )
 
     assert all(message.source_id != "remove-target" for message in thread.messages)

@@ -9,7 +9,7 @@ query checkpoints, authenticate requests, or provide an HTTP server.
 Use it when an application already owns Graph execution and needs only the conversion
 boundary. Applications that need managed Graph construction, checkpoint resume,
 Observation, and stream cleanup can use
-[`TinkerFin.open_agui_run()`](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md).
+[`AgentRuntime.open_agui_run()`](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/docs/en/agui/index.md).
 
 ## Installation
 
@@ -69,10 +69,10 @@ ownership.
 
 ## Event contract
 
-- One conversion emits one `RUN_STARTED` and exactly one main terminal.
+- A fully consumed conversion emits one `RUN_STARTED` and exactly one main terminal.
 - Text, reasoning, and tool lifecycles close before state, interrupt, error, or
   completion boundaries.
-- Full namespaces and IDs correlate concurrent messages, tool calls, results, and
+- Full graph namespaces and IDs correlate concurrent messages, tool calls, results, and
   subagents; arrival order is not identity.
 - Every `tasks/start` establishes a possible compiled-graph scope. Only a scope also
   correlated with a Deep Agents `task` Tool call receives `deep_agent_subagent`
@@ -94,8 +94,8 @@ ownership.
   validation.
 - Child interrupts remain buffered until root `values` propagates an identical full ID
   and value. The terminal boundary publishes root state, then a root-first
-  namespace-scoped message snapshot, then one interrupt outcome. A replay of the same
-  child interrupt set must carry the identical message snapshot for that namespace.
+  graph-scoped message snapshot, then one interrupt outcome. A replay of the same
+  child interrupt set must carry the identical message snapshot for that graph namespace.
 - Declared `RuntimeInterruptEnvelope` values map to AG-UI interrupts without a Tool
   ID. Their trusted envelope, response schema, and native ID are persisted for generic
   resume translation; one batch cannot mix runtime and Tool interrupts.
@@ -107,12 +107,13 @@ ownership.
 - `private_state_keys` removes only named top-level channels at known state projection
   boundaries. Nested same-named business fields remain visible. TinkerFin Plan
   Runtimes supply their private channels automatically.
-- Conversion pulls with bounded lookahead and closes an upstream iterator exposing
-  `aclose()` on cancellation or early consumer exit.
+- Conversion pulls with bounded lookahead. Close the event iterator explicitly or use
+  `aclosing` when leaving iteration early; cancellation during a pull closes its upstream.
 
 `ResumeMapper.map()` translates complete AG-UI resume entries from native checkpoint
-interrupts and messages grouped by full namespace. Resolved reviews require those
-messages so Tool calls can be correlated safely. `ResumeMapper.map_agui()` instead
+interrupts and messages grouped by full graph namespace. Resolved reviews require those
+messages so Tool calls can be correlated safely. Identical actions in different
+Graphs require `interrupt_graph_namespaces` from trusted checkpoint evidence. `ResumeMapper.map_agui()` instead
 accepts complete AG-UI interrupts that the host persisted from an earlier terminal. It
 reuses their already verified scoped `toolCallId` values and does not query a graph or
 checkpointer. Never pass client-supplied interrupt payloads to that method.
@@ -155,7 +156,7 @@ Assistant attachment blocks emit `CUSTOM` with name `tinkerfin.message.attachmen
 and value `{ "messageId": "...", "attachments": [...] }`, within a balanced message
 Start/End lifecycle. Consumers merge additions by attachment ID. Authoritative assistant
 and Tool snapshots carry the same descriptors in `attachments`; snapshot arrays replace
-prior descriptors. IDs and raw-event namespaces retain the ordinary scoped correlation
+prior descriptors. IDs and raw-event graph namespaces retain the ordinary scoped correlation
 contract. Attachment descriptors have `id`, `name`, `mime_type`, and `size_bytes` fields;
 `Attachment.model_json_schema()` in `tinkerfin_contracts.media` provides their schema.
 File bytes, signed download URLs, and credentials are not attachment descriptors.
@@ -178,11 +179,11 @@ checkpoint snapshots. Native messages use standard `image` or `file` blocks with
 
 ## Documentation
 
-- [AG-UI guide](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/index.md)
-- [Adapter extensions](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/agui/adapter-extensions.md)
-- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin/blob/main/docs/en/index.md)
+- [AG-UI guide](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/docs/en/agui/index.md)
+- [Adapter extensions](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/docs/en/agui/adapter-extensions.md)
+- [Complete documentation](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/docs/en/index.md)
 
 ## License
 
 Apache License 2.0. See the
-[repository license](https://github.com/tinkerfin-ai/tinkerfin/blob/main/LICENSE).
+[repository license](https://github.com/tinkerfin-ai/tinkerfin-harness/blob/main/LICENSE).

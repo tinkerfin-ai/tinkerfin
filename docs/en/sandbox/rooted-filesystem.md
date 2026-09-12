@@ -88,19 +88,12 @@ Responses preserve input order. A confirmed invalid path affects only that item.
 
 Rooted transfers require Python 3, Linux procfs, and shared process visibility between command and filesystem services. The default TinkerFin Sandbox image provides this environment.
 
-## Connect Deep Agents middleware
+## Connect an AgentRuntime
 
 ```python
-agent = create_deep_agent(
-    model=model,
-    backend=backend,
-    middleware=manager.build_agent_middleware(backend),
-)
-```
+from deepagents import FilesystemPermission
+from tinkerfin import TinkerFin
 
-For a `CompositeBackend`, pass the final composite to `build_agent_middleware()`, not only its default Sandbox backend.
-
-```python
 permissions = [
     FilesystemPermission(
         operations=["write"],
@@ -109,14 +102,19 @@ permissions = [
     )
 ]
 
-middleware = manager.build_agent_middleware(
-    composite_backend,
-    permissions=permissions,
+runtime = (
+    TinkerFin(checkpointer=checkpointer)
+    .with_namespace(namespace)
+    .build(
+        model=model,
+        backend=manager.workspace(workspace_key),
+        permissions=permissions,
+    )
 )
 ```
 
-Pass the same permissions to `create_deep_agent()`. Interrupt-mode permissions also require a checkpointer.
-
-Without a manager, call `build_rooted_filesystem_middleware(backend, permissions=...)` for an existing rooted backend.
+The Runtime prepares the rooted backend and its filesystem middleware together when the
+run starts. Permission rules that interrupt instead of deny require a checkpointer.
+Use `build_rooted_filesystem_middleware()` only in a caller-managed Deep Agents Graph.
 
 Next: [Persistent state and extensions](persistence-and-extensions.md).

@@ -52,7 +52,7 @@ def test_adapter_accepts_locked_v2_messages_tasks_and_values_envelopes() -> None
     """Exercise documented v2 envelope shapes using installed framework objects."""
 
     adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     )
     task_input = TaskToolSchema(
         description="Inspect the repository and report the public API.",

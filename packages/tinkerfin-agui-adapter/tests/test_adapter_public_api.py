@@ -140,10 +140,10 @@ def test_public_validator_can_be_reused_without_revalidating_the_envelope() -> N
     }
     validated = validate_deep_agent_stream_part(part)
     validated_adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     )
     ordinary_adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="thread-1", runId="run-1")
+        identity=RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
     )
 
     assert validated.type == "values"
@@ -170,13 +170,17 @@ def test_private_state_policy_requires_an_immutable_canonical_key_set() -> None:
     constructor: Callable[..., DeepAgentAgUiAdapter] = DeepAgentAgUiAdapter
     with pytest.raises(TypeError, match="frozenset"):
         constructor(
-            identity=RunIdentity(threadId="thread-1", runId="run-1"),
+            identity=RunIdentity(
+                namespace="test", thread_id="thread-1", run_id="run-1"
+            ),
             private_state_keys={"private"},  # pyright: ignore[reportArgumentType]
         )
     for value in ("", " private"):
         with pytest.raises(ValueError, match="canonical"):
             DeepAgentAgUiAdapter(
-                identity=RunIdentity(threadId="thread-1", runId="run-1"),
+                identity=RunIdentity(
+                    namespace="test", thread_id="thread-1", run_id="run-1"
+                ),
                 private_state_keys=frozenset({value}),
             )
 

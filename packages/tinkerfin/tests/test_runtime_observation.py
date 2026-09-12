@@ -18,18 +18,20 @@ from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
 from langgraph.types import Interrupt, StreamMode
 
 from tinkerfin import (
-    AgUiResumeBinding,
-    DeepAgentDefinition,
-    DeepAgentsFactoryPreparation,
-    DeepAgentsRuntimeProfile,
-    DeepAgentsV2RuntimeProfile,
-    NativeStreamFrame,
+    AgentRuntime,
     RunIdentity,
     RunObservationError,
     TinkerFin,
     TinkerFinStreamProtocolError,
 )
+from tinkerfin._observation import RuntimeObservationHub
+from tinkerfin.deep_agent import create_graph
 from tinkerfin.native_driver import DeepAgentsV2StreamDriver
+from tinkerfin.runtime_profile import (
+    DeepAgentsFactoryPreparation,
+    DeepAgentsRuntimeProfile,
+    DeepAgentsV2RuntimeProfile,
+)
 from tinkerfin_contracts import (
     NativeStateObservation,
     ObservationBoundary,
@@ -39,7 +41,11 @@ from tinkerfin_contracts import (
     RunTerminalObservation,
     RuntimeObservation,
 )
-from tinkerfin_native_stream import NativeStreamPart, NativeValuesStreamPart
+from tinkerfin_native_stream import (
+    NativeStreamFrame,
+    NativeStreamPart,
+    NativeValuesStreamPart,
+)
 
 _ProfileCheckpointSaver = (
     BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
@@ -212,7 +218,9 @@ class _Graph:
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-observed", runId="run-observed")
+    return RunIdentity(
+        namespace="test", thread_id="thread-observed", run_id="run-observed"
+    )
 
 
 def _input() -> InputAgentState:
@@ -230,42 +238,40 @@ def _source_context() -> RunSourceContext:
 
 
 def _definition(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
     graph: object,
     observer: _Observer,
-) -> DeepAgentDefinition[None]:
-    return definition_factory(graph, tinkerfin=TinkerFin().observe(observer))
+) -> AgentRuntime[None]:
+    return definition_factory(
+        graph, tinkerfin=TinkerFin().with_namespace("test").with_observer(observer)
+    )
 
 
 async def test_observe_is_immutable_and_plan_preserves_registration(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
-    base = TinkerFin()
+    base = TinkerFin().with_namespace("test")
     session = _Session()
     observer = _Observer(session)
-    observed = base.observe(observer)
-    planned = observed.plan(enabled=False)
+    observed = base.with_observer(observer)
+    planned = observed.with_plan(enabled=False)
 
-    plain_stream = (
-        definition_factory(_Graph([]), tinkerfin=base)
-        .new(identity=_identity())
-        .astream(_input())
+    plain_stream = definition_factory(_Graph([]), tinkerfin=base).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
-    observed_stream = (
-        definition_factory(_Graph([]), tinkerfin=planned)
-        .new(identity=_identity())
-        .astream(_input())
+    observed_stream = definition_factory(_Graph([]), tinkerfin=planned).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     assert [part async for part in plain_stream] == []
     assert [part async for part in observed_stream] == []
     assert len(observer.contexts) == 1
     with pytest.raises(ValueError, match="same RuntimeObserver"):
-        observed.observe(observer)
+        observed.with_observer(observer)
 
 
 async def test_native_observation_precedes_on_part_and_delivery(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     order: list[str] = []
     session = _Session(order=order)
@@ -280,13 +286,11 @@ async def test_native_observation_precedes_on_part_and_delivery(
     async def on_part(_part: object) -> None:
         order.append("hook")
 
-    stream = (
-        _definition(definition_factory, _Graph([part]), observer)
-        .new(
-            identity=_identity(),
-            on_part=on_part,
-        )
-        .astream(_input())
+    stream = _definition(definition_factory, _Graph([part]), observer).open_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
+        on_native_part=on_part,
+        input=_input(),
     )
     delivered = [value async for value in stream]
     order.append("delivered")
@@ -310,7 +314,7 @@ async def test_native_observation_precedes_on_part_and_delivery(
 
 
 async def test_malformed_part_never_reaches_trace_native_or_on_part(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     session = _Session()
     observer = _Observer(session)
@@ -325,13 +329,11 @@ async def test_malformed_part_never_reaches_trace_native_or_on_part(
         "ns": (),
         "data": (AIMessageChunk(id="message-1", content="partial"),),
     }
-    stream = (
-        _definition(definition_factory, _Graph([malformed]), observer)
-        .new(
-            identity=_identity(),
-            on_part=on_part,
-        )
-        .astream(_input())
+    stream = _definition(definition_factory, _Graph([malformed]), observer).open_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
+        on_native_part=on_part,
+        input=_input(),
     )
 
     with pytest.raises(TinkerFinStreamProtocolError):
@@ -350,7 +352,7 @@ async def test_malformed_part_never_reaches_trace_native_or_on_part(
 
 
 async def test_root_interrupt_selects_interrupted_terminal(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     session = _Session()
     observer = _Observer(session)
@@ -360,10 +362,8 @@ async def test_root_interrupt_selects_interrupted_terminal(
         "data": {"messages": []},
         "interrupts": (Interrupt(value={"request": "approval"}, id="interrupt-1"),),
     }
-    stream = (
-        _definition(definition_factory, _Graph([part]), observer)
-        .new(identity=_identity())
-        .astream(_input())
+    stream = _definition(definition_factory, _Graph([part]), observer).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     assert [value async for value in stream] == [part]
@@ -378,7 +378,7 @@ async def test_root_interrupt_selects_interrupted_terminal(
 
 
 async def test_root_interrupt_survives_trailing_message_part(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     session = _Session()
     observer = _Observer(session)
@@ -396,10 +396,10 @@ async def test_root_interrupt_survives_trailing_message_part(
             {"langgraph_node": "model"},
         ),
     }
-    stream = (
-        _definition(definition_factory, _Graph([interrupted, trailing]), observer)
-        .new(identity=_identity())
-        .astream(_input())
+    stream = _definition(
+        definition_factory, _Graph([interrupted, trailing]), observer
+    ).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     assert [value async for value in stream] == [interrupted, trailing]
@@ -409,8 +409,8 @@ async def test_root_interrupt_survives_trailing_message_part(
     assert terminal.interrupt_ids == ("interrupt-1",)
 
 
-async def test_later_root_values_can_clear_an_observed_interrupt(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+async def test_empty_root_values_preserves_an_observed_interrupt(
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     session = _Session()
     observer = _Observer(session)
@@ -426,29 +426,27 @@ async def test_later_root_values_can_clear_an_observed_interrupt(
         "data": {"messages": []},
         "interrupts": (),
     }
-    stream = (
-        _definition(definition_factory, _Graph([interrupted, continued]), observer)
-        .new(identity=_identity())
-        .astream(_input())
+    stream = _definition(
+        definition_factory, _Graph([interrupted, continued]), observer
+    ).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     assert [value async for value in stream] == [interrupted, continued]
     terminal = session.observations[-2]
     assert terminal.kind == "run.terminal"
-    assert terminal.outcome == "succeeded"
-    assert terminal.interrupt_ids == ()
+    assert terminal.outcome == "interrupted"
+    assert terminal.interrupt_ids == ("interrupt-1",)
 
 
 async def test_explicit_close_selects_cancelled_terminal(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     session = _Session()
     observer = _Observer(session)
     part = {"type": "values", "ns": (), "data": {"messages": []}}
-    stream = (
-        _definition(definition_factory, _Graph([part, part]), observer)
-        .new(identity=_identity())
-        .astream(_input())
+    stream = _definition(definition_factory, _Graph([part, part]), observer).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     assert await anext(stream) == part
@@ -459,44 +457,110 @@ async def test_explicit_close_selects_cancelled_terminal(
     assert terminal.outcome == "cancelled"
 
 
-async def test_cancelled_resume_without_graph_selects_abandoned_terminal(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
-) -> None:
+async def test_cancelled_resume_selects_abandoned_terminal(definition_factory) -> None:
+    from langchain_core.messages import AIMessage
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.types import interrupt
+
+    from tinkerfin import AgUiResumeRequest
+
+    executed: list[object] = []
+
+    def review(state: MessagesState) -> dict[str, list[AIMessage]]:
+        executed.append(
+            interrupt(
+                {
+                    "action_requests": [
+                        {"name": "change", "args": {}, "description": "Change a value"}
+                    ],
+                    "review_configs": [
+                        {
+                            "action_name": "change",
+                            "allowed_decisions": ["approve", "reject"],
+                        }
+                    ],
+                }
+            )
+        )
+        return {"messages": [AIMessage(content="done")]}
+
+    saver = InMemorySaver()
+
+    from tinkerfin._checkpoint import NamespaceCheckpointer
+
+    workflow = StateGraph(MessagesState)
+    workflow.add_node("review", review)
+    workflow.add_edge(START, "review")
+    workflow.add_edge("review", END)
+    graph = workflow.compile(checkpointer=NamespaceCheckpointer(saver, "test"))
+    builder = TinkerFin(checkpointer=saver).with_namespace("test")
+    first = definition_factory(graph, tinkerfin=builder)
+    events = [
+        event
+        async for event in first.open_agui_run(
+            thread_id="thread-observed",
+            run_id="review",
+            input={
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "tool-change",
+                                "name": "change",
+                                "args": {},
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+            },
+        )
+    ]
+    outcome = events[-1].outcome
+    assert outcome.type == "interrupt"
+    pending = outcome.interrupts[0]
     session = _Session()
     observer = _Observer(session)
-    binding = AgUiResumeBinding(
-        mode="abandon",
-        resume_data=None,
-        native_interrupt_ids=("interrupt-1",),
-    )
-    runtime = _definition(definition_factory, _Graph([]), observer).new_agui(
-        identity=_identity(),
-        resume=binding,
-    )
+    terminals: list[RunTerminalObservation] = []
 
-    events = [event async for event in runtime.astream()]
+    async def record_terminal(value: RunTerminalObservation) -> None:
+        terminals.append(value)
 
+    runtime = definition_factory(
+        graph,
+        tinkerfin=builder.with_observer(observer).with_observer(
+            on_terminal=record_terminal
+        ),
+    )
+    request = AgUiResumeRequest.model_validate(
+        {"entries": [{"interruptId": pending.id, "status": "cancelled"}]}
+    )
+    events = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id="thread-observed", run_id="abandon", resume=request
+        )
+    ]
     assert events[-1].type.value == "RUN_ERROR"
     terminal = session.observations[-2]
     assert terminal.kind == "run.terminal"
     assert terminal.outcome == "abandoned"
+    assert [value.outcome for value in terminals] == ["abandoned"]
     assert observer.contexts[0].resume == (
-        RunResumeSummary(
-            interrupt_id="interrupt-1",
-            status="cancelled",
-        ),
+        RunResumeSummary(interrupt_id=pending.id, status="cancelled"),
     )
+    assert executed == []
 
 
 async def test_agui_starts_observation_before_delivering_run_started(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     session = _Session()
     observer = _Observer(session)
-    stream = (
-        _definition(definition_factory, _Graph([]), observer)
-        .new_agui(identity=_identity())
-        .astream(_input())
+    stream = _definition(definition_factory, _Graph([]), observer).open_agui_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     started = await anext(stream)
@@ -515,18 +579,21 @@ async def test_agui_starts_observation_before_delivering_run_started(
 
 
 async def test_failing_observer_notifies_healthy_observer_then_fails_run(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     failed = _Session(fail_kind="native.state")
     healthy = _Session()
     failed_observer = _Observer(failed)
     healthy_observer = _Observer(healthy)
-    tinkerfin = TinkerFin().observe(failed_observer).observe(healthy_observer)
+    tinkerfin = (
+        TinkerFin()
+        .with_namespace("test")
+        .with_observer(failed_observer)
+        .with_observer(healthy_observer)
+    )
     part = {"type": "values", "ns": (), "data": {"messages": []}}
-    stream = (
-        definition_factory(_Graph([part]), tinkerfin=tinkerfin)
-        .new(identity=_identity())
-        .astream(_input())
+    stream = definition_factory(_Graph([part]), tinkerfin=tinkerfin).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     with pytest.raises(RunObservationError) as captured:
@@ -546,15 +613,18 @@ async def test_failing_observer_notifies_healthy_observer_then_fails_run(
 
 
 async def test_terminal_observer_failure_does_not_rewrite_the_selected_outcome(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     failed = _Session(fail_kind="run.terminal")
     healthy = _Session()
-    tinkerfin = TinkerFin().observe(_Observer(failed)).observe(_Observer(healthy))
-    stream = (
-        definition_factory(_Graph([]), tinkerfin=tinkerfin)
-        .new(identity=_identity())
-        .astream(_input())
+    tinkerfin = (
+        TinkerFin()
+        .with_namespace("test")
+        .with_observer(_Observer(failed))
+        .with_observer(_Observer(healthy))
+    )
+    stream = definition_factory(_Graph([]), tinkerfin=tinkerfin).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
     with pytest.raises(RunObservationError):
@@ -575,16 +645,14 @@ async def test_terminal_observer_failure_does_not_rewrite_the_selected_outcome(
 
 
 async def test_background_observer_failure_cancels_blocked_graph_pull(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     gate = asyncio.Event()
     graph = _Graph([], pull_gate=gate)
     session = _Session()
     observer = _Observer(session)
-    stream = (
-        _definition(definition_factory, graph, observer)
-        .new(identity=_identity())
-        .astream(_input())
+    stream = _definition(definition_factory, graph, observer).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
     pull = asyncio.create_task(anext(stream))
     await graph.started.wait()
@@ -603,7 +671,6 @@ async def test_observation_close_preserves_caller_cancellation_and_settles_sessi
 ):
     session = _BlockingClosedSession()
     observer = _Observer(session)
-    tinkerfin = TinkerFin().observe(observer)
     context = RunSourceContext(
         identity=_identity(),
         runtime_profile="deepagents-v2",
@@ -611,7 +678,7 @@ async def test_observation_close_preserves_caller_cancellation_and_settles_sessi
         input={"messages": []},
         config={},
     )
-    hub = tinkerfin._observation_hub(context)
+    hub = RuntimeObservationHub(context=context, observers=(observer,))
     await hub.start()
     await hub.terminal("cancelled", code="cancelled")
     closing = asyncio.create_task(hub.close())
@@ -627,7 +694,9 @@ async def test_observation_close_preserves_caller_cancellation_and_settles_sessi
 
 async def test_observer_delivery_serializes_observations_and_forces() -> None:
     session = _ConcurrentAccessSession()
-    hub = TinkerFin().observe(_Observer(session))._observation_hub(_source_context())
+    hub = RuntimeObservationHub(
+        context=_source_context(), observers=(_Observer(session),)
+    )
     await hub.start()
     observed_at = datetime.now(UTC)
 
@@ -635,7 +704,7 @@ async def test_observer_delivery_serializes_observations_and_forces() -> None:
         hub.observe(
             NativeStateObservation(
                 identity=_identity(),
-                namespace=(),
+                graph_namespace=(),
                 state={"step": 1},
                 observed_at=observed_at,
                 monotonic_ns=1,
@@ -645,7 +714,7 @@ async def test_observer_delivery_serializes_observations_and_forces() -> None:
         hub.observe(
             NativeStateObservation(
                 identity=_identity(),
-                namespace=(),
+                graph_namespace=(),
                 state={"step": 2},
                 observed_at=observed_at,
                 monotonic_ns=2,
@@ -663,10 +732,8 @@ async def test_observer_open_preserves_process_control(
     error_type: type[BaseException],
 ) -> None:
     error = error_type("process-control")
-    hub = (
-        TinkerFin()
-        .observe(_OpeningControlObserver(error))
-        ._observation_hub(_source_context())
+    hub = RuntimeObservationHub(
+        context=_source_context(), observers=(_OpeningControlObserver(error),)
     )
 
     with pytest.raises(error_type) as captured:
@@ -683,7 +750,9 @@ async def test_observer_lifecycle_preserves_process_control(
 ) -> None:
     error = error_type("process-control")
     session = _ControlSession(phase=phase, error=error)
-    hub = TinkerFin().observe(_Observer(session))._observation_hub(_source_context())
+    hub = RuntimeObservationHub(
+        context=_source_context(), observers=(_Observer(session),)
+    )
 
     if phase == "observe":
         with pytest.raises(error_type) as captured:
@@ -709,18 +778,19 @@ async def test_observer_lifecycle_preserves_process_control(
         await hub.close()
 
 
-async def test_failed_agui_run_records_input_terminal_and_close() -> None:
+async def test_graph_preparation_failure_records_input_terminal_and_close(
+    definition_factory,
+) -> None:
     session = _Session()
     observer = _Observer(session)
-    stream = (
-        TinkerFin()
-        .observe(observer)
-        .failed_agui_run(
-            RuntimeError("model setup failed"),
-            identity=_identity(),
-            input={"messages": []},
-            config={"configurable": {"thread_id": "thread-observed"}},
-        )
+    runtime = definition_factory(
+        RuntimeError("model setup failed"),
+        tinkerfin=TinkerFin().with_namespace("test").with_observer(observer),
+    )
+    stream = runtime.open_agui_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
+        input={"messages": []},
     )
 
     events = [event async for event in stream]
@@ -741,15 +811,24 @@ async def test_failed_agui_run_records_input_terminal_and_close() -> None:
     assert observer.contexts[0].call_tracking_enabled is False
 
 
-async def test_initialization_failure_keeps_a_later_observer_failure_distinct() -> None:
+async def test_initialization_failure_keeps_a_later_observer_failure_distinct(
+    definition_factory,
+) -> None:
     failed = _Session(fail_kind="run.input")
     healthy = _Session()
-    runtime = TinkerFin().observe(_Observer(failed)).observe(_Observer(healthy))
+    runtime = (
+        TinkerFin()
+        .with_namespace("test")
+        .with_observer(_Observer(failed))
+        .with_observer(_Observer(healthy))
+    )
 
-    async def create_agent() -> DeepAgentDefinition[None]:
-        raise RuntimeError("test-owned initialization failure")
-
-    stream = await runtime.open_run(_identity(), agent=create_agent, input=_input())
+    agent = definition_factory(
+        RuntimeError("test-owned initialization failure"), tinkerfin=runtime
+    )
+    stream = agent.open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
+    )
     try:
         with pytest.raises(RunObservationError):
             await anext(stream)
@@ -767,7 +846,9 @@ async def test_initialization_failure_keeps_a_later_observer_failure_distinct() 
     assert failed.closed == healthy.closed == 1
 
 
-async def test_failed_resume_resolution_preserves_resume_input_kind() -> None:
+async def test_failed_resume_resolution_preserves_resume_input_kind(
+    definition_factory,
+) -> None:
     from ag_ui.core.types import ResumeEntry
 
     from tinkerfin import AgUiResumeRequest
@@ -783,15 +864,12 @@ async def test_failed_resume_resolution_preserves_resume_input_kind() -> None:
             ),
         )
     )
-    stream = (
-        TinkerFin()
-        .observe(observer)
-        .failed_agui_run(
-            RuntimeError("checkpoint resolution failed"),
-            identity=_identity(),
-            config={"configurable": {"thread_id": "thread-observed"}},
-            resume_request=request,
-        )
+    runtime = definition_factory(
+        RuntimeError("checkpoint resolution failed"),
+        tinkerfin=TinkerFin().with_namespace("test").with_observer(observer),
+    )
+    stream = runtime.open_agui_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, resume=request
     )
 
     events = [event async for event in stream]
@@ -804,7 +882,7 @@ async def test_failed_resume_resolution_preserves_resume_input_kind() -> None:
 
 
 async def test_agui_reuses_the_runtime_structural_validation_result(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     class CountingDriver(DeepAgentsV2StreamDriver):
         def __init__(self) -> None:
@@ -833,10 +911,17 @@ async def test_agui_reuses_the_runtime_structural_validation_result(
     part = {"type": "values", "ns": (), "data": {"messages": []}}
     runtime = definition_factory(
         _Graph([part]),
-        tinkerfin=TinkerFin(runtime_profile=CountingProfile(driver)),
-    ).new_agui(identity=_identity())
+        tinkerfin=TinkerFin(runtime_profile=CountingProfile(driver)).with_namespace(
+            "test"
+        ),
+    )
 
-    events = [event async for event in runtime.astream(_input())]
+    events = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
+        )
+    ]
 
     assert events[-1].type.value == "RUN_FINISHED"
     assert driver.calls == 1
@@ -904,7 +989,7 @@ class _FixtureStreamDriver:
         canonical = self.validate(part)
         observation = NativeStateObservation(
             identity=context.identity,
-            namespace=(),
+            graph_namespace=(),
             state={"fixture": "value"},
             messages=(),
             interrupts=(),
@@ -979,10 +1064,6 @@ class _FixtureRuntimeProfile:
         del checkpoint, channel_name
         return ()
 
-    def native_resume_submitted(self, checkpoint: CheckpointTuple) -> bool:
-        del checkpoint
-        return False
-
     def _build(self, *_args: object, **_kwargs: object) -> _FixtureGraph:
         self.build_thread_ids.append(threading.get_ident())
         return self._graph
@@ -1011,15 +1092,19 @@ async def test_open_run_is_observable_before_output_and_closes_without_iteration
     graph = _FixtureGraph()
     profile = _FixtureRuntimeProfile(graph)
     session = _Session()
-    tinkerfin = TinkerFin(runtime_profile=profile).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(model="provider:model", tools=[])
+    tinkerfin = (
+        TinkerFin(runtime_profile=profile)
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(model="provider:model", tools=[])
 
-    stream = await tinkerfin.open_run(
-        _identity(),
-        agent=definition,
-        input=_input(),
+    stream = definition.open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
+    assert session.observations == []
+    await stream.messaging_owner_preflight()
     assert [item.kind for item in session.observations] == [
         "run.started",
         "run.input",
@@ -1041,15 +1126,19 @@ async def test_open_agui_run_is_observable_before_its_first_public_event() -> No
     graph = _FixtureGraph()
     profile = _FixtureRuntimeProfile(graph)
     session = _Session()
-    tinkerfin = TinkerFin(runtime_profile=profile).observe(_Observer(session))
-    definition = tinkerfin.create_deep_agent(model="provider:model", tools=[])
+    tinkerfin = (
+        TinkerFin(runtime_profile=profile)
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+    )
+    definition = tinkerfin.build(model="provider:model", tools=[])
 
-    stream = await tinkerfin.open_agui_run(
-        _identity(),
-        agent=definition,
-        input=_input(),
+    stream = definition.open_agui_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
     )
 
+    assert session.observations == []
+    await stream.messaging_owner_preflight()
     assert [item.kind for item in session.observations] == [
         "run.started",
         "run.input",
@@ -1074,12 +1163,18 @@ async def test_profile_maps_a_non_v2_source_once_for_observer_and_agui() -> None
     session = _Session()
     definition = (
         TinkerFin(runtime_profile=profile)
-        .observe(_Observer(session))
-        .create_deep_agent(model="provider:model", tools=[])
+        .with_namespace("test")
+        .with_observer(_Observer(session))
+        .build(model="provider:model", tools=[])
     )
-    runtime = definition.new_agui(identity=_identity())
+    runtime = definition
 
-    events = [event async for event in runtime.astream(_input())]
+    events = [
+        event
+        async for event in runtime.open_agui_run(
+            thread_id=_identity().thread_id, run_id=_identity().run_id, input=_input()
+        )
+    ]
 
     assert graph.options is not None
     assert graph.options["fixture_mode"] == "canonical"
@@ -1108,12 +1203,13 @@ async def test_profile_maps_a_non_v2_source_once_for_observer_and_agui() -> None
 async def test_existing_profile_uses_its_own_signature_for_direct_graph() -> None:
     graph = _FixtureGraph()
     profile = _FixtureRuntimeProfile(graph)
-    definition = TinkerFin(runtime_profile=profile).create_deep_agent(
-        model="provider:model",
-        tools=[],
+    definition = (
+        TinkerFin(runtime_profile=profile)
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
     )
 
-    direct = await definition.create_graph()
+    direct = await create_graph(definition)
     state = await direct.ainvoke(_input())
 
     assert state == {"messages": [], "fixture": "value"}
@@ -1125,12 +1221,13 @@ async def test_existing_profile_uses_its_own_signature_for_direct_graph() -> Non
 async def test_custom_profile_can_own_asynchronous_graph_creation() -> None:
     graph = _FixtureGraph()
     profile = _AsyncFixtureRuntimeProfile(graph)
-    definition = TinkerFin(runtime_profile=profile).create_deep_agent(
-        model="provider:model",
-        tools=[],
+    definition = (
+        TinkerFin(runtime_profile=profile)
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
     )
 
-    direct = await definition.create_graph()
+    direct = await create_graph(definition)
     state = await direct.ainvoke(_input())
 
     assert state == {"messages": [], "fixture": "value"}
@@ -1149,10 +1246,11 @@ async def test_custom_async_graph_capability_must_return_an_awaitable() -> None:
             return object()
 
     profile = InvalidAsyncProfile(_FixtureGraph())
-    definition = TinkerFin(runtime_profile=profile).create_deep_agent(
-        model="provider:model",
-        tools=[],
+    definition = (
+        TinkerFin(runtime_profile=profile)
+        .with_namespace("test")
+        .build(model="provider:model", tools=[])
     )
 
     with pytest.raises(TypeError, match="must return an awaitable"):
-        await definition.create_graph()
+        await create_graph(definition)

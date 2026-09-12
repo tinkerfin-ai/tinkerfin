@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from ..errors import OpenSandboxStateOwnershipError
 from . import _sql_availability
+from ._sql_fencing import current_claim_time
 from ._sql_schema import _cleanup, _owners, _warm_slots
 from ._sql_transactions import _apply_claim_lock, _read_rows
 from .state import (
@@ -43,15 +44,15 @@ async def acquire_owner(
         async def acquire(
             connection: AsyncConnection,
         ) -> OpenSandboxOwnerClaim | None:
-            now = self._now()
-            expires_at = now + timedelta(seconds=self._lease_ttl)
             statement = select(_owners).where(
                 _owners.c.namespace == self._namespace,
                 _owners.c.owner_digest == digest,
             )
-            if self._require_capabilities().name == "mysql":
+            if self._require_capabilities().row_locks:
                 statement = statement.with_for_update()
             row = (await connection.execute(statement)).mappings().one_or_none()
+            now = self._now()
+            expires_at = now + timedelta(seconds=self._lease_ttl)
             if row is None:
                 await connection.execute(
                     insert(_owners).values(
@@ -114,7 +115,7 @@ async def acquire_owner(
         try:
             claim = await self._run_write_transaction(acquire)
         except DBAPIError as exc:
-            if not self._is_retryable_mysql_conflict(exc):
+            if not self._is_retryable_claim_conflict(exc):
                 raise
         else:
             if claim is not None:
@@ -131,7 +132,9 @@ async def bind_owner(
     self._ensure_open()
 
     async def bind(connection: AsyncConnection) -> None:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            raise OpenSandboxStateOwnershipError("Sandbox claim is no longer current")
         result = await connection.execute(
             update(_owners)
             .where(
@@ -168,7 +171,9 @@ async def renew_owner(
     self._ensure_open()
 
     async def renew(connection: AsyncConnection) -> bool:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            return False
         result = await connection.execute(
             update(_owners)
             .where(
@@ -195,7 +200,9 @@ async def unbind_owner(
     self._ensure_open()
 
     async def unbind(connection: AsyncConnection) -> None:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            raise OpenSandboxStateOwnershipError("Sandbox claim is no longer current")
         result = await connection.execute(
             update(_owners)
             .where(
@@ -295,6 +302,7 @@ async def claim_warm_slot(
         row = (await connection.execute(statement)).mappings().one_or_none()
         if row is None:
             return None
+        now = self._now()
         token = uuid4().hex
         generation = int(row["generation"]) + 1
         result = await connection.execute(
@@ -349,6 +357,7 @@ async def claim_ready_warm_slot(
         row = (await connection.execute(statement)).mappings().one_or_none()
         if row is None:
             return None
+        now = self._now()
         token = uuid4().hex
         generation = int(row["generation"]) + 1
         result = await connection.execute(
@@ -387,7 +396,9 @@ async def discard_ready_warm_slot(
     self._ensure_open()
 
     async def discard(connection: AsyncConnection) -> None:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            raise OpenSandboxStateOwnershipError("Sandbox claim is no longer current")
         result = await connection.execute(
             update(_warm_slots)
             .where(
@@ -443,7 +454,9 @@ async def publish_warm(
     self._ensure_open()
 
     async def publish(connection: AsyncConnection) -> None:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            raise OpenSandboxStateOwnershipError("Sandbox claim is no longer current")
         result = await connection.execute(
             update(_warm_slots)
             .where(
@@ -475,7 +488,9 @@ async def renew_warm(
     self._ensure_open()
 
     async def renew(connection: AsyncConnection) -> bool:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            return False
         result = await connection.execute(
             update(_warm_slots)
             .where(
@@ -530,21 +545,9 @@ async def consume_warm(
     async def consume(
         connection: AsyncConnection,
     ) -> OpenSandboxBinding | None:
-        now = self._now()
-        owner_statement = select(_owners.c.owner_digest).where(
-            _owners.c.namespace == self._namespace,
-            _owners.c.owner_digest == claim.owner_digest,
-            _owners.c.claim_token == claim.token,
-            _owners.c.generation == claim.generation,
-            _owners.c.lease_expires_at > now,
-        )
+        if await current_claim_time(self, connection, claim) is None:
+            raise OpenSandboxStateOwnershipError("Owner claim is no longer current")
         capabilities = self._require_capabilities()
-        if capabilities.name == "mysql":
-            owner_statement = owner_statement.with_for_update()
-        if (await connection.execute(owner_statement)).one_or_none() is None:
-            raise OpenSandboxStateOwnershipError(
-                f"Owner claim for {claim.owner_key!r} is no longer current"
-            )
         slot_statement = (
             select(_warm_slots.c.slot, _warm_slots.c.sandbox_id)
             .where(
@@ -562,6 +565,13 @@ async def consume_warm(
         slot = (await connection.execute(slot_statement)).one_or_none()
         if slot is None:
             return None
+        # A warm row can also wait on MySQL 5.7. Recheck the already locked owner
+        # before consuming capacity; the two mutations retain one transaction.
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            raise OpenSandboxStateOwnershipError(
+                "Owner claim expired while claiming a warm slot"
+            )
         sandbox_id = str(slot.sandbox_id)
         result = await connection.execute(
             update(_warm_slots)
@@ -649,7 +659,7 @@ async def enqueue_cleanup(self: SQLAlchemyOpenSandboxState, sandbox_id: str) -> 
             await self._run_write_transaction(enqueue)
             return
         except DBAPIError as exc:
-            if not self._is_retryable_mysql_conflict(exc):
+            if not self._is_retryable_claim_conflict(exc):
                 raise
             await asyncio.sleep(self._poll_interval)
 
@@ -682,6 +692,7 @@ async def claim_cleanup(
         row = (await connection.execute(statement)).mappings().one_or_none()
         if row is None:
             return None
+        now = self._now()
         generation = int(row["generation"]) + 1
         token = uuid4().hex
         result = await connection.execute(
@@ -717,7 +728,9 @@ async def renew_cleanup(
     self._ensure_open()
 
     async def renew(connection: AsyncConnection) -> bool:
-        now = self._now()
+        now = await current_claim_time(self, connection, claim)
+        if now is None:
+            return False
         result = await connection.execute(
             update(_cleanup)
             .where(

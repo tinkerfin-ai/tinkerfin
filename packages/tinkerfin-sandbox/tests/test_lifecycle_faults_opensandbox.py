@@ -21,10 +21,12 @@ import pytest_asyncio
 from docker import DockerClient
 from docker.models.containers import Container
 from opensandbox.config import ConnectionConfig
+from test_manager import _resource_key
 from tests.support.docker_services import (
     OpenSandboxDockerRuntime,
     OpenSandboxTestService,
 )
+from tests.support.sql_engines import SqlEngineFactory
 
 from tinkerfin_sandbox import (
     OpenSandboxBackendUnavailableError,
@@ -341,6 +343,7 @@ def _assert_event_identity(observer: _Recorder, owner: str, sandbox_id: str) -> 
 
 @pytest.mark.asyncio
 async def test_real_stopped_container_preserves_binding_and_recovers_same_files(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     fault_docker: _OwnedDocker,
@@ -351,7 +354,7 @@ async def test_real_stopped_container_preserves_binding_and_recovers_same_files(
     """Docker stop requires a real access to announce failure; start retains files."""
     observer = _Recorder(fault_evidence)
     state = SQLAlchemyOpenSandboxState(
-        url=f"sqlite+aiosqlite:///{tmp_path / 'stop.db'}",
+        engine=sql_engine(f"sqlite+aiosqlite:///{tmp_path / 'stop.db'}"),
         namespace=fault_docker.purpose,
     )
     client = _client(opensandbox_test_service, opensandbox_docker_runtime, fault_docker)
@@ -396,7 +399,7 @@ async def test_real_stopped_container_preserves_binding_and_recovers_same_files(
             reason=failure_reason,
             attempts=attempts,
         )
-        binding = await state.read_binding(owner)
+        binding = await state.read_binding(_resource_key(owner))
         assert binding is not None and binding.sandbox_id == original_id
         assert await fault_docker.ids() == (original_id,)
         await observer.wait_for(Kind.RECOVERY_FAILED)
@@ -447,7 +450,7 @@ async def test_real_stopped_container_preserves_binding_and_recovers_same_files(
         assert Kind.REPLACED not in observer.kinds
         await manager.destroy(owner)
         await manager.destroy(owner)
-        assert await state.read_binding(owner) is None
+        assert await state.read_binding(_resource_key(owner)) is None
         assert (await fault_docker.snapshot(original_id))["status"] == "absent"
     assert len(observer.events) == count_after_recovery + 1
     assert observer.kinds.count(Kind.RECOVERING) == 1
@@ -463,6 +466,7 @@ async def test_real_stopped_container_preserves_binding_and_recovers_same_files(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", ["explicit", "automatic"])
 async def test_real_deleted_container_requires_selected_replacement(
+    sql_engine: SqlEngineFactory,
     replacement: str,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
@@ -475,7 +479,9 @@ async def test_real_deleted_container_requires_selected_replacement(
     observer = _Recorder(fault_evidence)
     url = f"sqlite+aiosqlite:///{tmp_path / 'deleted.db'}"
     owner = "deleted-owner"
-    state = SQLAlchemyOpenSandboxState(url=url, namespace=fault_docker.purpose)
+    state = SQLAlchemyOpenSandboxState(
+        engine=sql_engine(url), namespace=fault_docker.purpose
+    )
     content = b"deleted-container-sentinel\x00\x80"
     async with OpenSandboxManager[str](
         client=_client(
@@ -510,7 +516,7 @@ async def test_real_deleted_container_requires_selected_replacement(
                 reason="not_found",
                 attempts=1,
             )
-            binding = await state.read_binding(owner)
+            binding = await state.read_binding(_resource_key(owner))
             assert binding is not None and binding.sandbox_id == original_id
             assert await fault_docker.ids() == ()
         await observer.wait_for(Kind.RECOVERY_FAILED)
@@ -532,7 +538,7 @@ async def test_real_deleted_container_requires_selected_replacement(
             )
             assert missing.error == "file_not_found"
             assert missing.content is None
-            replaced_binding = await state.read_binding(owner)
+            replaced_binding = await state.read_binding(_resource_key(owner))
             assert (
                 replaced_binding is not None and replaced_binding.sandbox_id == new_id
             )
@@ -541,7 +547,7 @@ async def test_real_deleted_container_requires_selected_replacement(
     if replacement == "automatic":
         automatic = _Recorder(fault_evidence)
         replacement_state = SQLAlchemyOpenSandboxState(
-            url=url, namespace=fault_docker.purpose
+            engine=sql_engine(url), namespace=fault_docker.purpose
         )
         async with OpenSandboxManager[str](
             client=_client(
@@ -552,7 +558,7 @@ async def test_real_deleted_container_requires_selected_replacement(
             recovery_policy=OpenSandboxRecoveryPolicy(on_failure="recreate"),
             observers=(automatic, *additional_lifecycle_observers),
         ) as recreating:
-            before = await replacement_state.read_binding(owner)
+            before = await replacement_state.read_binding(_resource_key(owner))
             assert before is not None and before.sandbox_id == original_id
             replaced = await recreating.get(owner)
             new_id = replaced.id
@@ -567,7 +573,7 @@ async def test_real_deleted_container_requires_selected_replacement(
             )
             assert missing.error == "file_not_found"
             assert missing.content is None
-            after = await replacement_state.read_binding(owner)
+            after = await replacement_state.read_binding(_resource_key(owner))
             assert after is not None and after.sandbox_id == new_id
             await recreating.destroy(owner)
         assert automatic.kinds == [
@@ -618,6 +624,7 @@ async def test_real_deleted_container_requires_selected_replacement(
 
 @pytest.mark.asyncio
 async def test_real_reset_and_repeated_destroy_report_confirmed_operations(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     fault_docker: _OwnedDocker,
@@ -628,7 +635,7 @@ async def test_real_reset_and_repeated_destroy_report_confirmed_operations(
     """Each reset clears real files; repeating an already completed destroy is silent."""
     observer = _Recorder(fault_evidence)
     state = SQLAlchemyOpenSandboxState(
-        url=f"sqlite+aiosqlite:///{tmp_path / 'reset.db'}",
+        engine=sql_engine(f"sqlite+aiosqlite:///{tmp_path / 'reset.db'}"),
         namespace=fault_docker.purpose,
     )
     async with OpenSandboxManager[str](
@@ -662,7 +669,7 @@ async def test_real_reset_and_repeated_destroy_report_confirmed_operations(
             )
             assert missing.error == "file_not_found"
             assert missing.content is None
-            binding = await state.read_binding(owner)
+            binding = await state.read_binding(_resource_key(owner))
             assert binding is not None and binding.sandbox_id == original_id
             fault_evidence.record(
                 "reset_verified",
@@ -672,7 +679,7 @@ async def test_real_reset_and_repeated_destroy_report_confirmed_operations(
             )
         await manager.destroy(owner)
         await manager.destroy(owner)
-        assert await state.read_binding(owner) is None
+        assert await state.read_binding(_resource_key(owner)) is None
         assert await manager.get_details(owner) is None
         assert (await fault_docker.snapshot(original_id))["status"] == "absent"
     assert observer.kinds == [
@@ -692,6 +699,7 @@ async def test_real_reset_and_repeated_destroy_report_confirmed_operations(
 
 @pytest.mark.asyncio
 async def test_real_stopped_warm_container_reports_capacity_loss_and_restoration(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     fault_docker: _OwnedDocker,
@@ -719,7 +727,7 @@ async def test_real_stopped_warm_container_reports_capacity_loss_and_restoration
     async with OpenSandboxManager[str](
         client=client,
         state=SQLAlchemyOpenSandboxState(
-            url=f"sqlite+aiosqlite:///{tmp_path / 'warm.db'}",
+            engine=sql_engine(f"sqlite+aiosqlite:///{tmp_path / 'warm.db'}"),
             namespace=fault_docker.purpose,
         ),
         key_resolver=lambda key: key,
@@ -760,6 +768,7 @@ async def test_real_stopped_warm_container_reports_capacity_loss_and_restoration
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["raise", "timeout", "cancel"])
 async def test_real_manager_isolates_observer_failure_and_drains_on_close(
+    sql_engine: SqlEngineFactory,
     mode: str,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
@@ -803,7 +812,9 @@ async def test_real_manager_isolates_observer_failure_and_drains_on_close(
                 opensandbox_test_service, opensandbox_docker_runtime, fault_docker
             ),
             state=SQLAlchemyOpenSandboxState(
-                url=f"sqlite+aiosqlite:///{tmp_path / 'observer-failure.db'}",
+                engine=sql_engine(
+                    f"sqlite+aiosqlite:///{tmp_path / 'observer-failure.db'}"
+                ),
                 namespace=fault_docker.purpose,
             ),
             key_resolver=lambda key: key,
@@ -865,6 +876,7 @@ async def test_real_manager_isolates_observer_failure_and_drains_on_close(
 
 @pytest.mark.asyncio
 async def test_real_manager_drops_full_observer_queue_without_delaying_other_observers(
+    sql_engine: SqlEngineFactory,
     opensandbox_test_service: OpenSandboxTestService,
     opensandbox_docker_runtime: OpenSandboxDockerRuntime,
     fault_docker: _OwnedDocker,
@@ -899,7 +911,7 @@ async def test_real_manager_drops_full_observer_queue_without_delaying_other_obs
             opensandbox_test_service, opensandbox_docker_runtime, fault_docker
         ),
         state=SQLAlchemyOpenSandboxState(
-            url=f"sqlite+aiosqlite:///{tmp_path / 'observer-queue.db'}",
+            engine=sql_engine(f"sqlite+aiosqlite:///{tmp_path / 'observer-queue.db'}"),
             namespace=fault_docker.purpose,
         ),
         key_resolver=lambda key: key,

@@ -46,6 +46,10 @@ from testcontainers.core.waiting_utils import WaitStrategyTarget
 _MYSQL_IMAGE = (
     "mysql:8.4@sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb"
 )
+_MYSQL57_IMAGE = (
+    "mysql:5.7@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb"
+)
+_POSTGRESQL_IMAGE = "postgres:17@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675"
 _REDIS_STACK_IMAGE = (
     "redis/redis-stack-server:7.4.0-v8@sha256:"
     "798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a"
@@ -67,6 +71,8 @@ _DOCKER_FIXTURE_NAMES = frozenset(
         "mysql_admin_url",
         "mysql_sandbox_url",
         "mysql_test_service",
+        "mysql57_test_service",
+        "postgresql_test_service",
         "opensandbox_test_service",
         "opensandbox_docker_runtime",
         "redis_checkpoint_url",
@@ -210,6 +216,27 @@ class RedisTestService:
         if database < 0:
             raise ValueError("Redis database must be non-negative")
         return f"redis://{self.host}:{self.port}/{database}"
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLTestService:
+    """One session-owned PostgreSQL server with a random test credential."""
+
+    host: str
+    port: int
+    password: str
+
+    def url(self, database: str = "tinkerfin_test") -> str:
+        """Return an asyncpg SQLAlchemy URL without exposing credentials in reports."""
+
+        return URL.create(
+            drivername="postgresql+asyncpg",
+            username="postgres",
+            password=self.password,
+            host=self.host,
+            port=self.port,
+            database=database,
+        ).render_as_string(hide_password=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +395,82 @@ def mysql_admin_url(mysql_test_service: MySQLTestService) -> str:
     """Return the management URL used to create disposable test databases."""
 
     return mysql_test_service.url("tinkerfin_test_admin")
+
+
+@pytest.fixture(scope="session")
+def mysql57_test_service(
+    docker_test_client: DockerClient,
+    docker_test_run_id: str,
+) -> Iterator[MySQLTestService]:
+    """Exercise actual MySQL 5.7 behavior using an independently owned server."""
+
+    del docker_test_client
+    password = secrets.token_urlsafe(24)
+    container = (
+        _with_loopback_port(DockerContainer(_MYSQL57_IMAGE), 3306)
+        .with_env("MYSQL_ROOT_PASSWORD", password)
+        .with_env("MYSQL_DATABASE", "tinkerfin_test_admin")
+        .with_kwargs(platform="linux/amd64", labels={_TEST_LABEL: docker_test_run_id})
+        .waiting_for(
+            ExecWaitStrategy(
+                [
+                    "mysqladmin",
+                    "ping",
+                    "-h",
+                    "127.0.0.1",
+                    "-uroot",
+                    f"-p{password}",
+                    "--silent",
+                ]
+            )
+            .with_poll_interval(0.5)
+            .with_startup_timeout(180)
+        )
+    )
+    with _running_container(container):
+        yield MySQLTestService(
+            host=container.get_container_host_ip(),
+            port=container.get_exposed_port(3306),
+            password=password,
+        )
+
+
+@pytest.fixture(scope="session")
+def postgresql_test_service(
+    docker_test_client: DockerClient,
+    docker_test_run_id: str,
+) -> Iterator[PostgreSQLTestService]:
+    """Start PostgreSQL for isolated transaction and storage contract tests."""
+
+    del docker_test_client
+    password = secrets.token_urlsafe(24)
+    container = (
+        _with_loopback_port(DockerContainer(_POSTGRESQL_IMAGE), 5432)
+        .with_env("POSTGRES_PASSWORD", password)
+        .with_env("POSTGRES_DB", "tinkerfin_test")
+        .with_kwargs(labels={_TEST_LABEL: docker_test_run_id})
+        .waiting_for(
+            ExecWaitStrategy(
+                [
+                    "pg_isready",
+                    "-h",
+                    "127.0.0.1",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "tinkerfin_test",
+                ]
+            )
+            .with_poll_interval(0.2)
+            .with_startup_timeout(120)
+        )
+    )
+    with _running_container(container):
+        yield PostgreSQLTestService(
+            host=container.get_container_host_ip(),
+            port=container.get_exposed_port(5432),
+            password=password,
+        )
 
 
 def _opensandbox_config(*, docker_host: str) -> str:
@@ -726,5 +829,6 @@ async def mysql_sandbox_url(
 __all__ = [
     "MySQLTestService",
     "OpenSandboxTestService",
+    "PostgreSQLTestService",
     "RedisTestService",
 ]

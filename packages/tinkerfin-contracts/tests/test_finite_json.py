@@ -23,13 +23,15 @@ from tinkerfin_contracts import (
     ToolExecutionObservation,
 )
 
-_IDENTITY = RunIdentity(threadId="finite-thread", runId="finite-run")
+_IDENTITY = RunIdentity(
+    namespace="test", thread_id="finite-thread", run_id="finite-run"
+)
 _MESSAGE = NativeMessageRecord(message_type="human", content="hello")
 _OBSERVED = {
     "identity": _IDENTITY,
     "observed_at": datetime(2026, 9, 5, tzinfo=UTC),
     "monotonic_ns": 1,
-    "namespace": (),
+    "graph_namespace": (),
 }
 
 

@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import math
-from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
-from typing import Literal, TypeVar, cast
+from typing import TypeVar, cast
 from uuid import uuid4
 
-from sqlalchemy import (
-    delete,
-    text,
-)
+from sqlalchemy import delete
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
-    create_async_engine,
+)
+
+from tinkerfin_sqlalchemy import (
+    DatabaseCapabilities,
+    SqlDialect,
+    SqlTransaction,
+    engine_dialect,
 )
 
 from ..errors import (
@@ -35,15 +36,7 @@ from . import _sql_availability, _sql_schema, _sql_state_ops, _sql_transactions
 from ._sql_schema import _cleanup as _cleanup
 from ._sql_schema import _warm_slots as _warm_slots
 from ._sql_schema import _workers
-from ._sql_transactions import (
-    _MYSQL_STARTUP_LOCK_TIMEOUT_SECONDS,
-    _SQLDialectCapabilities,
-    _WriteConnectionDisposition,
-)
-from ._sql_transactions import _apply_claim_lock as _apply_claim_lock
-from ._sql_transactions import (
-    _resolve_dialect_capabilities as _resolve_dialect_capabilities,
-)
+from ._sql_tasks import TaskOutcome, capture, join_owned_task, select_failure
 from .availability import (
     OpenSandboxAvailability,
     OpenSandboxAvailabilityPhase,
@@ -137,26 +130,25 @@ class SQLAlchemyOpenSandboxStateSchema:
         ddl: Full empty-database DDL including indexes.
     """
 
-    dialect: Literal["mysql", "sqlite"]
+    dialect: SqlDialect
     table_names: tuple[str, ...]
     ddl: str
 
 
 def get_sqlalchemy_opensandbox_state_schema(
     *,
-    dialect: Literal["mysql", "sqlite"],
+    dialect: SqlDialect,
 ) -> SQLAlchemyOpenSandboxStateSchema:
     """Build the complete OpenSandbox State schema without database I/O.
 
     Args:
-        dialect: Deployment SQL dialect. MySQL output targets the common MySQL
-            5.7 and 8.x DDL subset.
+        dialect: Deployment SQL dialect. MySQL output also supports MySQL 5.7.
 
     Returns:
         An immutable descriptor containing deterministic full-database DDL.
 
     Raises:
-        ValueError: The requested dialect is not ``mysql`` or ``sqlite``.
+        ValueError: The requested dialect is unsupported.
     """
 
     return _sql_schema.get_sqlalchemy_opensandbox_state_schema(
@@ -165,59 +157,42 @@ def get_sqlalchemy_opensandbox_state_schema(
 
 
 class SQLAlchemyOpenSandboxState(OpenSandboxState):
-    """Persist OpenSandbox allocation state through SQLAlchemy Core.
+    """Persist Sandbox bindings, claims, availability, and cleanup through SQLAlchemy.
 
-    The State accepts either an owned URL or a borrowed ``AsyncEngine``. Borrowed mode
-    never creates, reconfigures, or disposes the host Engine; both modes still own
-    worker registration and background renewal tasks.
+    The State borrows an asynchronous SQLite, MySQL, or PostgreSQL Engine. It owns
+    worker registration and renewal, and never disposes or reconfigures the Engine.
+    Start the State through OpenSandboxManager; closing the manager settles these
+    State resources while persistent bindings remain available to other workers.
 
     Args:
-        url: Owned SQLite ``sqlite+aiosqlite`` or MySQL ``mysql+asyncmy`` URL.
-        engine: Borrowed asynchronous SQLite or MySQL Engine.
-        namespace: Logical deployment namespace stored with every state row.
-        lease_ttl: Seconds before an abandoned State claim or Worker can be fenced out.
-        poll_interval: Seconds between attempts while another worker owns a claim.
-        sqlite_retry_timeout: Maximum seconds spent retrying rolled-back SQLite write
-            lock conflicts. The first attempt is always made.
+        engine: Borrowed asynchronous SQLAlchemy Engine with exclusive checkouts.
+        namespace: Deployment domain shared by cooperating Sandbox managers.
+        lease_ttl: Worker and claim expiry duration in seconds.
+        poll_interval: Delay between contested claim attempts in seconds.
+        sqlite_retry_timeout: Maximum SQLite lock retry time in seconds. A known
+            busy COMMIT retries in the same transaction; an unknown outcome never
+            replays a mutation. Driver timeouts are controlled by the Engine owner.
 
     Raises:
-        TypeError: Engine or timing values have the wrong public type.
-        ValueError: Engine ownership selection, namespace, timing, or dialect is invalid.
+        TypeError: The Engine or timing arguments have the wrong type.
+        ValueError: The namespace, timing values, or SQL dialect are unsupported.
     """
 
     def __init__(
         self,
         *,
-        url: str | None = None,
-        engine: AsyncEngine | None = None,
+        engine: AsyncEngine,
         namespace: str = "",
         lease_ttl: float = 15.0,
         poll_interval: float = 0.05,
         sqlite_retry_timeout: float = 5.0,
     ) -> None:
-        """Initialize owned or borrowed SQLAlchemy persistence without database I/O.
+        """Validate a borrowed Engine and State policy without database I/O."""
 
-        Exactly one of ``url`` and ``engine`` is required. Timing and ownership values
-        are validated before any connection, task, or schema mutation occurs.
-
-        Args:
-            url: URL used to create an Engine owned by this State.
-            engine: Existing asynchronous Engine borrowed from the host.
-            namespace: Logical deployment namespace stored with State records.
-            lease_ttl: Claim and Worker lease duration in seconds.
-            poll_interval: Delay between contested claim attempts in seconds.
-            sqlite_retry_timeout: Bounded SQLite lock retry duration in seconds.
-
-        Raises:
-            TypeError: Engine or timing values have the wrong public type.
-            ValueError: Ownership selection, namespace, timing, or dialect is invalid.
-        """
-
-        if (url is None) == (engine is None):
-            raise ValueError("exactly one of url or engine must be provided")
-        if engine is not None and not isinstance(engine, AsyncEngine):
-            raise TypeError("engine must be an AsyncEngine or None")
-
+        self._dialect = engine_dialect(engine)
+        SqlTransaction(engine)
+        if not isinstance(namespace, str):
+            raise TypeError("namespace must be a string")
         if len(namespace) > 64:
             raise ValueError("namespace must contain at most 64 characters")
         if isinstance(lease_ttl, bool) or not isinstance(lease_ttl, int | float):
@@ -248,21 +223,13 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         self._sqlite_retry_timeout = resolved_sqlite_retry_timeout
         self._worker_id = uuid4().hex
         self._worker_lease_ttl = resolved_lease_ttl
-        self._worker_renew_task: asyncio.Task[None] | None = None
-        self._worker_failure: Exception | None = None
-        self._owns_engine = url is not None
-        self._engine = (
-            create_async_engine(url) if url is not None else cast(AsyncEngine, engine)
-        )
-        self._dialect = self._engine.url.get_backend_name()
-        if self._dialect not in {"sqlite", "mysql"}:
-            raise ValueError(
-                "SQLAlchemyOpenSandboxState supports only SQLite and MySQL"
-            )
-        self._capabilities: _SQLDialectCapabilities | None = None
-        self._start_lock = asyncio.Lock()
-        self._start_task: asyncio.Task[None] | None = None
-        self._close_task: asyncio.Task[None] | None = None
+        self._worker_renew_task: asyncio.Task[TaskOutcome[None]] | None = None
+        self._worker_failure: BaseException | None = None
+        self._engine = engine
+        self._capabilities: DatabaseCapabilities | None = None
+        self._start_task: asyncio.Task[TaskOutcome[None]] | None = None
+        self._close_task: asyncio.Task[TaskOutcome[None]] | None = None
+        self._worker_may_exist = False
         self._started = False
         self._warm_pool_size: int | None = None
         self._closed = False
@@ -283,11 +250,13 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         if self._closed:
             raise OpenSandboxStateError("OpenSandbox state is closed")
         if self._worker_failure is not None:
+            if not isinstance(self._worker_failure, Exception):
+                raise self._worker_failure
             raise OpenSandboxStateError(
                 "OpenSandbox worker registration is no longer valid"
             ) from self._worker_failure
 
-    def _require_capabilities(self) -> _SQLDialectCapabilities:
+    def _require_capabilities(self) -> DatabaseCapabilities:
         """Return capabilities established before schema initialization."""
         capabilities = self._capabilities
         if capabilities is None:
@@ -300,53 +269,8 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
     def _now() -> datetime:
         return datetime.now(UTC).replace(tzinfo=None)
 
-    def _is_retryable_mysql_conflict(self, error: DBAPIError) -> bool:
-        """Recognize only transaction conflicts MySQL explicitly allows retrying."""
-
-        return _sql_transactions._is_retryable_mysql_conflict(
-            self,
-            error,
-        )
-
-    def _is_retryable_sqlite_lock(self, error: DBAPIError) -> bool:
-        """Recognize SQLite lock result codes without matching driver text."""
-
-        return _sql_transactions._is_retryable_sqlite_lock(
-            self,
-            error,
-        )
-
-    async def _begin_write_transaction(self, connection: AsyncConnection) -> None:
-        """Open one dialect-specific write transaction without retrying it."""
-
-        return await _sql_transactions._begin_write_transaction(
-            self,
-            connection,
-        )
-
-    async def _commit_write_transaction(
-        self,
-        connection: AsyncConnection,
-        disposition: _WriteConnectionDisposition,
-    ) -> None:
-        """Settle COMMIT and retry only SQLite's known uncommitted BUSY result."""
-
-        return await _sql_transactions._commit_write_transaction(
-            self,
-            connection,
-            disposition,
-        )
-
-    async def _write_transaction_once(
-        self,
-        operation: Callable[[AsyncConnection], Awaitable[_ResultT]],
-    ) -> _ResultT:
-        """Run one write attempt and expose only safely retryable SQLite locks."""
-
-        return await _sql_transactions._write_transaction_once(
-            self,
-            operation,
-        )
+    def _is_retryable_claim_conflict(self, error: DBAPIError) -> bool:
+        return _sql_transactions._is_retryable_claim_conflict(self, error)
 
     async def _run_write_transaction(
         self,
@@ -369,47 +293,6 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
             self,
             operation,
         )
-
-    @asynccontextmanager
-    async def _startup_lock(self) -> AsyncGenerator[None]:
-        """Serialize MySQL DDL and initial State rows inside one database."""
-        if self._require_capabilities().name != "mysql":
-            yield
-            return
-
-        database = self._engine.url.database or ""
-        database_digest = hashlib.sha256(database.encode()).hexdigest()[:32]
-        lock_name = f"tinkerfin:opensandbox:{database_digest}"
-        connection = await self._engine.connect()
-        acquired = False
-        try:
-            result = await connection.scalar(
-                text("SELECT GET_LOCK(:lock_name, :timeout_seconds)"),
-                {
-                    "lock_name": lock_name,
-                    "timeout_seconds": _MYSQL_STARTUP_LOCK_TIMEOUT_SECONDS,
-                },
-            )
-            if result != 1:
-                raise OpenSandboxStateError(
-                    "Timed out acquiring the OpenSandbox State startup lock"
-                )
-            acquired = True
-            yield
-        finally:
-            try:
-                if acquired:
-                    released = await connection.scalar(
-                        text("SELECT RELEASE_LOCK(:lock_name)"),
-                        {"lock_name": lock_name},
-                    )
-                    if released != 1:
-                        await connection.invalidate()
-            except BaseException:
-                await connection.invalidate()
-                raise
-            finally:
-                await connection.close()
 
     @_state_operation("start")
     async def start(self, *, warm_pool_size: int) -> None:
@@ -434,29 +317,6 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
         return await _sql_transactions.start(
             self,
             warm_pool_size=warm_pool_size,
-        )
-
-    @staticmethod
-    def _is_retryable_start_failure(start_task: asyncio.Task[None]) -> bool:
-        """Return whether a settled startup failure is known to precede registration."""
-
-        return _sql_transactions._is_retryable_start_failure(
-            start_task,
-        )
-
-    async def _start_once(self, *, warm_pool_size: int) -> None:
-        """Initialize the database and worker renewal task under the startup lock."""
-
-        return await _sql_transactions._start_once(
-            self,
-            warm_pool_size=warm_pool_size,
-        )
-
-    async def _renew_worker_loop(self) -> None:
-        """Keep this worker active without exposing another coordinator."""
-
-        return await _sql_transactions._renew_worker_loop(
-            self,
         )
 
     @_state_operation("acquire_owner")
@@ -720,35 +580,60 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
     @_state_operation("close")
     async def aclose(self) -> None:
-        """Settle startup and release State-owned resources idempotently.
+        """Settle accepted startup and release State resources once.
 
-        All callers await one shielded close task. Closing waits any owned startup
-        attempt, unregisters the worker when its transaction may have committed, and
-        then disposes only an Engine created from ``url``. A borrowed Engine remains
-        pooled and usable by its host after State closure.
+        Concurrent callers share close. Cancellation waits for worker renewal to
+        stop and unregisters a worker whose registration may have committed. The
+        borrowed Engine remains usable; durable Sandbox bindings are retained.
+
+        Raises:
+            OpenSandboxStateError: Worker unregistration fails after renewal stops.
+            BaseException: Cancellation or process control follows resource cleanup.
         """
-        async with self._start_lock:
-            close_task = self._close_task
-            if close_task is None:
-                self._closed = True
-                close_task = asyncio.create_task(
-                    self._aclose_once(),
-                    name=f"tinkerfin-opensandbox-close:{self._worker_id}",
-                )
-                self._close_task = close_task
-        await asyncio.shield(close_task)
+
+        close_task = self._close_task
+        if close_task is None:
+            self._closed = True
+            close_task = asyncio.create_task(
+                capture(self._aclose_once()),
+                name=f"tinkerfin-opensandbox-close:{self._worker_id}",
+            )
+            self._close_task = close_task
+        await join_owned_task(close_task)
 
     async def _aclose_once(self) -> None:
-        """Settle startup, unregister the worker, and dispose only an owned engine."""
+        failure: BaseException | None = None
         start_task = self._start_task
         if start_task is not None:
-            await asyncio.gather(start_task, return_exceptions=True)
+            try:
+                await join_owned_task(start_task)
+            except Exception:  # noqa: BLE001 - startup failure already belongs to its caller
+                # The startup caller receives ordinary failure; registration still
+                # has to be removed if its COMMIT acknowledgement was uncertain.
+                pass
+            except BaseException as error:  # noqa: BLE001 - complete ownership cleanup before delivery
+                failure = error
         renew_task = self._worker_renew_task
         if renew_task is not None:
-            renew_task.cancel()
-            await asyncio.gather(renew_task, return_exceptions=True)
+            cancel_renewal = asyncio.get_running_loop().call_soon(renew_task.cancel)
+            try:
+                await join_owned_task(renew_task)
+            except BaseException as error:  # noqa: BLE001 - unregister even when renewal failed
+                if not isinstance(error, asyncio.CancelledError):
+                    failure = (
+                        error if failure is None else select_failure(failure, error)
+                    )
+            finally:
+                cancel_renewal.cancel()
             self._worker_renew_task = None
-        if start_task is not None:
+        worker_failure = self._worker_failure
+        if worker_failure is not None and not isinstance(worker_failure, Exception):
+            failure = (
+                worker_failure
+                if failure is None
+                else select_failure(failure, worker_failure)
+            )
+        if self._worker_may_exist:
 
             async def unregister(connection: AsyncConnection) -> None:
                 await connection.execute(
@@ -760,8 +645,7 @@ class SQLAlchemyOpenSandboxState(OpenSandboxState):
 
             try:
                 await self._run_write_transaction(unregister)
-            except Exception:  # noqa: BLE001
-                # Lease expiry removes a crashed or unreachable worker registration
-                pass
-        if self._owns_engine:
-            await self._engine.dispose()
+            except BaseException as error:  # noqa: BLE001 - the caller must observe an unconfirmed close
+                failure = error if failure is None else select_failure(failure, error)
+        if failure is not None:
+            raise failure

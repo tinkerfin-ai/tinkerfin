@@ -18,17 +18,19 @@ from tinkerfin_messaging import (
     MemoryBackend,
     MessageSubscription,
     Messaging,
-    MessagingBackendSettings,
-    MessagingTransition,
-    MessagingTransitionResult,
     RecoverableMessage,
     RecoveryCheckpoint,
     RunProducerFailed,
 )
+from tinkerfin_messaging.backend_contract import (
+    MessagingBackendSettings,
+    MessagingTransition,
+    MessagingTransitionResult,
+)
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="conversation-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="conversation-1", run_id="run-1")
 
 
 class _TextCodec:

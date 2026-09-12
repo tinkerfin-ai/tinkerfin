@@ -25,10 +25,10 @@ from .._agui_lineage import (
     resolve_agui_thread_head,
 )
 from .._agui_lineage_state import (
-    LINEAGE_STATE_KEY,
-    RESUME_MARKER_STATE_KEY,
-    LineageRole,
-    lineage_marker_with_role,
+    LINEAGE_CONFIG_KEY,
+    RESUME_CONFIG_KEY,
+    LineageMarker,
+    ResumeIntent,
 )
 from .._tasks import join_task
 from ._clarification import (
@@ -146,76 +146,6 @@ async def _native_snapshot_for_plan(
         )
     )
     return await native.aget_state(selected), selected
-
-
-def _lineage_update_for_role(
-    state: Mapping[str, object],
-    *,
-    role: LineageRole,
-    required: bool,
-) -> dict[str, object]:
-    """Change Graph role while carrying an accepted resume marker across handoff."""
-
-    raw_marker = state.get(LINEAGE_STATE_KEY)
-    if raw_marker is None:
-        if required:
-            raise PlanStateConflictError("Plan state lost its private lineage marker")
-        return {}
-    try:
-        marker = lineage_marker_with_role(raw_marker, role=role)
-    except ValueError as error:
-        raise PlanStateConflictError(
-            "Plan state has an invalid lineage marker"
-        ) from error
-    update: dict[str, object] = {LINEAGE_STATE_KEY: marker}
-    if RESUME_MARKER_STATE_KEY in state:
-        update[RESUME_MARKER_STATE_KEY] = state[RESUME_MARKER_STATE_KEY]
-    return update
-
-
-def _input_with_lineage_role(
-    value: object,
-    *,
-    role: LineageRole,
-    required: bool,
-) -> object:
-    """Rewrite only the private lineage role on state or resume input.
-
-    Command routing, resume payload, and every host state field remain unchanged. A
-    decision-only Command is valid after the two-phase Runtime has durably staged the
-    role marker; Commands that still carry a state update must contain an existing
-    marker rather than asking this router to invent lineage.
-    """
-
-    if value is None:
-        return None
-    if isinstance(value, Command):
-        command = cast(Command[object], value)
-        raw_update = command.update
-        if not isinstance(raw_update, Mapping):
-            return command
-        update = {
-            **cast(Mapping[str, object], raw_update),
-            **_lineage_update_for_role(
-                cast(Mapping[str, object], raw_update),
-                role=role,
-                required=required,
-            ),
-        }
-        updated_command: Command[object] = Command(
-            graph=command.graph,
-            update=update,
-            resume=command.resume,
-            goto=command.goto,
-        )
-        return updated_command
-    if isinstance(value, Mapping):
-        state = cast(Mapping[str, object], value)
-        return {
-            **state,
-            **_lineage_update_for_role(state, role=role, required=required),
-        }
-    raise TypeError("Plan Graph input must be a mapping, Command, or None")
 
 
 async def _plan_checkpoint_channels(
@@ -561,7 +491,9 @@ class PlanCapableGraphRuntime:
         graph_input = bound.arguments.get("input")
         config = _config(bound)
         configurable = config.get("configurable", {})
-        lineage_required = RUN_ID_METADATA_KEY in configurable
+        lineage_required = isinstance(
+            configurable.get(LINEAGE_CONFIG_KEY), LineageMarker
+        )
         runtime_profile = configurable.get(RUNTIME_PROFILE_METADATA_KEY)
         if lineage_required and (
             not isinstance(runtime_profile, str) or not runtime_profile
@@ -592,6 +524,25 @@ class PlanCapableGraphRuntime:
         )
 
         use_planning = self._prefer_plan
+        if graph_input is None and isinstance(
+            configurable.get(RESUME_CONFIG_KEY), ResumeIntent
+        ):
+            # An accepted retry has no native Command. Restore its actual completed
+            # Graph role so a rejected Plan still returns the Planning snapshot,
+            # without making a new model call or interpreting the preferred mode.
+            lineage = configurable.get(LINEAGE_CONFIG_KEY)
+            if not isinstance(lineage, LineageMarker):
+                raise PlanStateConflictError(
+                    "resume retry requires typed run ownership"
+                )
+            head = await resolve_agui_thread_head(
+                self.checkpointer,
+                thread_id=lineage.thread_id,
+                runtime_profile=lineage.runtime_profile,
+            )
+            if head is None:
+                raise PlanStateConflictError("resume retry has no checkpoint")
+            use_planning = head.role == PLANNING_CHECKPOINT_ROLE
         if _is_resume_command(graph_input):
             planning_snapshot: StateSnapshot | None = None
             if lineage_required:
@@ -676,12 +627,23 @@ class PlanCapableGraphRuntime:
                             "clarification resume has an invalid contract digest"
                         )
                     command = cast(Command[object], graph_input)
+                    raw_response = command.resume
+                    # Native Commands permit a scalar response or an interrupt-ID
+                    # map. AG-UI uses the latter so retry can omit consumed groups.
+                    if isinstance(raw_response, Mapping):
+                        response_map = cast(Mapping[str, object], raw_response)
+                        response: object = response_map
+                        if len(planning_snapshot.interrupts) == 1:
+                            interrupt_id = planning_snapshot.interrupts[0].id
+                            response = response_map.get(interrupt_id, response_map)
+                    else:
+                        response = raw_response
                     form = restore_form(self._options.clarification, pending.form)
                     validate_and_normalize_response(
                         self._options.clarification,
                         form,
                         pending.response_schema,
-                        command.resume,
+                        response,
                     )
                 use_planning = True
             elif native_pending:
@@ -759,7 +721,8 @@ class PlanCapableGraphRuntime:
             planning_bound = self._signature.bind(*bound.args, **bound.kwargs)
             planning_input: object = cast(object, graph_input)
             if (
-                checkpoint_plan is not None
+                graph_input is not None
+                and checkpoint_plan is not None
                 and checkpoint_plan.status is PlanStatus.AWAITING_INPUT
                 and not isinstance(graph_input, Command)
             ):
@@ -773,11 +736,7 @@ class PlanCapableGraphRuntime:
                     update=cast(Mapping[str, object], graph_input),
                     goto="initialize_plan",
                 )
-            planning_bound.arguments["input"] = _input_with_lineage_role(
-                planning_input,
-                role="planning",
-                required=lineage_required,
-            )
+            planning_bound.arguments["input"] = planning_input
             async for part in planning.astream(
                 *planning_bound.args,
                 **planning_bound.kwargs,
@@ -826,11 +785,6 @@ class PlanCapableGraphRuntime:
                     {
                         "messages": [message],
                         PLAN_HANDOFF_STATE_KEY: final_plan.handoff.digest,
-                        **_lineage_update_for_role(
-                            final_state,
-                            role="native",
-                            required=lineage_required,
-                        ),
                     },
                     as_node=START,
                 )

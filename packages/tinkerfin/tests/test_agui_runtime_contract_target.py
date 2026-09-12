@@ -9,10 +9,9 @@ from pydantic import BaseModel
 import tinkerfin
 import tinkerfin_agui_adapter
 from tinkerfin import (
+    AgentRuntime,
     AgUiResumeBinding,
     AgUiResumeCheckpoint,
-    DeepAgentAgUiResumeRuntime,
-    DeepAgentDefinition,
 )
 
 
@@ -28,22 +27,21 @@ def test_target_public_surface_removes_context_and_exposes_checkpoint_semantics(
     assert "AgUiResumeCheckpoint" in tinkerfin.__all__
     assert "AgUiResumeCheckpointObserver" in tinkerfin.__all__
     assert "AgUiResumeNotSavedObserver" in tinkerfin.__all__
-    assert "DeepAgentAgUiResumeRuntime" in tinkerfin.__all__
+    assert "AgentRuntime" in tinkerfin.__all__
     assert AgUiResumeCheckpoint is not None
-    assert DeepAgentAgUiResumeRuntime is not None
+    assert AgentRuntime is not None
 
 
-def test_target_new_agui_signature_has_no_protocol_input_or_settlement_callback() -> (
-    None
-):
+def test_execution_signature_has_no_protocol_input_or_settlement_callback() -> None:
     """Keep transport DTOs and ambiguous settlement wording out of the Runtime API."""
 
-    parameters = inspect.signature(DeepAgentDefinition.new_agui).parameters
+    parameters = inspect.signature(AgentRuntime.open_agui_run).parameters
 
-    assert "identity" in parameters
+    assert "thread_id" in parameters
+    assert "run_id" in parameters
     assert "parent_run_id" in parameters
     assert "resume" in parameters
-    assert "on_resume_checkpointed" in parameters
+    assert "on_resume_saved" in parameters
     assert "on_resume_not_saved" in parameters
     assert "run_input" not in parameters
     assert "on_resume_settled" not in parameters

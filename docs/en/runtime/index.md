@@ -1,23 +1,10 @@
-# Runtime basics
+# Runtime
 
 [Documentation](../index.md) · [中文](../../cn/runtime/index.md)
 
-TinkerFin opens one managed Agent run and exposes its progress as an asynchronous
-stream. Models, databases, checkpointers, Stores, and Sandbox resources remain owned by
-the host.
-
-## Choose an entry point
-
-| Goal | Use |
-| --- | --- |
-| Consume validated native LangGraph data | `TinkerFin.open_run()` |
-| Return the final state with managed observations and cleanup | `TinkerFin.ainvoke()` |
-| Send AG-UI events to a frontend | `TinkerFin.open_agui_run()` |
-| Reuse a direct async Runnable without managed lifecycle | `DeepAgentDefinition.create_graph()` |
-
-Start with `ainvoke()` when only the final state is needed, or `open_run()` when the
-caller consumes progress. The direct Graph is an advanced boundary and does not create
-a run identity, Runtime Observation, Trace, AG-UI, Messaging, or business lifecycle.
+`TinkerFin` configures an agent. `with_namespace(...).build(...)` returns an
+`AgentRuntime` that executes that configuration. Building does not open a model,
+database, Sandbox, or Graph.
 
 ## Installation
 
@@ -25,111 +12,82 @@ a run identity, Runtime Observation, Trace, AG-UI, Messaging, or business lifecy
 pip install tinkerfin
 ```
 
-The base installation includes native Runtime, Plan Mode, Observation, and native SSE.
-Install `pip install "tinkerfin[agui]"` before using `open_agui_run()`.
+Install `tinkerfin[agui]` to produce AG-UI events. Install the LangChain package for
+the model provider you use.
 
-Install and configure the selected model provider separately. The OpenAI model string
-below requires `pip install langchain-openai`.
-
-## Your first managed run
+## Build and run
 
 ```python
-import asyncio
+from contextlib import aclosing
 
-from tinkerfin import RunIdentity, TinkerFin
+from tinkerfin import TinkerFin
 
-
-tinkerfin = TinkerFin()
-agent = tinkerfin.create_deep_agent(
-    model="openai:gpt-5.4",
-    tools=[],
+runtime = (
+    TinkerFin()
+    .with_namespace("company-a")
+    .build(model="openai:gpt-5.4", tools=[])
 )
 
+stream = runtime.open_run(
+    thread_id="conversation-1",
+    run_id="request-1",
+    input={"messages": [{"role": "user", "content": "Summarize this request"}]},
+)
 
-async def main() -> None:
-    stream = await tinkerfin.open_run(
-        RunIdentity(threadId="conversation-1", runId="run-1"),
-        agent=agent,
-        input={
-            "messages": [
-                {"role": "user", "content": "Describe Beijing in one sentence"}
-            ]
-        },
-    )
+async with aclosing(stream):
     async for part in stream:
-        print(part)
-
-
-asyncio.run(main())
+        await handle(part)
 ```
 
-The common path has three steps:
+Choose the execution method by result:
 
-1. Configure one reusable `TinkerFin` facade.
-2. Create a reusable Agent definition.
-3. Call `open_run()` with the identity and input, then consume the returned stream.
+| Goal | API |
+| --- | --- |
+| Get the final state | `await runtime.ainvoke(...)` |
+| Consume native objects | `runtime.open_run(...)` |
+| Consume AG-UI events | `runtime.open_agui_run(...)` |
+| Build a caller-managed Graph | `await tinkerfin.deep_agent.create_graph(runtime)` |
 
-The facade resolves a lazy Agent callback when needed, constructs the Graph through the
-selected Profile's native asynchronous method or its bounded synchronous-factory
-boundary, injects identity, opens observations and coordination, and owns cancellation
-and cleanup.
+Stream factories are synchronous and lazy. Preparation starts only when a stream is
+preflighted or consumed. Close a stream when the consumer stops early.
 
-## What `RunIdentity` does
+## Identity and isolation
 
-`RunIdentity` contains only `threadId` and `runId`. TinkerFin injects `threadId` into
-Graph configuration, so callers do not repeat it.
+The application chooses the Runtime namespace. It may represent a tenant, user,
+project, or another business scope. TinkerFin treats it as opaque text.
+
+| Value | Meaning |
+| --- | --- |
+| `runtime.namespace` | Business data and resource scope fixed at build time |
+| `thread_id` | Continuing conversation inside that namespace |
+| `run_id` | One semantic execution inside the thread |
+| `graph_namespace` | Position of an event inside the execution Graph |
+
+Use `runtime.run_identity(thread_id, run_id)` when another TinkerFin package needs the
+complete identity. Graph namespace is execution lineage and does not replace the
+business namespace.
+
+## Persistence and resources
+
+Pass a checkpointer to retain conversation state and resume tool or Plan approval.
+Pass a Store for long-term memory. The Runtime scopes both by its namespace.
 
 ```python
-identity = RunIdentity(threadId="user-42-support", runId="run-20260820-1")
+runtime = (
+    TinkerFin(checkpointer=checkpointer)
+    .with_namespace(namespace)
+    .build(model=model, tools=tools, store=store)
+)
 ```
 
-| Field | Requirement | Purpose |
-| --- | --- | --- |
-| `threadId` | Required, non-empty, no surrounding whitespace | Continuing conversation and checkpoint thread |
-| `runId` | Required, non-empty, no surrounding whitespace | Idempotent ID for one semantic run |
-
-The value is immutable, limits each identifier to 1,024 characters, and rejects extra
-fields. Parent lineage, authentication, and request content are separate inputs. Reuse
-`threadId` for one continuing conversation. Use a new `runId` for new semantic input and
-reuse it only for retry or attachment to that same run.
-
-## Managed streams and direct Graphs
-
-Every stream returned by `open_run()` or `open_agui_run()` is single-use and closeable.
-These methods return after Run start and input observations are committed, but before the
-first model output is pulled. Close a returned stream that will not be iterated. The
-Agent definition is reusable, including across concurrent thread IDs.
-
-Advanced code can create one reusable async Runnable:
-
-```python
-graph = await agent.create_graph(mode="plan")
-result = await graph.ainvoke(graph_input, config=config)
-```
-
-`DeepAgentGraph` supports `ainvoke()`, `astream()`, `abatch()`, and standard Runnable
-composition. It uses native LangGraph `Command(resume=...)` for direct resume. Its
-synchronous `invoke()`, `stream()`, and `batch()` paths reject execution so async
-checkpointers, Stores, tools, and cancellation remain native.
-
-## Runtime Profile selection
-
-`DeepAgentsV2RuntimeProfile` is the default stable integration. The
-`DeepAgentsV3RuntimeProfile` integration for Deep Agents v3 selects LangGraph's
-experimental v3 event stream. The Runtime never detects, negotiates, or falls back
-between them. Both produce the same canonical Native observations, so Trace, AG-UI,
-Messaging, and host code do not branch on the upstream stream API. `TodoGroups` remain
-host projections over canonical Trace facts rather than Runtime state or a second
-persistence format.
-
-The selected Profile and its `profile_id` form a framework-private integration and
-checkpoint-recovery boundary. A host selects that boundary during framework assembly;
-the identity is not an application database field or HTTP request/response value.
+Models, stores, checkpointers, caches, coordinators, and supplied backends remain owned
+by the application. Each run owns its Graph, lazy workspace preparation, stream, and
+cleanup.
 
 ## Next steps
 
-- [Create and run a Deep Agent](deep-agents.md)
+- [Run your first agent](quick_start.md)
+- [Configure agents and Plan](deep-agents.md)
 - [Streams and SSE](streams-and-sse.md)
-- [Run coordination and Redis leases](extensions.md)
-- [Record semantic execution history](../tracing/index.md)
-- [Runtime usage reference](api-reference.md)
+- [Runtime extensions](extensions.md)
+- [Runtime API](api-reference.md)

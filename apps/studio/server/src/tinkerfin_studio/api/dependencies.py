@@ -15,6 +15,7 @@ from tinkerfin_studio.auth.types import AuthenticatedSession, UserContext
 from tinkerfin_studio.conversation.command import ConversationCommandService
 from tinkerfin_studio.conversation.history import ConversationHistoryService
 from tinkerfin_studio.conversation.repository import ConversationRepository
+from tinkerfin_studio.infrastructure.redis_keys import AUTH_TOKEN_KEY_PREFIX
 from tinkerfin_studio.models.repository import AgentModelRepository
 from tinkerfin_studio.models.service import AgentModelService
 from tinkerfin_studio.resources import get_resources
@@ -37,8 +38,8 @@ async def get_auth_service(request: Request, session: SessionDep) -> AuthService
     return AuthService(
         UserRepository(session),
         RedisTokenRepository(
-            resources.redis_control,
-            key_prefix=resources.settings.redis_control.auth_key_prefix,
+            resources.redis_runtime,
+            key_prefix=AUTH_TOKEN_KEY_PREFIX,
         ),
         token_expire_seconds=resources.settings.auth_token_expire_seconds,
     )

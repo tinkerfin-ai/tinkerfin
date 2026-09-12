@@ -5,12 +5,19 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from pydantic import SecretStr
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tinkerfin import AgUiResumeRequest, RunIdentity, TinkerFin
+from tinkerfin import AgentRuntime, AgUiResumeRequest, RunIdentity, TinkerFin
 from tinkerfin_studio.api.errors import BusinessException, ConversationErrorCode
 from tinkerfin_studio.auth.types import UserContext
+from tinkerfin_studio.conversation import service as service_module
+from tinkerfin_studio.conversation.models import (
+    ConversationRunRegistration,
+    ConversationThread,
+)
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.request import ChatRequest
 from tinkerfin_studio.conversation.run_preparation import (
@@ -47,6 +54,26 @@ async def stored_model_configs(session):
         await service.save_settings(
             AgentModelSave.model_validate(_model(model_id).model_dump())
         )
+
+
+@pytest.fixture(autouse=True)
+def conversation_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """会话登记和传输测试使用本地模型，业务工具装配由 Runtime 测试覆盖"""
+
+    def build_runtime(
+        *,
+        resources: ApplicationResources,
+        user_id: int,
+        thread_id: str,
+        model_config: AgentModelConfig,
+        image_model: AgentModelConfig | None,
+    ) -> AgentRuntime[None]:
+        del thread_id, model_config, image_model
+        return resources.tinkerfin.with_namespace(f"ns_{user_id}").build(
+            model=FakeListChatModel(responses=["unused"])
+        )
+
+    monkeypatch.setattr(service_module, "build_conversation_runtime", build_runtime)
 
 
 def _ordinary_request(
@@ -309,7 +336,7 @@ class _Channel:
         self.body: _Body | None = None
         self._close_error = close_error
 
-    async def sse(
+    async def open_sse(
         self,
         _source,
         *,
@@ -597,14 +624,21 @@ async def test_title_notification_shares_chat_stream_and_response_lifetime(
 
     main_release, model_requested, model_release = (asyncio.Event() for _ in range(3))
     model_calls = 0
-    source_opens = 0
+    source_prepares = 0
 
     class Source:
         messaging_cancel_waits_for_first_item = True
+        messaging_codec_profile = "agui.event"
+        messaging_source_type = BaseEvent
+        messaging_replay_type = BaseEvent
 
         def __init__(self, identity: RunIdentity):
             self.messaging_identity = identity
             self.iterator = self.events()
+
+        async def messaging_owner_preflight(self) -> None:
+            nonlocal source_prepares
+            source_prepares += 1
 
         async def events(self) -> AsyncGenerator[BaseEvent, None]:
             identity = self.messaging_identity
@@ -625,11 +659,9 @@ async def test_title_notification_shares_chat_stream_and_response_lifetime(
                 RunFinishedEvent(thread_id=identity.thread_id, run_id=identity.run_id)
             ]
 
-    async def open_run(self, identity, **kwargs):
-        nonlocal source_opens
-        del self, kwargs
-        source_opens += 1
-        return Source(identity)
+    def open_run(self: AgentRuntime[None], *, thread_id: str, run_id: str, **kwargs):
+        del kwargs
+        return Source(self.run_identity(thread_id, run_id))
 
     async def model_http(request):
         nonlocal model_calls
@@ -651,7 +683,7 @@ async def test_title_notification_shares_chat_stream_and_response_lifetime(
             content="data: " + json.dumps(payload) + "\n\ndata: [DONE]\n\n",
         )
 
-    monkeypatch.setattr(TinkerFin, "open_agui_run", open_run)
+    monkeypatch.setattr(AgentRuntime, "open_agui_run", open_run)
     async with (
         Messaging() as messaging,
         httpx.AsyncClient(transport=httpx.MockTransport(model_http)) as client,
@@ -691,7 +723,7 @@ async def test_title_notification_shares_chat_stream_and_response_lifetime(
                 _ordinary_request(thread_id=prepared.thread_id), last_event_id="1"
             )
             await attached.body.aclose()
-            assert source_opens == 1 and model_calls == 1
+            assert source_prepares == 1 and model_calls == 1
             if ending == "title":
                 model_release.set()
                 frame = await asyncio.wait_for(anext(prepared.body), 2)
@@ -710,7 +742,11 @@ async def test_title_notification_shares_chat_stream_and_response_lifetime(
                 await asyncio.wait_for(prepared.body.aclose(), 2)
                 assert (
                     await resources.conversation_channel.get_run_status(
-                        identity=RunIdentity(threadId=prepared.thread_id, runId="run-1")
+                        identity=RunIdentity(
+                            namespace="ns_1",
+                            thread_id=prepared.thread_id,
+                            run_id="run-1",
+                        )
                     )
                     == "running"
                 )
@@ -730,3 +766,210 @@ async def test_title_notification_shares_chat_stream_and_response_lifetime(
 
 async def _collect_body(body):
     return [chunk async for chunk in body]
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("stage", ["image-model", "runtime"])
+@pytest.mark.parametrize(
+    "failure_type", [ValueError, asyncio.CancelledError, KeyboardInterrupt, SystemExit]
+)
+async def test_pre_delivery_failure_keeps_only_preexisting_business_registration(
+    database,
+    session,
+    attachments,
+    monkeypatch: pytest.MonkeyPatch,
+    existing: bool,
+    stage: str,
+    failure_type: type[BaseException],
+) -> None:
+    """模型读取或运行构建失败时，只清理本次新建的会话与运行登记"""
+    request = _ordinary_request(run_id="setup-failure")
+    if existing:
+        repository = ConversationRepository(session)
+        thread = await repository.create_thread(
+            user_id=1,
+            thread_id="existing-conversation",
+            title="已有会话",
+            model_id="model-main",
+        )
+        await repository.commit()
+        request = _ordinary_request(thread_id=thread.thread_id, run_id="setup-failure")
+        intent = classify_intent(request)
+        assert isinstance(intent, StartChatIntent)
+        prepared = prepare_run_request(request, user_id=1, thread_id=thread.thread_id)
+        await ConversationRunPreparer(
+            session, user_id=1, attachments=attachments
+        ).register(
+            intent=intent,
+            prepared=prepared,
+            model=_model(),
+            thread=thread,
+        )
+    failure = failure_type("configuration preparation failed")
+
+    def reject_runtime(**_kwargs: object) -> AgentRuntime[None]:
+        raise failure
+
+    async def reject_image_model(
+        _service: AgentModelService,
+    ) -> AgentModelConfig | None:
+        raise failure
+
+    if stage == "runtime":
+        monkeypatch.setattr(
+            service_module, "build_conversation_runtime", reject_runtime
+        )
+    else:
+        monkeypatch.setattr(
+            AgentModelService, "resolve_image_model", reject_image_model
+        )
+    resources = cast(
+        ApplicationResources,
+        SimpleNamespace(
+            database=database,
+            attachments=attachments,
+            conversation_trace=_TraceCoordinator(),
+        ),
+    )
+    service = ConversationChatService(
+        session,
+        user=UserContext(
+            user_id=1, username="user", display_name="用户", roles=(), disabled=False
+        ),
+        resources=resources,
+    )
+    with pytest.raises(failure_type) as caught:
+        await service.start(request, last_event_id=None)
+    assert caught.value is failure
+    async with database.session() as verification:
+        runs = list(
+            (await verification.scalars(select(ConversationRunRegistration))).all()
+        )
+        threads = list((await verification.scalars(select(ConversationThread))).all())
+    if existing:
+        assert [(run.run_id, run.status) for run in runs] == [
+            ("setup-failure", "preparing")
+        ]
+        assert [thread.thread_id for thread in threads] == ["existing-conversation"]
+    else:
+        assert runs == []
+        assert threads == []
+
+
+@pytest.mark.parametrize("cancel_count", [0, 1, 2])
+@pytest.mark.parametrize(
+    "cleanup_failure_type", [None, OSError, KeyboardInterrupt, SystemExit]
+)
+async def test_business_registration_cleanup_settles_before_request_cancellation(
+    database,
+    session,
+    attachments,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_count: int,
+    cleanup_failure_type: type[BaseException] | None,
+) -> None:
+    """清理提交期间的请求取消不回滚删除，并保留构建与清理的原始异常"""
+    build_failed, cleanup_started, release = (asyncio.Event() for _ in range(3))
+    build_failure = ValueError("runtime configuration rejected")
+    build_cause = LookupError("configuration source")
+    build_failure.__cause__ = build_cause
+    cleanup_failure = (
+        cleanup_failure_type("cleanup provider failure")
+        if cleanup_failure_type is not None
+        else None
+    )
+    cleanup_cause = LookupError("cleanup original cause")
+    if cleanup_failure is not None:
+        cleanup_failure.__cause__ = cleanup_cause
+    original_commit = session.commit
+
+    async def commit() -> None:
+        if build_failed.is_set():
+            cleanup_started.set()
+            await release.wait()
+        await original_commit()
+        if build_failed.is_set() and cleanup_failure is not None:
+            raise cleanup_failure
+
+    def reject_runtime(**_kwargs: object) -> AgentRuntime[None]:
+        build_failed.set()
+        raise build_failure
+
+    monkeypatch.setattr(session, "commit", commit)
+    monkeypatch.setattr(service_module, "build_conversation_runtime", reject_runtime)
+    service = ConversationChatService(
+        session,
+        user=UserContext(
+            user_id=1, username="user", display_name="用户", roles=(), disabled=False
+        ),
+        resources=cast(
+            ApplicationResources,
+            SimpleNamespace(
+                database=database,
+                attachments=attachments,
+                conversation_trace=_TraceCoordinator(),
+            ),
+        ),
+    )
+
+    async def start_request() -> BaseException:
+        try:
+            await service.start(
+                _ordinary_request(run_id="cleanup-failure"), last_event_id=None
+            )
+        except BaseException as error:  # noqa: BLE001 - 在请求调用方检查控制异常
+            return error
+        raise AssertionError("构建失败必须交回调用方")
+
+    request = asyncio.create_task(start_request())
+    try:
+        await cleanup_started.wait()
+        for index in range(cancel_count):
+            request.cancel(f"client cancellation {index + 1}")
+        assert not request.done()
+        release.set()
+        outcome = await request
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+    await session.rollback()
+    if cleanup_failure is not None and not isinstance(cleanup_failure, Exception):
+        assert outcome is cleanup_failure
+    elif cancel_count:
+        assert isinstance(outcome, asyncio.CancelledError)
+    else:
+        assert outcome is (
+            build_failure if cleanup_failure is None else cleanup_failure
+        )
+
+    seen: set[int] = set()
+    active: set[int] = set()
+
+    def visit(error: BaseException) -> None:
+        assert id(error) not in active, "异常图不应包含循环"
+        if id(error) in seen:
+            return
+        seen.add(id(error))
+        active.add(id(error))
+        for nested in (error.__cause__, error.__context__):
+            if nested is not None:
+                visit(nested)
+        if isinstance(error, BaseExceptionGroup):
+            for nested in error.exceptions:
+                visit(nested)
+        active.remove(id(error))
+
+    visit(outcome)
+    assert id(build_failure) in seen and id(build_cause) in seen
+    if cleanup_failure is not None:
+        assert id(cleanup_failure) in seen and id(cleanup_cause) in seen
+    async with database.session() as verification:
+        assert (
+            list(
+                (await verification.scalars(select(ConversationRunRegistration))).all()
+            )
+            == []
+        )
+        assert (
+            list((await verification.scalars(select(ConversationThread))).all()) == []
+        )

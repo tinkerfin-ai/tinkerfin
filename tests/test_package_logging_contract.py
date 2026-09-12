@@ -7,18 +7,13 @@ import json
 import logging
 import subprocess
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
-
-import pytest
-
-from langgraph.store.mysql.base import row_to_search_item
 
 _ROOT = Path(__file__).resolve().parents[1]
 _COMPONENT_ROOTS = {
     "agui",
     "contracts",
-    "langgraph_mysql",
+    "langgraph_store",
     "messaging",
     "native_stream",
     "runtime",
@@ -90,7 +85,7 @@ before = {
 }
 import tinkerfin_messaging._producer_runtime
 import tinkerfin_sandbox.lifecycle._manager_resources
-import langgraph.store.mysql.base
+import tinkerfin_langgraph_store.sqlalchemy
 after = {
     "level": root.level,
     "handlers": [id(value) for value in root.handlers],
@@ -102,7 +97,7 @@ assert before == after
 expected = (
     "tinkerfin.messaging.producer",
     "tinkerfin.sandbox.lifecycle",
-    "tinkerfin.langgraph_mysql.store",
+    "tinkerfin.langgraph_store.store",
 )
 for name in expected:
     logger = logging.getLogger(name)
@@ -113,7 +108,7 @@ for forbidden in (
     "tinkerfin_messaging",
     "tinkerfin_sandbox",
     "tinkerfin_agui_adapter",
-    "langgraph.store.mysql",
+    "tinkerfin_langgraph_store",
 ):
     assert not any(
         name == forbidden or name.startswith(forbidden + ".")
@@ -141,8 +136,8 @@ def test_parent_component_override_and_complete_silence() -> None:
         "tinkerfin.messaging.producer",
         "tinkerfin.sandbox",
         "tinkerfin.sandbox.lifecycle",
-        "tinkerfin.langgraph_mysql",
-        "tinkerfin.langgraph_mysql.store",
+        "tinkerfin.langgraph_store",
+        "tinkerfin.langgraph_store.store",
     )
     loggers = {name: logging.getLogger(name) for name in names}
     snapshots = {
@@ -184,7 +179,7 @@ def test_parent_component_override_and_complete_silence() -> None:
 
         child.debug("component probe")
         loggers["tinkerfin.sandbox.lifecycle"].warning("sandbox probe")
-        loggers["tinkerfin.langgraph_mysql.store"].warning("mysql probe")
+        loggers["tinkerfin.langgraph_store.store"].warning("mysql probe")
         assert [record.getMessage() for record in captured] == [
             "component probe",
             "sandbox probe",
@@ -200,7 +195,7 @@ def test_parent_component_override_and_complete_silence() -> None:
             loggers[name].propagate = True
         child.error("messaging silence probe")
         loggers["tinkerfin.sandbox.lifecycle"].error("sandbox silence probe")
-        loggers["tinkerfin.langgraph_mysql.store"].error("mysql silence probe")
+        loggers["tinkerfin.langgraph_store.store"].error("mysql silence probe")
         assert captured == []
         assert escaped_records == []
     finally:
@@ -214,26 +209,3 @@ def test_parent_component_override_and_complete_silence() -> None:
         root.handlers = root_snapshot[1]
         root.propagate = root_snapshot[2]
         root.disabled = root_snapshot[3]
-
-
-def test_mysql_invalid_external_score_is_ignored_without_logging(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Keep malformed database evidence out of host handlers and public results."""
-
-    with caplog.at_level(logging.WARNING, logger="tinkerfin.langgraph_mysql"):
-        item = row_to_search_item(
-            ("namespace",),
-            {
-                "key": "key",
-                "prefix": "namespace",
-                "value": b'{"value":true}',
-                "created_at": datetime.now(UTC),
-                "updated_at": datetime.now(UTC),
-                "score": "password=SECRET-SCORE",
-            },
-        )
-
-    assert item.score is None
-    assert caplog.records == []
-    assert "SECRET-SCORE" not in caplog.text

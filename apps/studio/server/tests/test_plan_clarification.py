@@ -62,7 +62,7 @@ def test_studio_plan_form_exposes_all_builtin_question_types() -> None:
     assert option_attributes["required"] == ["recommended"]
     assert option_attributes["properties"]["recommended"]["type"] == "boolean"
 
-    TinkerFin().plan(clarification_schema=StudioPlanClarificationForm)
+    TinkerFin().with_plan(clarification_schema=StudioPlanClarificationForm)
 
 
 def test_studio_single_choice_requires_only_the_first_option_as_recommended() -> None:

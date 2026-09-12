@@ -43,7 +43,7 @@ RUN_FINISHED
 
 ## 主 Agent 和子 Agent
 
-子 Agent 来自非根 namespace。转换器会保留完整 namespace 和来源信息，避免不同子 Agent 的消息、工具和状态混在一起。
+子 Agent 来自非根 graph_namespace。转换器会保留完整 graph_namespace 和来源信息，避免不同子 Agent 的消息、工具和状态混在一起。
 
 `expose_subagent_events=True` 会发送子 Agent 的公开事件。设置为 `False` 时，转换器仍会检查这些数据，但不把对应事件交给前端。
 
@@ -62,12 +62,19 @@ Agents 原本可执行的 task 在转换阶段失败。
 如果界面需要显示支持的推理过程：
 
 ```python
-events = await tinkerfin.open_agui_run(
-    identity,
-    agent=agent,
+from contextlib import aclosing
+
+from tinkerfin import TinkerFin
+
+runtime = TinkerFin().with_namespace(namespace).build(model=model)
+async with aclosing(runtime.open_agui_run(
+    thread_id=thread_id,
+    run_id=run_id,
     input=graph_input,
     include_reasoning_events=True,
-)
+)) as events:
+    async for event in events:
+        await send_event(event)
 ```
 
 你可能收到 `REASONING_START`、`REASONING_MESSAGE_*` 和 `REASONING_END`。不是所有模型都会产生可公开的推理事件，也不能假设内容为空的模型 chunk 就是心跳。
@@ -83,7 +90,7 @@ events = await tinkerfin.open_agui_run(
 | 原生模式 | 转换时提供的信息 |
 | --- | --- |
 | `messages` | 文本 chunk、工具参数 chunk、工具结果及消息 metadata |
-| `tasks` | Graph 节点和任务的开始、结果、错误及 namespace 关系 |
+| `tasks` | Graph 节点和任务的开始、结果、错误及 graph_namespace 关系 |
 | `values` | 每一步之后的状态快照，以及顶层 `interrupts` |
 
 `tasks` 是复数；它不等于 Deep Agents 中名为 `task` 的子 Agent 工具。根 Graph 与子图的 `values` 也是不同状态范围，前端或服务端不能用后到的子图状态覆盖根状态。
@@ -105,12 +112,19 @@ async def audit_event(event) -> None:
     await audit_log.write(event.model_dump(mode="json", by_alias=True))
 
 
-events = await tinkerfin.open_agui_run(
-    identity,
-    agent=agent,
+from contextlib import aclosing
+
+from tinkerfin import TinkerFin
+
+runtime = TinkerFin().with_namespace(namespace).build(model=model)
+async with aclosing(runtime.open_agui_run(
+    thread_id=thread_id,
+    run_id=run_id,
     input=graph_input,
     on_agui_event=audit_event,
-)
+)) as events:
+    async for event in events:
+        await send_event(event)
 ```
 
 `on_agui_event` 在事件交给消费者前执行。它适合审计和指标，不适合阻塞 I/O。

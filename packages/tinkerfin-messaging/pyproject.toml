@@ -12,27 +12,30 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 
 dependencies = [
     "pydantic>=2,<3",
-    "tinkerfin-contracts>=0.1.0,<0.9.0",
+    "tinkerfin-contracts==0.1.0",
 ]
 
 [project.optional-dependencies]
 redis = ["redis>=6,<9"]
+sqlalchemy = ["sqlalchemy[asyncio]>=2.0.52,<3", "tinkerfin-sqlalchemy==0.1.0"]
 agui = ["ag-ui-protocol==0.1.19"]
-native = ["tinkerfin-native-stream>=0.1.0,<0.9.0"]
+native = ["tinkerfin-native-stream==0.1.0"]
 
 [tool.uv.sources]
 tinkerfin-contracts = { workspace = true }
 tinkerfin-native-stream = { workspace = true }
+tinkerfin-sqlalchemy = { workspace = true }
 
 [project.urls]
-Homepage = "https://github.com/tinkerfin-ai/tinkerfin"
-Repository = "https://github.com/tinkerfin-ai/tinkerfin"
-Issues = "https://github.com/tinkerfin-ai/tinkerfin/issues"
+Homepage = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Repository = "https://github.com/tinkerfin-ai/tinkerfin-harness"
+Issues = "https://github.com/tinkerfin-ai/tinkerfin-harness/issues"
 
 [build-system]
 requires = ["setuptools>=77"]

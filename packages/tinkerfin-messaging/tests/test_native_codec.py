@@ -59,7 +59,7 @@ def test_native_codec_round_trips_every_canonical_mode(
 
     assert decoded == part
     assert decoded.mode == mode
-    assert decoded.namespace == ("child:task-1",)
+    assert decoded.graph_namespace == ("child:task-1",)
     assert decoded.data == {"mode": mode}
     assert decoded.interrupts == ()
 

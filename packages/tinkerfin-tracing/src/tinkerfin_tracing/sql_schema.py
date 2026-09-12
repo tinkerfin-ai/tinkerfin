@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -17,8 +18,54 @@ from sqlalchemy import (
     Table,
     Text,
 )
-from sqlalchemy.dialects import mysql, sqlite
-from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.engine import Dialect
+from sqlalchemy.schema import (
+    CreateIndex,
+    CreateTable,
+    SetColumnComment,
+    SetTableComment,
+)
+from sqlalchemy.types import TypeDecorator
+
+from .errors import TraceStoreProtocolError
+
+
+class _TraceText(TypeDecorator[str]):
+    """Preserve opaque UTF-8 strings, including NUL, in every SQL text column.
+
+    PostgreSQL cannot store a literal NUL in TEXT. A JSON string is the sole stored
+    representation; queries bind the same representation and return decoded values.
+    Hashes and domain ordering use the original strings. Graph namespace arrays
+    already have a canonical JSON representation and do not use this type.
+    """
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: str | None, dialect: Dialect) -> str | None:
+        """Encode one text value without changing its identity."""
+
+        return None if value is None else json.dumps(value, ensure_ascii=False)
+
+    def process_result_value(self, value: str | None, dialect: Dialect) -> str | None:
+        """Reject stored text that is not the current JSON string representation."""
+
+        if value is None:
+            return None
+        try:
+            decoded: object = json.loads(value)
+        except ValueError as error:
+            raise TraceStoreProtocolError(
+                "Trace SQL text is invalid", cause=error
+            ) from error
+        if (
+            not isinstance(decoded, str)
+            or json.dumps(decoded, ensure_ascii=False) != value
+        ):
+            raise TraceStoreProtocolError("Trace SQL text is not canonical")
+        return decoded
+
 
 TRACE_TABLE_NAMES = (
     "tinkerfin_trace_namespaces",
@@ -50,7 +97,12 @@ namespaces = Table(
         primary_key=True,
         comment="SHA-256 key for the logical namespace",
     ),
-    Column("namespace", Text, nullable=False, comment="Logical Trace Store namespace"),
+    Column(
+        "namespace",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing logical Trace Store namespace",
+    ),
     Column(
         "created_at",
         _DATABASE_TIMESTAMP,
@@ -67,8 +119,18 @@ threads = Table(
         "namespace_hash", _HASH_KEY, primary_key=True, comment="SHA-256 namespace key"
     ),
     Column("thread_hash", _HASH_KEY, primary_key=True, comment="SHA-256 thread key"),
-    Column("namespace", Text, nullable=False, comment="Logical Trace namespace"),
-    Column("thread_id", Text, nullable=False, comment="Canonical semantic thread ID"),
+    Column(
+        "namespace",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing logical Trace namespace",
+    ),
+    Column(
+        "thread_id",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing canonical semantic thread ID",
+    ),
     Column(
         "generation",
         String(64),
@@ -119,7 +181,12 @@ writers = Table(
         "generation", String(64), primary_key=True, comment="Exact Trace generation ID"
     ),
     Column("run_hash", _HASH_KEY, primary_key=True, comment="SHA-256 Run key"),
-    Column("run_id", Text, nullable=False, comment="Canonical semantic Run ID"),
+    Column(
+        "run_id",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing canonical semantic Run ID",
+    ),
     Column(
         "owner_token",
         String(64),
@@ -214,7 +281,12 @@ events = Table(
         comment="Idempotent Store event identity",
     ),
     Column("run_hash", _HASH_KEY, nullable=False, comment="SHA-256 Run key"),
-    Column("run_id", Text, nullable=False, comment="Semantic Run owning this fact"),
+    Column(
+        "run_id",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing semantic Run owning this fact",
+    ),
     Column(
         "fact_kind",
         String(64),
@@ -288,10 +360,16 @@ projection_checkpoints = Table(
         "run_scope_hash", _HASH_KEY, primary_key=True, comment="SHA-256 Run scope key"
     ),
     Column(
-        "projection_name", Text, nullable=False, comment="Canonical Projection identity"
+        "projection_name",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing canonical Projection identity",
     ),
     Column(
-        "run_scope", Text, nullable=False, comment="Run ID or empty thread-wide scope"
+        "run_scope",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing run ID or empty thread-wide scope",
     ),
     Column(
         "as_of_seq",
@@ -330,7 +408,12 @@ graph_nodes = Table(
         "generation", String(64), primary_key=True, comment="Exact Trace generation ID"
     ),
     Column("node_hash", _HASH_KEY, primary_key=True, comment="SHA-256 Graph node key"),
-    Column("node_id", Text, nullable=False, comment="Canonical Graph node identity"),
+    Column(
+        "node_id",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing canonical Graph node identity",
+    ),
     Column(
         "parent_subagent_hash",
         _HASH_KEY,
@@ -339,9 +422,9 @@ graph_nodes = Table(
     ),
     Column(
         "parent_subagent_id",
-        Text,
+        _TraceText(),
         nullable=True,
-        comment="Nearest owning Subagent, null for the Turn root scope",
+        comment="JSON string containing nearest owning Subagent, null for the Turn root scope",
     ),
     Column(
         "model_call_hash",
@@ -351,9 +434,9 @@ graph_nodes = Table(
     ),
     Column(
         "model_call_id",
-        Text,
+        _TraceText(),
         nullable=True,
-        comment="Model call that emitted this Assistant, Tool, or Subagent",
+        comment="JSON string containing model call that emitted this Assistant, Tool, or Subagent",
     ),
     Column(
         "model_call_seq",
@@ -375,9 +458,9 @@ graph_nodes = Table(
     ),
     Column(
         "name",
-        Text,
+        _TraceText(),
         nullable=True,
-        comment="Graph node display name, null on a removal revision",
+        comment="JSON string containing graph node display name, null on a removal revision",
     ),
     Column(
         "run_hash",
@@ -385,7 +468,12 @@ graph_nodes = Table(
         primary_key=True,
         comment="SHA-256 Run revision key",
     ),
-    Column("run_id", Text, nullable=False, comment="Semantic Run owning the node"),
+    Column(
+        "run_id",
+        _TraceText(),
+        nullable=False,
+        comment="JSON string containing semantic Run owning the node",
+    ),
     Column(
         "removed",
         Boolean,
@@ -410,21 +498,36 @@ graph_nodes = Table(
         nullable=True,
         comment="SHA-256 Agent name key when present",
     ),
-    Column("agent_name", Text, nullable=True, comment="Named Agent when present"),
+    Column(
+        "agent_name",
+        _TraceText(),
+        nullable=True,
+        comment="JSON string containing named Agent when present",
+    ),
     Column(
         "provider_hash",
         _HASH_KEY,
         nullable=True,
         comment="SHA-256 model provider key when present",
     ),
-    Column("provider", Text, nullable=True, comment="Model provider when present"),
+    Column(
+        "provider",
+        _TraceText(),
+        nullable=True,
+        comment="JSON string containing model provider when present",
+    ),
     Column(
         "model_hash",
         _HASH_KEY,
         nullable=True,
         comment="SHA-256 model name key when present",
     ),
-    Column("model", Text, nullable=True, comment="Model name when present"),
+    Column(
+        "model",
+        _TraceText(),
+        nullable=True,
+        comment="JSON string containing model name when present",
+    ),
     Column(
         "started_at",
         _DATABASE_TIMESTAMP,
@@ -496,17 +599,19 @@ class TraceStoreSchema:
     """Describe deterministic full empty-database DDL for one supported dialect.
 
     Attributes:
-        dialect: SQLite or MySQL compilation target.
+        dialect: SQLite, MySQL, or PostgreSQL compilation target.
         table_names: Exact tables owned by the Trace framework.
-        ddl: Complete deterministic create-table and create-index statements.
+        ddl: Complete deterministic tables, indexes, and supported database comments.
     """
 
-    dialect: Literal["mysql", "sqlite"]
+    dialect: Literal["mysql", "sqlite", "postgresql"]
     table_names: tuple[str, ...]
     ddl: str
 
 
-def get_trace_store_schema(*, dialect: Literal["mysql", "sqlite"]) -> TraceStoreSchema:
+def get_trace_store_schema(
+    *, dialect: Literal["mysql", "sqlite", "postgresql"]
+) -> TraceStoreSchema:
     """Compile the exact metadata used by automatic Store setup.
 
     Args:
@@ -516,15 +621,17 @@ def get_trace_store_schema(*, dialect: Literal["mysql", "sqlite"]) -> TraceStore
         Immutable table ownership and deterministic DDL text.
 
     Raises:
-        ValueError: ``dialect`` is not SQLite or MySQL.
+        ValueError: ``dialect`` is not SQLite, MySQL, or PostgreSQL.
     """
 
     if dialect == "sqlite":
         selected = sqlite.dialect()
     elif dialect == "mysql":
         selected = mysql.dialect()
+    elif dialect == "postgresql":
+        selected = postgresql.dialect()
     else:
-        raise ValueError("dialect must be 'sqlite' or 'mysql'")
+        raise ValueError("dialect must be 'sqlite', 'mysql', or 'postgresql'")
     statements = [
         str(CreateTable(table).compile(dialect=selected)).strip()
         for table in metadata.sorted_tables
@@ -534,6 +641,17 @@ def get_trace_store_schema(*, dialect: Literal["mysql", "sqlite"]) -> TraceStore
         for table in metadata.sorted_tables
         for index in sorted(table.indexes, key=lambda item: item.name or "")
     )
+    if dialect == "postgresql":
+        # PostgreSQL stores comments separately from CREATE TABLE. Match the DDL
+        # emitted by SQLAlchemy MetaData.create_all for empty database setup.
+        for table in metadata.sorted_tables:
+            if table.comment is not None:
+                statements.append(str(SetTableComment(table).compile(dialect=selected)))
+            statements.extend(
+                str(SetColumnComment(column).compile(dialect=selected))
+                for column in table.columns
+                if column.comment is not None
+            )
     return TraceStoreSchema(
         dialect=dialect,
         table_names=TRACE_TABLE_NAMES,

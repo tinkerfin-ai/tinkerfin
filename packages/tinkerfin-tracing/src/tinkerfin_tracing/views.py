@@ -23,7 +23,7 @@ class TraceMessage(TraceModel):
     id: str
     trace_seq: int = Field(ge=1)
     source_id: str | None = None
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     run_id: str
     role: Literal["user", "assistant", "tool", "system", "other"]
     content: JsonValue | None = None
@@ -41,7 +41,7 @@ class TraceReasoning(TraceModel):
     id: str
     trace_seq: int = Field(ge=1)
     message_id: str
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     run_id: str
     extractor: str
     content: JsonValue | None = None
@@ -62,7 +62,7 @@ class TraceInteraction(TraceModel):
     id: str
     trace_seq: int = Field(ge=1)
     source_id: str
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     run_id: str
     kind: str
     tool_call_ids: tuple[str, ...] = ()

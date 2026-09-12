@@ -314,9 +314,9 @@ describe('conversation stream client', () => {
     const source = {
       kind: 'compiled_subgraph',
       nodeName: 'create_plan',
-      namespace: ['create_plan:graph-task-1'],
+      graphNamespace: ['create_plan:graph-task-1'],
       graphTaskId: 'graph-task-1',
-      parentNamespace: [],
+      parentGraphNamespace: [],
     }
     const events = [
       {

@@ -137,17 +137,21 @@ class ResumeMapper:
         *,
         entries: Sequence[ResumeEntry],
         interrupts: Sequence[AgentRuntimeInterrupt],
-        messages_by_namespace: Mapping[tuple[str, ...], Sequence[BaseMessage]]
+        messages_by_graph_namespace: Mapping[tuple[str, ...], Sequence[BaseMessage]]
         | None = None,
+        interrupt_graph_namespaces: Mapping[str, tuple[str, ...]] | None = None,
     ) -> ResumeTranslation:
         """Classify AG-UI resume entries as command, abandonment, or custom data.
 
         Args:
             entries: Resume entries already validated by the AG-UI schema.
             interrupts: Pending interrupts supplied from a host checkpoint snapshot.
-            messages_by_namespace: Complete checkpoint messages grouped by their
+            messages_by_graph_namespace: Complete checkpoint messages grouped by their
                 full graph namespace. Required when at least one review is resolved;
                 an all-cancelled abandonment does not need Tool-call correlation.
+            interrupt_graph_namespaces: Trusted Graph location of each native
+                interrupt. Supply checkpoint evidence to distinguish identical
+                actions in separate Graphs; never use locations from client input.
 
         Returns:
             A lossless translation preserving grouping and native action order.
@@ -188,9 +192,41 @@ class ResumeMapper:
                 if selected is None
                 else tuple(tuple(selected[group_id]) for group_id in group_ids)
             )
+            if interrupt_graph_namespaces is not None:
+                if set(interrupt_graph_namespaces) != set(group_ids):
+                    raise ResumeMappingError(
+                        AgUiAdapterErrorCode.RESUME_INTERRUPT_UNSUPPORTED,
+                        "interrupt Graph locations must cover the pending review groups",
+                    )
+                groups_by_namespace: dict[tuple[str, ...], list[int]] = {}
+                for index, group_id in enumerate(group_ids):
+                    namespace = interrupt_graph_namespaces[group_id]
+                    groups_by_namespace.setdefault(namespace, []).append(index)
+                matched: list[str] = []
+                for namespace, indices in groups_by_namespace.items():
+                    if (
+                        messages_by_graph_namespace is None
+                        or namespace not in messages_by_graph_namespace
+                    ):
+                        raise ResumeMappingError(
+                            AgUiAdapterErrorCode.RESUME_CHECKPOINT_MESSAGES_REQUIRED,
+                            "each interrupted Graph must provide its checkpoint messages",
+                        )
+                    matched.extend(
+                        self._prior_tool_call_ids(
+                            [action_groups[index] for index in indices],
+                            {namespace: messages_by_graph_namespace[namespace]},
+                            selected_slots=(
+                                None
+                                if selected_slots is None
+                                else [selected_slots[index] for index in indices]
+                            ),
+                        )
+                    )
+                return tuple(matched)
             return self._prior_tool_call_ids(
                 action_groups,
-                messages_by_namespace,
+                messages_by_graph_namespace,
                 selected_slots=selected_slots,
             )
 
@@ -535,13 +571,14 @@ class ResumeMapper:
     @staticmethod
     def _prior_tool_call_ids(
         action_groups: Sequence[Sequence[HitlActionRequest]],
-        messages_by_namespace: Mapping[tuple[str, ...], Sequence[BaseMessage]] | None,
+        messages_by_graph_namespace: Mapping[tuple[str, ...], Sequence[BaseMessage]]
+        | None,
         *,
         selected_slots: Sequence[Sequence[bool]] | None = None,
     ) -> tuple[str, ...]:
         """Correlate complete action groups, then return the selected Tool call IDs."""
 
-        if messages_by_namespace is None:
+        if messages_by_graph_namespace is None:
             raise ResumeMappingError(
                 AgUiAdapterErrorCode.RESUME_CHECKPOINT_MESSAGES_REQUIRED,
                 "resolved Tool reviews require checkpoint messages grouped by "
@@ -550,7 +587,7 @@ class ResumeMapper:
         codec = ScopedIdCodec()
         scoped_messages: list[BaseMessage] = []
         try:
-            for namespace, messages in messages_by_namespace.items():
+            for namespace, messages in messages_by_graph_namespace.items():
                 if not isinstance(namespace, tuple):
                     raise TypeError("message namespace must be a tuple")
                 for message in messages:

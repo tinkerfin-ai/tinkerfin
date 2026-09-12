@@ -227,7 +227,9 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
     assert parent_results[0]["interrupts"] == []
 
     before_adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="real-subagent-resume", runId="request-before")
+        identity=RunIdentity(
+            namespace="test", thread_id="real-subagent-resume", run_id="request-before"
+        )
     )
     before_events = [event for part in before for event in before_adapter.process(part)]
     before_events.extend(before_adapter.finish())
@@ -246,7 +248,7 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
     ]
     assert len(descriptors) == 1
     before_provenance = SubagentProvenance.model_validate(descriptors[0])
-    assert before_provenance.namespace == child_namespace
+    assert before_provenance.graph_namespace == child_namespace
     assert before_provenance.graph_task_id == graph_task_id
     assert before_provenance.request_run_id == "request-before"
     public_interrupt = before_outcome.interrupts[0]
@@ -264,7 +266,9 @@ async def test_real_subagent_tool_resume_preserves_native_identity() -> None:
     )
 
     after_adapter = DeepAgentAgUiAdapter(
-        identity=RunIdentity(threadId="real-subagent-resume", runId="request-after"),
+        identity=RunIdentity(
+            namespace="test", thread_id="real-subagent-resume", run_id="request-after"
+        ),
         prior_tool_call_ids=frozenset(translation.prior_tool_call_ids),
     )
     after_events = [event for part in after for event in after_adapter.process(part)]

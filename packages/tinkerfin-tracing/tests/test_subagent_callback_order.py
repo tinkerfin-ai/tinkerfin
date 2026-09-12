@@ -30,7 +30,7 @@ from tinkerfin_tracing import (
     Tracer,
 )
 
-_IDENTITY = RunIdentity(threadId="callback-order", runId="run")
+_IDENTITY = RunIdentity(namespace="test", thread_id="callback-order", run_id="run")
 _CHILD = ("tools:parent-task",)
 _BASE = datetime(2026, 9, 5, tzinfo=UTC)
 
@@ -87,7 +87,7 @@ async def _prepare(
         await session.observe(
             NativeTaskObservation(
                 identity=_IDENTITY,
-                namespace=(),
+                graph_namespace=(),
                 phase="start",
                 task_id="parent-task",
                 name="tools",
@@ -109,7 +109,7 @@ async def _prepare(
         await session.observe(
             ToolExecutionObservation(
                 identity=_IDENTITY,
-                namespace=(),
+                graph_namespace=(),
                 phase="started",
                 execution_id="parent-execution",
                 tool_call_id="delegate",
@@ -127,7 +127,7 @@ def _model_start(
 ) -> ModelCallObservation:
     return ModelCallObservation(
         identity=_IDENTITY,
-        namespace=namespace,
+        graph_namespace=namespace,
         phase="started",
         call_id="child-model",
         agent_name="worker",
@@ -140,7 +140,7 @@ def _model_start(
 def _tool_start(value: int) -> ToolExecutionObservation:
     return ToolExecutionObservation(
         identity=_IDENTITY,
-        namespace=_CHILD,
+        graph_namespace=_CHILD,
         phase="started",
         execution_id="child-execution",
         tool_call_id="child-tool",
@@ -154,7 +154,7 @@ def _tool_start(value: int) -> ToolExecutionObservation:
 def _native_start(value: int) -> NativeTaskObservation:
     return NativeTaskObservation(
         identity=_IDENTITY,
-        namespace=_CHILD,
+        graph_namespace=_CHILD,
         phase="start",
         task_id="child-native-task",
         name="model",
@@ -184,7 +184,7 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
             await session.observe(
                 ToolExecutionObservation(
                     identity=_IDENTITY,
-                    namespace=_CHILD,
+                    graph_namespace=_CHILD,
                     phase="completed",
                     execution_id="child-execution",
                     tool_call_id="child-tool",
@@ -199,7 +199,7 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
         await session.observe(
             NativeStateObservation(
                 identity=_IDENTITY,
-                namespace=_CHILD,
+                graph_namespace=_CHILD,
                 state={},
                 observed_at=_time(11),
                 monotonic_ns=11,
@@ -208,7 +208,7 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
         await session.observe(
             ModelCallObservation(
                 identity=_IDENTITY,
-                namespace=_CHILD,
+                graph_namespace=_CHILD,
                 phase="completed",
                 call_id="child-model",
                 observed_at=_time(12),
@@ -218,7 +218,7 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
         await session.observe(
             ToolExecutionObservation(
                 identity=_IDENTITY,
-                namespace=(),
+                graph_namespace=(),
                 phase="completed",
                 execution_id="parent-execution",
                 tool_call_id="delegate",
@@ -231,7 +231,7 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
         await session.observe(
             NativeTaskObservation(
                 identity=_IDENTITY,
-                namespace=(),
+                graph_namespace=(),
                 phase="result",
                 task_id="parent-task",
                 name="tools",
@@ -258,7 +258,7 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
         )
     finally:
         await session.aclose()
-    snapshot = await tracer.store.snapshot(_IDENTITY.thread_id)
+    snapshot = await tracer.store.snapshot(_IDENTITY.thread)
     events = await tracer.store.read_events(
         snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
     )
@@ -272,14 +272,14 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
     assert isinstance(opening.fact, SubagentFact)
     assert opening.fact.occurred_at == _time(6)
     assert opening.fact.monotonic_ns == 6
-    assert opening.fact.namespace == _CHILD
+    assert opening.fact.graph_namespace == _CHILD
     assert opening.fact.parent_execution_id is not None
     child_model = next(
         event
         for event in events
         if isinstance(event.fact, ModelCallFact)
         and event.fact.phase == "started"
-        and event.fact.namespace == _CHILD
+        and event.fact.graph_namespace == _CHILD
     )
     assert isinstance(child_model.fact, ModelCallFact)
     assert child_model.fact.context_started_at == expected_context_start
@@ -290,10 +290,10 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
             for event in events
             if isinstance(event.fact, ToolExecutionFact)
             and event.fact.phase == "started"
-            and event.fact.namespace == _CHILD
+            and event.fact.graph_namespace == _CHILD
         )
         assert opening.trace_seq < child_tool.trace_seq
-    graph = await tracer.query(_IDENTITY.thread_id)
+    graph = await tracer.query(_IDENTITY.thread)
     subagents = [
         node for node in graph.nodes if node.kind is TraceGraphNodeKind.SUBAGENT
     ]
@@ -302,12 +302,12 @@ async def test_child_callback_and_native_orders_share_one_proven_start(
     context = next(
         node
         for node in graph.nodes
-        if node.kind is TraceGraphNodeKind.CONTEXT and node.namespace == _CHILD
+        if node.kind is TraceGraphNodeKind.CONTEXT and node.graph_namespace == _CHILD
     )
     model = next(
         node
         for node in graph.nodes
-        if node.kind is TraceGraphNodeKind.MODEL and node.namespace == _CHILD
+        if node.kind is TraceGraphNodeKind.MODEL and node.graph_namespace == _CHILD
     )
     assert context.parent_subagent_id == model.parent_subagent_id == subagents[0].id
     assert context.started_at == expected_context_start
@@ -332,7 +332,7 @@ async def test_proven_child_callback_rejects_missing_or_later_parent_boundary(
             )
     finally:
         await session.aclose()
-    snapshot = await tracer.store.snapshot(_IDENTITY.thread_id)
+    snapshot = await tracer.store.snapshot(_IDENTITY.thread)
     events = await tracer.store.read_events(
         snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
     )
@@ -348,7 +348,7 @@ async def test_unproven_namespace_keeps_ordinary_scope_without_inventing_subagen
         await session.observe(_model_start(7, namespace=("ordinary:subgraph",)))
     finally:
         await session.aclose()
-    snapshot = await tracer.store.snapshot(_IDENTITY.thread_id)
+    snapshot = await tracer.store.snapshot(_IDENTITY.thread)
     events = await tracer.store.read_events(
         snapshot.key, after_seq=0, as_of_seq=snapshot.as_of_seq, limit=100
     )
@@ -356,7 +356,7 @@ async def test_unproven_namespace_keeps_ordinary_scope_without_inventing_subagen
     child = next(
         event.fact
         for event in events
-        if isinstance(event.fact, ModelCallFact) and event.fact.namespace
+        if isinstance(event.fact, ModelCallFact) and event.fact.graph_namespace
     )
     assert isinstance(child, ModelCallFact)
     assert not child.in_subagent_scope

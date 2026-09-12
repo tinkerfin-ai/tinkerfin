@@ -39,7 +39,7 @@ class ReducedTraceGraphNode:
     status: TraceGraphNodeStatus
     name: str
     run_id: str
-    namespace: tuple[str, ...]
+    graph_namespace: tuple[str, ...]
     agent_name: str | None
     provider: str | None
     model: str | None
@@ -68,26 +68,26 @@ ReducedTraceGraphRevision: TypeAlias = (
 )
 
 
-def _tool_node(namespace: tuple[str, ...], source_tool_call_id: str) -> str:
-    return scope_id("tool", namespace, source_tool_call_id)
+def _tool_node(graph_namespace: tuple[str, ...], source_tool_call_id: str) -> str:
+    return scope_id("tool", graph_namespace, source_tool_call_id)
 
 
-def _subagent_owner(namespace: tuple[str, ...]) -> str | None:
-    if not namespace:
+def _subagent_owner(graph_namespace: tuple[str, ...]) -> str | None:
+    if not graph_namespace:
         return None
-    return scope_id("subagent", namespace, namespace[-1])
+    return scope_id("subagent", graph_namespace, graph_namespace[-1])
 
 
-def _outer_subagent_owner(namespace: tuple[str, ...]) -> str | None:
-    return _subagent_owner(namespace[:-1])
+def _outer_subagent_owner(graph_namespace: tuple[str, ...]) -> str | None:
+    return _subagent_owner(graph_namespace[:-1])
 
 
 def _fact_subagent_owner(fact: TraceSemanticFact) -> str | None:
-    return _subagent_owner(fact.namespace) if fact.in_subagent_scope else None
+    return _subagent_owner(fact.graph_namespace) if fact.in_subagent_scope else None
 
 
 def _subagent_input_node(fact: SubagentFact) -> str:
-    return scope_id("subagent-input", fact.namespace, fact.subagent_id)
+    return scope_id("subagent-input", fact.graph_namespace, fact.subagent_id)
 
 
 def resolve_graph_link_issue(
@@ -175,7 +175,7 @@ def graph_node_mutations(
                     status=TraceGraphNodeStatus.SUCCEEDED,
                     name="HumanMessage",
                     run_id=fact.identity.run_id,
-                    namespace=(),
+                    graph_namespace=(),
                     started_at=fact.occurred_at,
                     completed_at=fact.occurred_at,
                     started_seq=event.trace_seq,
@@ -197,7 +197,7 @@ def graph_node_mutations(
             if fact.role == "tool" or fact.role == "other" or fact.role == "system":
                 continue
             if fact.role == "user":
-                if fact.namespace or fact.phase == "content":
+                if fact.graph_namespace or fact.phase == "content":
                     continue
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -228,7 +228,7 @@ def graph_node_mutations(
                     name="AssistantMessage",
                     run_id=fact.identity.run_id,
                     parent_subagent_id=_fact_subagent_owner(fact),
-                    namespace=fact.namespace,
+                    graph_namespace=fact.graph_namespace,
                     started_at=fact.occurred_at,
                     completed_at=_terminal_time(status, fact.occurred_at),
                     started_seq=event.trace_seq,
@@ -245,14 +245,14 @@ def graph_node_mutations(
                     )
                 mutations.append(
                     TraceGraphNodeMutation(
-                        node_id=scope_id("context", fact.namespace, fact.call_id),
+                        node_id=scope_id("context", fact.graph_namespace, fact.call_id),
                         updated_seq=event.trace_seq,
                         kind=TraceGraphNodeKind.CONTEXT,
                         status=TraceGraphNodeStatus.SUCCEEDED,
                         name="Context",
                         run_id=fact.identity.run_id,
                         parent_subagent_id=_fact_subagent_owner(fact),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         agent_name=fact.agent_name,
                         provider=fact.provider,
                         model=fact.model,
@@ -271,7 +271,7 @@ def graph_node_mutations(
                         name=fact.model or "Model",
                         run_id=fact.identity.run_id,
                         parent_subagent_id=_fact_subagent_owner(fact),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         agent_name=fact.agent_name,
                         provider=fact.provider,
                         model=fact.model,
@@ -294,7 +294,7 @@ def graph_node_mutations(
                         TraceGraphNodeMutation(
                             node_id=scope_id(
                                 "message",
-                                fact.namespace,
+                                fact.graph_namespace,
                                 source_message_id,
                             ),
                             updated_seq=event.trace_seq,
@@ -305,7 +305,7 @@ def graph_node_mutations(
                             parent_subagent_id=_fact_subagent_owner(fact),
                             model_call_id=fact.call_id,
                             model_call_seq=event.trace_seq,
-                            namespace=fact.namespace,
+                            graph_namespace=fact.graph_namespace,
                             agent_name=fact.agent_name,
                             started_at=fact.occurred_at,
                             started_seq=event.trace_seq,
@@ -334,7 +334,7 @@ def graph_node_mutations(
                             TraceGraphNodeMutation(
                                 node_id=scope_id(
                                     "message",
-                                    fact.namespace,
+                                    fact.graph_namespace,
                                     source_message_id,
                                 ),
                                 updated_seq=event.trace_seq,
@@ -345,7 +345,7 @@ def graph_node_mutations(
                                 parent_subagent_id=_fact_subagent_owner(fact),
                                 model_call_id=fact.call_id,
                                 model_call_seq=event.trace_seq,
-                                namespace=fact.namespace,
+                                graph_namespace=fact.graph_namespace,
                                 agent_name=fact.agent_name,
                                 started_at=fact.occurred_at,
                                 completed_at=fact.occurred_at,
@@ -357,7 +357,7 @@ def graph_node_mutations(
                         mutations.append(
                             TraceGraphNodeMutation(
                                 node_id=_tool_node(
-                                    fact.namespace,
+                                    fact.graph_namespace,
                                     source_tool_call_id,
                                 ),
                                 updated_seq=event.trace_seq,
@@ -370,7 +370,7 @@ def graph_node_mutations(
         if isinstance(fact, ToolFact):
             if fact.tool_name == "task":
                 continue
-            node_id = _tool_node(fact.namespace, fact.source_tool_call_id)
+            node_id = _tool_node(fact.graph_namespace, fact.source_tool_call_id)
             if fact.phase in {"started", "arguments"}:
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -385,7 +385,7 @@ def graph_node_mutations(
                         model_call_seq=(
                             event.trace_seq if fact.parent_call_id is not None else None
                         ),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
                         request_seq=(
@@ -419,7 +419,7 @@ def graph_node_mutations(
                         model_call_seq=(
                             event.trace_seq if fact.parent_call_id is not None else None
                         ),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         started_at=fact.occurred_at,
                         completed_at=fact.occurred_at,
                         started_seq=event.trace_seq,
@@ -446,7 +446,7 @@ def graph_node_mutations(
                         model_call_seq=(
                             event.trace_seq if fact.parent_call_id is not None else None
                         ),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         started_at=fact.occurred_at,
                         completed_at=fact.occurred_at,
                         started_seq=event.trace_seq,
@@ -457,7 +457,7 @@ def graph_node_mutations(
             if fact.tool_name == "task":
                 continue
             node_id = (
-                _tool_node(fact.namespace, fact.source_tool_call_id)
+                _tool_node(fact.graph_namespace, fact.source_tool_call_id)
                 if fact.source_tool_call_id is not None
                 else fact.execution_id
             )
@@ -475,7 +475,7 @@ def graph_node_mutations(
                         model_call_seq=(
                             event.trace_seq if fact.parent_call_id is not None else None
                         ),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         agent_name=fact.agent_name,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
@@ -510,7 +510,7 @@ def graph_node_mutations(
                 )
             continue
         if isinstance(fact, SubagentFact):
-            parent_subagent_id = _outer_subagent_owner(fact.namespace)
+            parent_subagent_id = _outer_subagent_owner(fact.graph_namespace)
             if fact.phase == "started":
                 mutations.append(
                     TraceGraphNodeMutation(
@@ -525,7 +525,7 @@ def graph_node_mutations(
                         model_call_seq=(
                             event.trace_seq if fact.model_call_id is not None else None
                         ),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         agent_name=fact.agent_name,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
@@ -551,7 +551,7 @@ def graph_node_mutations(
                             name="HumanMessage",
                             run_id=fact.identity.run_id,
                             parent_subagent_id=fact.subagent_id,
-                            namespace=fact.namespace,
+                            graph_namespace=fact.graph_namespace,
                             agent_name=fact.agent_name,
                             started_at=fact.occurred_at,
                             completed_at=fact.occurred_at,
@@ -570,7 +570,7 @@ def graph_node_mutations(
                         status=status,
                         name=fact.agent_name or "Subagent",
                         parent_subagent_id=parent_subagent_id,
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         agent_name=fact.agent_name,
                         started_at=fact.occurred_at,
                         completed_at=_terminal_time(status, fact.occurred_at),
@@ -596,7 +596,7 @@ def graph_node_mutations(
                         name=fact.name,
                         run_id=fact.identity.run_id,
                         parent_subagent_id=_fact_subagent_owner(fact),
-                        namespace=fact.namespace,
+                        graph_namespace=fact.graph_namespace,
                         started_at=fact.occurred_at,
                         started_seq=event.trace_seq,
                         request_seq=event.trace_seq,
@@ -632,14 +632,16 @@ def graph_node_mutations(
             )
             mutations.append(
                 TraceGraphNodeMutation(
-                    node_id=scope_id("plan", fact.namespace, fact.identity.run_id),
+                    node_id=scope_id(
+                        "plan", fact.graph_namespace, fact.identity.run_id
+                    ),
                     updated_seq=event.trace_seq,
                     kind=TraceGraphNodeKind.PLAN,
                     status=status,
                     name="Plan",
                     run_id=fact.identity.run_id,
                     parent_subagent_id=_fact_subagent_owner(fact),
-                    namespace=fact.namespace,
+                    graph_namespace=fact.graph_namespace,
                     started_at=fact.occurred_at,
                     completed_at=_terminal_time(status, fact.occurred_at),
                     started_seq=event.trace_seq,
@@ -666,7 +668,7 @@ def graph_node_mutations(
                     name=fact.interaction_kind,
                     run_id=fact.identity.run_id,
                     parent_subagent_id=_fact_subagent_owner(fact),
-                    namespace=fact.namespace,
+                    graph_namespace=fact.graph_namespace,
                     started_at=fact.occurred_at,
                     completed_at=_terminal_time(status, fact.occurred_at),
                     started_seq=event.trace_seq,
@@ -725,10 +727,10 @@ def _coalesce_graph_mutations(
             parent_subagent_id=parent_subagent_id,
             model_call_id=model_call_id,
             model_call_seq=mutation.model_call_seq or current.model_call_seq,
-            namespace=(
-                current.namespace
-                if current.namespace is not None
-                else mutation.namespace
+            graph_namespace=(
+                current.graph_namespace
+                if current.graph_namespace is not None
+                else mutation.graph_namespace
             ),
             agent_name=mutation.agent_name or current.agent_name,
             provider=mutation.provider or current.provider,
@@ -780,7 +782,7 @@ def apply_graph_node_mutation(
             mutation.kind is None
             or mutation.status is None
             or mutation.name is None
-            or mutation.namespace is None
+            or mutation.graph_namespace is None
             or mutation.started_at is None
             or mutation.started_seq is None
         ):
@@ -798,7 +800,7 @@ def apply_graph_node_mutation(
             status=mutation.status,
             name=mutation.name,
             run_id=mutation.run_id,
-            namespace=mutation.namespace,
+            graph_namespace=mutation.graph_namespace,
             agent_name=mutation.agent_name,
             provider=mutation.provider,
             model=mutation.model,
@@ -827,7 +829,10 @@ def apply_graph_node_mutation(
     )
     if mutation.name is not None and mutation.name != row.name:
         raise TraceStoreProtocolError("Trace Graph node name changed")
-    if mutation.namespace is not None and mutation.namespace != row.namespace:
+    if (
+        mutation.graph_namespace is not None
+        and mutation.graph_namespace != row.graph_namespace
+    ):
         raise TraceStoreProtocolError("Trace Graph node namespace changed")
     if mutation.parent_subagent_id is not None:
         if (
@@ -952,7 +957,7 @@ def effective_graph_nodes(
                 status=latest.status,
                 name=latest.name,
                 run_id=latest.run_id,
-                namespace=latest.namespace,
+                graph_namespace=latest.graph_namespace,
                 agent_name=cast(str | None, latest_value("agent_name")),
                 provider=cast(str | None, latest_value("provider")),
                 model=cast(str | None, latest_value("model")),
@@ -1096,7 +1101,7 @@ def graph_revision_mutations(
                 parent_subagent_id=revision.parent_subagent_id,
                 model_call_id=revision.model_call_id,
                 model_call_seq=revision.model_call_seq,
-                namespace=revision.namespace,
+                graph_namespace=revision.graph_namespace,
                 agent_name=revision.agent_name,
                 provider=revision.provider,
                 model=revision.model,

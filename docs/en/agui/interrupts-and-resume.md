@@ -1,95 +1,37 @@
-# Interrupts and resume
+# Approvals and resume
 
-[Understand AG-UI events](events.md) · [中文](../../cn/agui/interrupts-and-resume.md)
+[AG-UI events](events.md) · [中文](../../cn/agui/interrupts-and-resume.md)
 
-An agent can pause before a sensitive tool action and return an interrupt. After the user decides, resume the same checkpointed thread.
+An agent can pause before running a tool, wait for a decision, and continue within the same namespace and thread.
 
-## Require approval for a tool
+## Configure tool approval
+
+This example uses an application-defined `delete_order` tool:
 
 ```python
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.memory import InMemorySaver
 from tinkerfin import TinkerFin
+from tinkerfin.coordination import InMemoryRunCoordinator
 
-
-agent = TinkerFin().create_deep_agent(
-    model="openai:gpt-5.4",
-    tools=[delete_order],
-    interrupt_on={
-        "delete_order": {
-            "allowed_decisions": ["approve", "reject"],
-        }
-    },
-    checkpointer=MemorySaver(),
+runtime = (
+    TinkerFin(
+        checkpointer=InMemorySaver(),
+        run_coordinator=InMemoryRunCoordinator(),
+    )
+    .with_namespace("company-a")
+    .build(
+        model="openai:gpt-5.4",
+        tools=[delete_order],
+        interrupt_on={"delete_order": {"allowed_decisions": ["approve", "reject"]}},
+    )
 )
 ```
 
-Without a checkpointer there is no reliable paused Graph state to resume.
+Resume requires a checkpointer. In-memory storage and coordination suit one process; deployments with multiple processes need shared persistent storage and coordination.
 
-## Plan clarification and review
+## Submit decisions
 
-An Agent created through `TinkerFin().plan(enabled=True)` can pause for two
-runtime-owned reasons. Select `mode="plan"` on that request:
-
-```python
-events = await tinkerfin.open_agui_run(
-    identity,
-    agent=agent,
-    input=graph_input,
-    mode="plan",
-)
-```
-
-| Reason | Expected resolved payload |
-| --- | --- |
-| `tinkerfin:plan_clarification` | `{"type":"respond","answers":{"question-id":{"status":"answered","answerType":"single_choice","optionId":"option-id"}}}`; each question value follows the exact interrupt response Schema, while an optional skip is `{"status":"skipped"}` |
-| `tinkerfin:plan_review` | One decision permitted by the interrupt response Schema, with the current `baseRevision`; the default is `approve`, `respond`, or `reject`, while `edit` requires explicit host configuration |
-
-A Plan interrupt has no `toolCallId`. It carries a declared trusted runtime envelope,
-its exact response JSON Schema, and Plan clarification metadata containing the complete
-public Form. Every question carries `answerType` and
-an explicit `required` flag. Built-in answer types are `single_choice`,
-`multiple_choice`, `text`, and `date`.
-Question and option attributes are preserved as public, non-authoritative planning
-context. Internal schema fingerprints remain in checkpoint state and are not part of
-any public AG-UI event. The root `tinkerfin_plan` state is
-published before the interrupt terminal. On a resumed request, the synchronized
-snapshot may be followed by RFC 6902 state deltas as the Plan moves through
-`approved` and publishes `effectiveMode=default` before native execution.
-
-Clients must not return the Form, labels, descriptions, or attributes. The Planning Graph
-restores the trusted checkpoint Form and derives selected option labels. The `answers`
-object must contain every checkpoint question ID exactly once and no unknown keys.
-Supplying fields for a different `answerType`, violating multiple-choice bounds, using an
-invalid date, skipping a required question, or using unknown option IDs fails before the
-Graph consumes the resume.
-
-The same `open_agui_run(resume=...)` flow handles Plan and Tool interrupts. It restores
-the trusted envelope and exact pending set from the canonical checkpoint; the Planning
-Graph validates the response contract and rejects a stale `baseRevision`. Use a new
-`runId` with the same `threadId` for every resume.
-
-A pending batch cannot mix Plan and Tool interrupts. A Tool review can still occur
-later, after Plan approval, and its original scoped Tool ID remains continuous across
-that later resume.
-
-Published Tool reviews carry `metadata.deepagents` with schema
-`tinkerfin.deepagents.tool-review`. The required fields are
-`nativeInterruptId`, `actionIndex`, `toolName`, `allowedDecisions`, and
-`originalArgs`. The high-level Runtime does not require the host to persist or resubmit
-that metadata: it restores and validates the native interrupt from the checkpointer.
-Direct Adapter integrations that maintain their own trusted event log can validate a
-complete published interrupt with `parse_tool_review_interrupt()`. Missing fields,
-unknown fields, an invalid decision, or disagreement with
-`metadata.langgraphValue` fails closed.
-
-Cancelling a Plan clarification or review abandons that Plan request without fabricating
-`reject`. A later ordinary input can use `mode="default"` on the same Plan-capable
-Definition and checkpoint thread. Changing the future mode never approves, rejects, or
-cancels a pending Tool/Filesystem review.
-
-## Resume entries from the frontend
-
-Each entry corresponds to one pending interrupt:
+Each decision identifies an interrupt from the terminal event. The request must cover every pending item in the batch:
 
 ```json
 {
@@ -99,110 +41,71 @@ Each entry corresponds to one pending interrupt:
 }
 ```
 
-| Field | Required | Purpose |
-| --- | --- | --- |
-| `interruptId` | yes | ID from the previous terminal event |
-| `status` | yes | `resolved` for a decision or `cancelled` to abandon it |
-| `payload` | no | Approval, edit, rejection, or response data |
+| Field | Purpose |
+| --- | --- |
+| `interruptId` | Interrupt ID published by the server |
+| `status` | `resolved` submits a decision; `cancelled` abandons it |
+| `payload` | A decision allowed by the interrupt response Schema; omitted for cancellation |
 
-The server should load the complete current pending set and require exact coverage. Never trust interrupt details resubmitted by the client as correlation evidence.
+The application owns authentication and approval permissions. Clients submit decisions, not trusted interrupt content, Tool correlation, or checkpoint coordinates.
 
-## Resume from the canonical checkpoint
-
-The ordinary host path carries only client decisions. The managed facade loads current
-pending interrupts, messages, lineage, and Runtime Profile from the same checkpointed
-thread:
+## Continue execution
 
 ```python
+from contextlib import aclosing
 from tinkerfin import AgUiResumeRequest
 
-
-events = await tinkerfin.open_agui_run(
-    resume_identity,
-    agent=agent,
+async with aclosing(runtime.open_agui_run(
+    thread_id="conversation-1",
+    run_id="approval-1",
     resume=AgUiResumeRequest(entries=tuple(resume_entries)),
-    parent_run_id=parent_run_id,
-    config=config,
-    on_resume_saved=record_checkpoint_idempotently,
-    on_resume_not_saved=release_unprepared_claim_idempotently,
-)
+)) as events:
+    async for event in events:
+        await send_event(event)
 ```
 
-`AgUiResumeRequest` rejects duplicate IDs and contains no server interrupt payload,
-native command, checkpoint identity, or Runtime Profile selection. Resolution requires
-exact pending coverage and proves Tool correlation from complete checkpoint messages.
-Unknown, stale, incomplete, or disallowed decisions fail before Graph continuation.
-The application still validates authorization, atomically claims the public pending set,
-and validates the complete HTTP request.
+The framework validates the pending review, Tool correlation, and decision coverage. Unknown IDs, incomplete coverage, stale sources, invalid payloads, and disallowed decisions fail before continuation.
 
-## Advanced Adapter resume inputs
-
-`prepare_agui_resume()` and `AgUiResumeBinding` remain advanced Definition-level
-boundaries for custom orchestration. An Adapter integration that already owns complete
-native checkpoint objects can use the lower-level mapper:
-
-```python
-translation = ResumeMapper().map(
-    entries=resume_entries,
-    interrupts=pending_interrupts,
-    messages_by_namespace=messages_by_namespace,
-)
-```
-
-Resolved reviews need complete messages for safe tool correlation. Do not match parallel or repeated tool names by arrival order.
-This is an Adapter-level inspection path; ordinary Runtime callers do not translate or
-pass a native command.
-
-If an advanced integration instead owns a trusted, complete AG-UI terminal event log,
-`AgUiResumeBinding.from_agui(entries=..., interrupts=...)` can validate those persisted
-public facts directly. It must never accept interrupt details resubmitted by a client,
-and it is not required by the standard Definition/Checkpointer flow.
-
-## Three resume modes
-
-| Mode | Meaning | Runtime action |
-| --- | --- | --- |
-| fully resolved | All entries map to native resume data | Checkpoint once and continue the Graph |
-| all cancelled | Every entry was abandoned | Emit a finite cancelled lifecycle without invoking the Graph |
-| mixed | Resolved and cancelled entries share a Tool batch | Execute resolved Tools and settle cancelled slots without executing them |
-
-Cancellation is never converted to rejection. In a mixed Tool batch, TinkerFin executes
-resolved calls and creates a deterministic, non-executed error `ToolMessage` for each
-cancelled call. Main, general-purpose, declarative subagents, and permission-generated
-reviews receive the same adapter. Mixed generic runtime interrupts are not Tool decisions
-and are rejected by `AgUiResumeBinding`.
-
-Before submitting the native decision, the selected Runtime Profile durably writes private
-lineage and marker values on the exact interrupted checkpoint. This does not run a Graph
-node or replace root, Planning, or subgraph pending work. The framework invokes
-`on_resume_saved` only after those writes are readable and before exposing the first
-resumed native event. A prepared retry receives the same `AgUiResumeCheckpoint` and invokes
-the idempotent callback again; a decision already accepted by the Graph is not resubmitted.
-Decision-only and `None` continuation inputs remain internal.
-
-If request resolution, staging, or stream startup fails or is cancelled before the marker
-is readable, the Runtime invokes `on_resume_not_saved` from retained settlement
-task. Hosts use this idempotent callback to release the claimed public interrupt set. The
-callback cannot run after prepared or accepted evidence exists; those retries continue
-through `on_resume_saved` instead.
-
-## Retry and concurrency
-
-- Use a new `runId` for the resume request and keep the same `threadId`;
-- atomically claim the complete pending set in application storage;
-- keep the exact client decision request stable across retries until checkpoint
-  settlement; do not reconstruct or accept interrupt metadata from the client;
-- resolve application approvals only from `on_resume_saved`, never from
-  `RUN_STARTED`;
-- preserve original tool IDs when results continue after resume.
-
-## Common errors
-
-| Error | Likely cause |
+| Decision set | Behavior |
 | --- | --- |
-| `AgUiResumeBindingError` | Unknown ID, incomplete coverage, disallowed decision, invalid Schema payload, or missing Tool evidence |
-| `ValueError` | Invalid input/resume selection, unsupported mixed runtime cancellation, or incomplete scoped Tool ID |
-| State cannot be resumed | Changed `RunIdentity.threadId` or missing checkpointer |
-| Action runs twice | Pending interrupts were not claimed atomically or retry data changed |
+| All `resolved` | Save the request and continue execution |
+| All `cancelled` | Abandon the request and emit a cancelled terminal without running the Graph |
+| Mixed Tool decisions | Execute resolved Tools and return unexecuted results for cancelled Tools |
 
-Next: [Use the converter directly](adapter-extensions.md).
+Cancellation does not become rejection. Mixed Tool decisions require TinkerFin approval support in the affected Tools. Plan and Tool approvals cannot share one batch.
+
+## Retries, concurrency, and callbacks
+
+- Give each new approval request a new `run_id`. Retry the original request with the same `run_id`, `thread_id`, and decisions.
+- Serialize writes within each namespace and thread. Use shared coordination or enforce this in the host, covering both Native and AG-UI calls.
+- Retries use the original approval batch. If a subagent reaches another review, an old request cannot approve the new question.
+- Completed parallel tasks stay complete; recovery submits only original decisions that have not been consumed.
+- External effects before an interrupt in the same Graph node still need idempotency. A checkpoint does not make external writes transactional.
+
+Applications that settle business approvals can provide two asynchronous callbacks:
+
+| Parameter | When it runs |
+| --- | --- |
+| `on_resume_saved` | The request is durably saved; receives `AgUiResumeCheckpoint`, delivered again on retry |
+| `on_resume_not_saved` | The request failed or was cancelled before being saved; releases an application claim |
+
+Both callbacks must be idempotent. `on_resume_saved` confirms request persistence, not Tool success. Do not settle approvals from `RUN_STARTED`.
+
+AG-UI does not accept a new review round when a custom Graph repeatedly interrupts within the same checkpoint/task. Put each round in a new Graph step. If another Native invocation leaves a global resume value, the framework rejects continuation to prevent it from answering an unapproved question.
+
+## Plan clarification and review
+
+Build the Runtime with `.with_plan(enabled=True)` and select `mode="plan"` for execution. Resume still uses `open_agui_run(resume=...)`:
+
+| Reason | Response requirements |
+| --- | --- |
+| `tinkerfin:plan_clarification` | `type="respond"` with `answers` covering every question ID and following each response Schema |
+| `tinkerfin:plan_review` | An allowed action with the current `baseRevision` |
+
+Plan interrupts have no `toolCallId`. Clients must not return Forms, labels, or other trusted form content; the framework restores them from the checkpoint. Unknown options, skipped required questions, and stale `baseRevision` values fail validation. After abandoning a Plan, a later ordinary input can use `mode="default"`.
+
+## Use the Adapter independently
+
+Integrations that own a complete trusted event log can call `AgUiResumeBinding.from_agui(entries=..., interrupts=...)`. Integrations that own native checkpoints can use `ResumeMapper.map()` with complete Tool messages and Graph locations. Ordinary Runtime callers do not translate native Commands.
+
+Next: [Use the converter directly](adapter-extensions.md)

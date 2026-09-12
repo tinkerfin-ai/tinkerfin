@@ -22,11 +22,11 @@ class TraceFactBase(TimedTraceModel):
 
     source_observation_id: str = Field(min_length=1, max_length=1024)
     identity: RunIdentity
-    namespace: tuple[str, ...] = ()
+    graph_namespace: tuple[str, ...] = ()
     in_subagent_scope: bool = Field(
         default=False,
         exclude_if=_omit_false,
-        description="Whether namespace is a proven Subagent execution scope",
+        description="Whether the graph namespace is a proven Subagent execution scope",
     )
 
 
@@ -42,7 +42,7 @@ class TurnFact(TraceFactBase):
 class RunFact(TraceFactBase):
     """Describe the root Runtime lifecycle without transport or Subagent state.
 
-    Run observations describe the whole invocation. Their namespace is always empty
+    Run observations describe the whole invocation. Their graph namespace is always empty
     and ``in_subagent_scope`` is false; child execution belongs to ``SubagentFact``.
     """
 
@@ -79,7 +79,7 @@ class RunFact(TraceFactBase):
     def phase_fields_are_consistent(self) -> RunFact:
         """Require the evidence needed to interpret each lifecycle phase."""
 
-        if self.namespace != () or self.in_subagent_scope is not False:
+        if self.graph_namespace != () or self.in_subagent_scope is not False:
             raise ValueError("Run lifecycle facts require the root scope")
         if self.phase == "started" and self.input_kind is None:
             raise ValueError("started Run facts require input_kind")
@@ -272,7 +272,7 @@ class SubagentFact(TraceFactBase):
     ``started`` requires ``running``; ``updated`` requires ``waiting``; ``completed``
     accepts ``succeeded``, ``failed``, ``cancelled``, or ``abandoned``. Only started
     facts carry ``input``, ``parent_tool_call_id``, ``parent_execution_id``, and
-    ``model_call_id``. Subsequent facts retain the same ``subagent_id`` and namespace
+    ``model_call_id``. Subsequent facts retain the same ``subagent_id`` and graph namespace
     while inherited opening evidence supplies their request and relationships.
     """
 

@@ -88,7 +88,7 @@ def resolve_agent_mode(
     *,
     options: PlanOptions | None,
 ) -> AgentMode:
-    """Resolve one request mode against immutable Definition capabilities."""
+    """Resolve the requested mode against the Runtime's configured capabilities."""
 
     if value is None:
         mode: AgentMode = "default" if options is None else options.default_mode
@@ -96,7 +96,7 @@ def resolve_agent_mode(
         mode = validate_agent_mode(value)
     if mode == "plan" and options is None:
         raise PlanModeConfigurationError(
-            "mode='plan' requires a Plan-capable Deep Agent Definition"
+            "mode='plan' requires a Plan-capable AgentRuntime"
         )
     return mode
 

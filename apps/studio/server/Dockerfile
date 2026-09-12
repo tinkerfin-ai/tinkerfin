@@ -33,7 +33,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM python-base
 LABEL org.opencontainers.image.title="TinkerFin Studio Server" \
-      org.opencontainers.image.source="https://github.com/tinkerfin-ai/tinkerfin"
+      org.opencontainers.image.source="https://github.com/tinkerfin-ai/tinkerfin-harness"
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
 RUN groupadd --gid 10001 tinkerfin \

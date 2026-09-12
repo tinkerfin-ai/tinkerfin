@@ -8,13 +8,14 @@ from sqlalchemy import event, inspect
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from tests.support.sql_engines import SqlEngineFactory
+from tests.support.sql_faults import after_sql_commit
 
 import tinkerfin_sandbox
 from tinkerfin_sandbox import (
     SQLAlchemyOpenSandboxState,
     get_sqlalchemy_opensandbox_state_schema,
 )
-from tinkerfin_sandbox.lifecycle._sql_transactions import _SQLDialectCapabilities
 
 
 def _ddl_statements(ddl: str) -> tuple[str, ...]:
@@ -77,10 +78,10 @@ async def _reset_and_apply_exported_schema(mysql_url: str) -> None:
 @pytest.mark.docker_integration
 @pytest.mark.mysql_integration
 async def test_mysql57_fallback_restores_borrowed_session_lock_wait(
-    mysql_sandbox_url: str,
+    mysql57_sandbox_url: str,
 ) -> None:
     engine = create_async_engine(
-        mysql_sandbox_url,
+        mysql57_sandbox_url,
         pool_size=2,
         max_overflow=0,
     )
@@ -103,11 +104,6 @@ async def test_mysql57_fallback_restores_borrowed_session_lock_wait(
             )
             await first_connection.rollback()
             await second_connection.rollback()
-        state._capabilities = _SQLDialectCapabilities(
-            name="mysql",
-            server_version=(5, 7, 44),
-            supports_skip_locked=False,
-        )
         claim = await state.acquire_owner("mysql57-owner")
         await state.release_owner(claim)
         await state.aclose()
@@ -162,10 +158,10 @@ async def _mysql_pool_lock_wait_values(engine: AsyncEngine) -> set[int]:
 @pytest.mark.docker_integration
 @pytest.mark.mysql_integration
 async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
-    mysql_sandbox_url: str,
+    mysql57_sandbox_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = create_async_engine(mysql_sandbox_url, pool_size=2, max_overflow=0)
+    engine = create_async_engine(mysql57_sandbox_url, pool_size=2, max_overflow=0)
     state = SQLAlchemyOpenSandboxState(
         engine=engine,
         namespace="integration-mysql57-settlement",
@@ -181,11 +177,6 @@ async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
                 "SET SESSION innodb_lock_wait_timeout = 37"
             )
             await connection.rollback()
-    state._capabilities = _SQLDialectCapabilities(
-        name="mysql",
-        server_version=(5, 7, 44),
-        supports_skip_locked=False,
-    )
     failure = RuntimeError("borrowed MySQL operation failed")
 
     async def fail_operation(_connection: AsyncConnection) -> Never:
@@ -218,35 +209,17 @@ async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
     assert await _mysql_pool_lock_wait_values(engine) == {37}
 
     original_ids = await _mysql_pool_connection_ids(engine)
-    state_type = type(state)
-    original_commit = state_type._commit_write_transaction
-    uncertainty = tinkerfin_sandbox.OpenSandboxStateCommitUncertainError(
-        "MySQL commit result unknown"
-    )
+    failure = OperationalError("COMMIT", None, RuntimeError("response lost"))
 
-    async def fail_commit(
-        _state: object,
-        _connection: AsyncConnection,
-        _disposition: object,
-    ) -> Never:
-        raise uncertainty
+    async def lose_acknowledgement() -> Never:
+        raise failure
 
-    async def no_op(_connection: AsyncConnection) -> None:
-        return None
-
-    monkeypatch.setattr(state_type, "_commit_write_transaction", fail_commit)
-    try:
+    with after_sql_commit(engine, lose_acknowledgement):
         with pytest.raises(
             tinkerfin_sandbox.OpenSandboxStateCommitUncertainError
         ) as captured_uncertainty:
-            await state._run_write_transaction(no_op)
-        assert captured_uncertainty.value is uncertainty
-    finally:
-        monkeypatch.setattr(
-            state_type,
-            "_commit_write_transaction",
-            original_commit,
-        )
+            await state.enqueue_cleanup("uncertain-target")
+    assert captured_uncertainty.value.cause is failure
     assert await _mysql_pool_connection_ids(engine) != original_ids
 
     await state.aclose()
@@ -256,21 +229,16 @@ async def test_mysql57_borrowed_settlement_restores_or_invalidates_session(
 @pytest.mark.docker_integration
 @pytest.mark.mysql_integration
 async def test_mysql57_cancelled_failed_commit_invalidates_without_warning(
-    mysql_sandbox_url: str,
+    mysql57_sandbox_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = create_async_engine(mysql_sandbox_url, pool_size=2, max_overflow=0)
+    engine = create_async_engine(mysql57_sandbox_url, pool_size=2, max_overflow=0)
     state = SQLAlchemyOpenSandboxState(
         engine=engine,
         namespace="integration-mysql57-cancelled-commit",
         poll_interval=0.01,
     )
     await state.start(warm_pool_size=0)
-    state._capabilities = _SQLDialectCapabilities(
-        name="mysql",
-        server_version=(5, 7, 44),
-        supports_skip_locked=False,
-    )
     original_ids = await _mysql_pool_connection_ids(engine)
     commit_entered = asyncio.Event()
     release_commit = asyncio.Event()
@@ -326,19 +294,21 @@ async def test_mysql57_cancelled_failed_commit_invalidates_without_warning(
 
 @pytest.mark.mysql_integration
 async def test_mysql8_export_and_runtime_claims_are_compatible(
+    sql_engine: SqlEngineFactory,
     mysql_sandbox_url: str,
 ) -> None:
     await _reset_and_apply_exported_schema(mysql_sandbox_url)
     observed_sql: list[str] = []
+    owner_queried = asyncio.Event()
     first = SQLAlchemyOpenSandboxState(
-        url=mysql_sandbox_url,
+        engine=sql_engine(mysql_sandbox_url),
         namespace="integration-mysql8",
         lease_ttl=1.0,
         poll_interval=0.01,
         sqlite_retry_timeout=0,
     )
     second = SQLAlchemyOpenSandboxState(
-        url=mysql_sandbox_url,
+        engine=sql_engine(mysql_sandbox_url),
         namespace="integration-mysql8",
         lease_ttl=1.0,
         poll_interval=0.01,
@@ -355,6 +325,11 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
     ) -> None:
         del connection, cursor, parameters, context, executemany
         observed_sql.append(statement.upper())
+        if (
+            statement.startswith("SELECT")
+            and "tinkerfin_opensandbox_owners" in statement
+        ):
+            owner_queried.set()
 
     event.listen(first._engine.sync_engine, "before_cursor_execute", capture_sql)
     event.listen(second._engine.sync_engine, "before_cursor_execute", capture_sql)
@@ -365,11 +340,12 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
         )
         capabilities = first._require_capabilities()
         assert capabilities.server_version[:2] == (8, 4)
-        assert capabilities.supports_skip_locked is True
+        assert capabilities.skip_locked is True
 
         initial_owner = await first.acquire_owner("serialized-owner")
+        owner_queried.clear()
         waiting_owner = asyncio.create_task(second.acquire_owner("serialized-owner"))
-        await asyncio.sleep(0.05)
+        await owner_queried.wait()
         assert not waiting_owner.done()
         await first.release_owner(initial_owner)
         successor_owner = await asyncio.wait_for(waiting_owner, timeout=2)
@@ -440,7 +416,10 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
         assert stale_warm is not None
         assert other_stale_warm is not None
         assert stale_warm.slot != other_stale_warm.slot
-        await asyncio.sleep(1.7)
+        async with first._engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "UPDATE tinkerfin_opensandbox_warm_slots SET lease_expires_at = '2000-01-01 00:00:00'"
+            )
         replacement_warm = await second.claim_warm_slot()
         assert replacement_warm is not None
         assert replacement_warm.slot == min(stale_warm.slot, other_stale_warm.slot)
@@ -457,7 +436,10 @@ async def test_mysql8_export_and_runtime_claims_are_compatible(
         await first.enqueue_cleanup("cleanup-expiring")
         stale_cleanup = await first.claim_cleanup()
         assert stale_cleanup is not None
-        await asyncio.sleep(1.7)
+        async with first._engine.begin() as connection:
+            await connection.exec_driver_sql(
+                "UPDATE tinkerfin_opensandbox_cleanup SET lease_expires_at = '2000-01-01 00:00:00'"
+            )
         replacement_cleanup = await second.claim_cleanup()
         assert replacement_cleanup is not None
         assert replacement_cleanup.sandbox_id == stale_cleanup.sandbox_id

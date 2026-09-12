@@ -1,12 +1,12 @@
 {
   "agentName": "researcher",
   "description": "Research the requested topic",
-  "graphTaskId": "graph-task",
-  "namespace": [
+  "graphNamespace": [
     "tools:parent",
     "tools:graph-task"
   ],
-  "parentNamespace": [
+  "graphTaskId": "graph-task",
+  "parentGraphNamespace": [
     "tools:parent"
   ],
   "parentToolCallId": "tf:tool:W1sidG9vbHM6cGFyZW50Il0sImNhbGwtdGFzayJd",

@@ -7,7 +7,6 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Awaitable
 from dataclasses import FrozenInstanceError, fields
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.resources import files
@@ -19,6 +18,7 @@ from ag_ui.core import BaseEvent
 
 import tinkerfin_messaging
 import tinkerfin_messaging.backend as backend_module
+import tinkerfin_messaging.backend_contract as backend_contract
 import tinkerfin_messaging.messaging as messaging_module
 import tinkerfin_messaging.redis as redis_module
 from tinkerfin_contracts import RunIdentity
@@ -41,7 +41,7 @@ def test_backend_protocol_documents_storage_extension_contracts(
 ) -> None:
     """Keep atomicity, results, failures, and ownership next to each operation."""
 
-    method = getattr(tinkerfin_messaging.MessagingBackend, method_name)
+    method = getattr(backend_contract.MessagingBackend, method_name)
     documentation = inspect.getdoc(method)
 
     assert documentation is not None
@@ -53,7 +53,7 @@ def test_backend_protocol_documents_storage_extension_contracts(
 def test_backend_protocol_exposes_exactly_six_descriptive_operations() -> None:
     operations = {
         name
-        for name, value in inspect.getmembers(tinkerfin_messaging.MessagingBackend)
+        for name, value in inspect.getmembers(backend_contract.MessagingBackend)
         if inspect.isfunction(value) and not name.startswith("_")
     }
 
@@ -67,7 +67,7 @@ def test_backend_protocol_exposes_exactly_six_descriptive_operations() -> None:
     }
     settings_doc = inspect.getdoc(
         inspect.getattr_static(
-            tinkerfin_messaging.MessagingBackend,
+            backend_contract.MessagingBackend,
             "messaging_settings",
         )
     )
@@ -106,7 +106,7 @@ def test_removed_backend_handle_shapes_are_not_importable() -> None:
     ],
 )
 def test_backend_extension_values_document_every_attribute(type_name: str) -> None:
-    extension_type = getattr(tinkerfin_messaging, type_name)
+    extension_type = getattr(backend_contract, type_name)
     documentation = inspect.getdoc(extension_type)
 
     assert documentation is not None
@@ -131,7 +131,7 @@ def test_backend_operations_document_non_obvious_extension_requirements(
     required_terms: tuple[str, ...],
 ) -> None:
     documentation = inspect.getdoc(
-        getattr(tinkerfin_messaging.MessagingBackend, method_name)
+        getattr(backend_contract.MessagingBackend, method_name)
     )
 
     assert documentation is not None
@@ -146,7 +146,7 @@ def test_backend_operations_document_non_obvious_extension_requirements(
 def test_backend_extension_functions_document_complete_contracts(
     function_name: str,
 ) -> None:
-    documentation = inspect.getdoc(getattr(tinkerfin_messaging, function_name))
+    documentation = inspect.getdoc(getattr(backend_contract, function_name))
 
     assert documentation is not None
     assert "Args:" in documentation
@@ -169,54 +169,90 @@ def test_package_source_comments_and_docstrings_remain_english() -> None:
 
 
 def test_public_namespace_exposes_the_default_tinkerfin_facade() -> None:
-    required = {
-        "CancelCallback",
+    expected = {
         "AgUiCodec",
         "ActiveRunStatus",
+        "BackendOwnershipLost",
+        "CancelCallback",
         "CancelContext",
         "CancellableMessageSource",
+        "CancellationUnsupported",
+        "CodecMismatch",
+        "CommittedCallback",
+        "DecodedMessage",
         "DeferredMessageSource",
         "FailedRunStatus",
         "FinalRunStatus",
+        "FiniteMessageSource",
+        "InvalidCursor",
         "MemoryBackend",
         "MessageChannel",
         "MessageCodec",
         "MessageCodecInputSource",
         "MessageEnvelope",
+        "MessageIdConflict",
+        "MessagePublicationPolicy",
         "MessageSource",
         "MessageSourceBinding",
         "MessageSubscription",
         "Messaging",
-        "MessagingBackend",
-        "MessagingBackendSettings",
-        "MessagingChangeWait",
-        "MessagingStateQuery",
-        "MessagingStateSnapshot",
-        "MessagingStorageEffect",
-        "MessagingTransition",
-        "MessagingTransitionKind",
-        "MessagingTransitionResult",
+        "MessagingBackendError",
+        "MessagingBackendProtocolError",
+        "MessagingBackendTimeout",
+        "MessagingBackendUnavailable",
+        "MessagingClosed",
+        "MessagingError",
+        "MessagingErrorCode",
+        "MessagingLimits",
+        "MessagingNotStarted",
+        "MessagingQuotaExceeded",
+        "MessagingRetentionPolicy",
         "MessagingSettlementTimeout",
         "NativeStreamPart",
         "NativeStreamPartCodec",
-        "ProfiledMessageSource",
         "ProfiledDeferredMessageSource",
+        "ProfiledMessageSource",
+        "PublicationRejected",
+        "RecoverableMessage",
+        "RecoverableSource",
+        "RecoveryCheckpoint",
+        "RecoveryUnsupported",
         "RedisBackend",
+        "RunAlreadyActive",
+        "RunNotFound",
+        "RunProducerFailed",
+        "RunStatus",
+        "SqlAlchemyBackend",
         "SourceProfileMismatch",
         "SseRenderer",
+        "SseRenderingUnsupported",
+        "StreamDeleteConflict",
+        "StreamDeleted",
+        "StreamExpired",
+        "UnexpectedMessagingBackendError",
         "create_agui_run_source",
         "is_active_run_status",
         "is_failed_run_status",
         "is_final_run_status",
+        "map_source",
         "parse_sse_event_id",
-        "resolve_messaging_transition",
     }
 
-    assert required <= set(tinkerfin_messaging.__all__)
-    assert all(hasattr(tinkerfin_messaging, name) for name in required)
+    assert set(tinkerfin_messaging.__all__) == expected
+    assert all(hasattr(tinkerfin_messaging, name) for name in expected)
 
 
-def test_agui_run_source_hides_its_deferred_implementation_type() -> None:
+def test_backend_extension_contract_is_exposed_only_from_its_module() -> None:
+    extension_names = set(backend_contract.__all__)
+
+    assert "MessagingBackend" in extension_names
+    assert "resolve_messaging_transition" in extension_names
+    assert extension_names.isdisjoint(tinkerfin_messaging.__all__)
+    assert all(not hasattr(tinkerfin_messaging, name) for name in extension_names)
+    assert all(hasattr(backend_contract, name) for name in extension_names)
+
+
+def test_agui_run_source_returns_the_public_profiled_source_contract() -> None:
     from tinkerfin_messaging.agui import create_agui_run_source
 
     return_type = get_type_hints(create_agui_run_source)["return"]
@@ -224,33 +260,32 @@ def test_agui_run_source_hides_its_deferred_implementation_type() -> None:
     assert get_origin(return_type) is tinkerfin_messaging.ProfiledMessageSource
 
 
-def test_agui_run_source_requires_an_event_message_source_opener() -> None:
+def test_agui_run_source_requires_a_profiled_event_source() -> None:
     from tinkerfin_messaging.agui import create_agui_run_source
 
-    open_events_type = get_type_hints(create_agui_run_source)["open_events"]
-    parameters, result = get_args(open_events_type)
-    source_type = get_args(result)[0]
-
-    assert parameters == [RunIdentity]
-    assert get_origin(result) is Awaitable
-    assert get_origin(source_type) is tinkerfin_messaging.MessageSource
-    assert get_args(source_type) == (BaseEvent,)
+    source_type = get_type_hints(create_agui_run_source)["source"]
+    assert get_origin(source_type) is tinkerfin_messaging.ProfiledMessageSource
+    assert get_args(source_type) == (BaseEvent, BaseEvent)
 
 
 def test_cancel_context_is_an_immutable_public_value() -> None:
     context = tinkerfin_messaging.CancelContext(
         channel="events",
-        identity=RunIdentity(threadId="conversation-1", runId="run-1"),
+        identity=RunIdentity(
+            namespace="test", thread_id="conversation-1", run_id="run-1"
+        ),
     )
 
     assert (context.channel, context.identity) == (
         "events",
-        RunIdentity(threadId="conversation-1", runId="run-1"),
+        RunIdentity(namespace="test", thread_id="conversation-1", run_id="run-1"),
     )
     with pytest.raises(FrozenInstanceError):
         context.__setattr__(
             "identity",
-            RunIdentity(threadId="conversation-1", runId="replacement"),
+            RunIdentity(
+                namespace="test", thread_id="conversation-1", run_id="replacement"
+            ),
         )
 
 
@@ -290,7 +325,7 @@ def test_distribution_declares_only_protocol_neutral_core_dependencies() -> None
 
     requirements = set(metadata.requires or ())
     assert "pydantic<3,>=2" in requirements
-    assert "tinkerfin-contracts<0.9.0,>=0.1.0" in requirements
+    assert "tinkerfin-contracts==0.1.0" in requirements
     assert not any(
         "extra ==" not in value and "ag-ui-protocol" in value for value in requirements
     )
@@ -306,7 +341,7 @@ def test_distribution_declares_redis_agui_and_native_extras() -> None:
 
     assert 'redis<9,>=6; extra == "redis"' in requirements
     assert 'ag-ui-protocol==0.1.19; extra == "agui"' in requirements
-    assert 'tinkerfin-native-stream<0.9.0,>=0.1.0; extra == "native"' in requirements
+    assert 'tinkerfin-native-stream==0.1.0; extra == "native"' in requirements
     assert not any(
         'extra == "native"' in value and value.startswith("tinkerfin<")
         for value in requirements
@@ -320,6 +355,8 @@ def test_distribution_declares_redis_agui_and_native_extras() -> None:
         ("create_agui_run_source", ("ag_ui",), "agui"),
         ("NativeStreamPartCodec", ("tinkerfin_native_stream",), "native"),
         ("RedisBackend", ("redis",), "redis"),
+        ("SqlAlchemyBackend", ("sqlalchemy",), "sqlalchemy"),
+        ("SqlAlchemyBackend", ("tinkerfin_sqlalchemy",), "sqlalchemy"),
     ),
 )
 def test_missing_optional_dependency_reports_the_install_command(

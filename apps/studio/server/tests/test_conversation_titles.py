@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import create_autospec
 
 import pytest
+from langchain_core.language_models import BaseChatModel
 
 from tinkerfin_studio.conversation.repository import ConversationRepository
 from tinkerfin_studio.conversation.schemas import ConversationTitle
+from tinkerfin_studio.conversation.titles import summarize_conversation_title
 from tinkerfin_studio.infrastructure.database import Database
 
 
@@ -17,6 +20,73 @@ async def create_thread(database: Database):
         )
         await repository.commit()
         return thread.id
+
+
+@pytest.mark.parametrize("phase", ["claim", "settlement"])
+async def test_title_repeated_cancellation_finishes_committed_claim(
+    database, monkeypatch, phase: str
+) -> None:
+    thread_pk = await create_thread(database)
+    claim_entered, model_entered, finish_entered, release = (
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+        asyncio.Event(),
+    )
+    original_claim = ConversationRepository.claim_title
+    original_finish = ConversationRepository.finish_title
+    claims = []
+
+    async def claim(repository, thread_pk):
+        claims.append(asyncio.current_task())
+        claim_entered.set()
+        if phase == "claim":
+            await release.wait()
+        return await original_claim(repository, thread_pk)
+
+    async def finish(repository, thread_pk, title):
+        finish_entered.set()
+        if phase == "settlement":
+            await release.wait()
+        return await original_finish(repository, thread_pk, title)
+
+    async def invoke(*_args: object, **_kwargs: object) -> None:
+        model_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ConversationRepository, "claim_title", claim)
+    monkeypatch.setattr(ConversationRepository, "finish_title", finish)
+    model = create_autospec(BaseChatModel, instance=True)
+    model.ainvoke.side_effect = invoke
+    request = asyncio.create_task(
+        summarize_conversation_title(
+            database=database, thread_pk=thread_pk, text="测试标题", model=model
+        )
+    )
+    await (claim_entered if phase == "claim" else model_entered).wait()
+    request.cancel("首次取消")
+    if phase == "settlement":
+        await finish_entered.wait()
+    delivered = asyncio.Event()
+    asyncio.get_running_loop().call_soon(delivered.set)
+    await delivered.wait()
+    request.cancel("重复取消")
+    checked = asyncio.Event()
+    asyncio.get_running_loop().call_soon(checked.set)
+    await checked.wait()
+    premature = request.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    await asyncio.gather(
+        *(task for task in claims if task is not None), return_exceptions=True
+    )
+    assert not premature
+    assert finish_entered.is_set()
+    async with database.session() as session:
+        thread = await ConversationRepository(session).get_thread_by_pk(thread_pk)
+        assert thread is not None
+        assert thread.title_generation_status == "failed"
 
 
 @pytest.mark.parametrize("source", ["user", "generated", "unknown"])

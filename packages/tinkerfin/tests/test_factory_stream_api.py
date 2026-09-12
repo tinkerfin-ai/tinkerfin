@@ -9,11 +9,11 @@ from ag_ui.core import BaseEvent
 from langchain.agents.middleware.types import InputAgentState
 from langgraph.graph.state import CompiledStateGraph
 
-from tinkerfin import DeepAgentDefinition, RunIdentity
+from tinkerfin import AgentRuntime, RunIdentity
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 def _graph_input() -> InputAgentState:
@@ -41,7 +41,7 @@ setattr(
 
 @pytest.mark.asyncio
 async def test_native_facade_binds_one_lazy_graph_source(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     calls = 0
     closed = False
@@ -64,11 +64,13 @@ async def test_native_facade_binds_one_lazy_graph_source(
     async def on_part(value: object) -> None:
         observed.append(value)
 
-    runtime = definition_factory(_SourceGraph(source)).new(
-        identity=_identity(),
-        on_part=on_part,
+    runtime = definition_factory(_SourceGraph(source))
+    stream = runtime.open_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
+        on_native_part=on_part,
+        input=_graph_input(),
     )
-    stream = runtime.astream(_graph_input())
 
     assert calls == 0
     assert await anext(stream) is part
@@ -80,24 +82,27 @@ async def test_native_facade_binds_one_lazy_graph_source(
     assert closed is True
 
 
-def test_native_facade_allows_exactly_one_stream_claim(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+@pytest.mark.asyncio
+async def test_native_run_allows_one_consumer_claim(
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
-        if False:  # pragma: no cover - provides the source shape only
+        if False:
             yield None
 
-    runtime = definition_factory(_SourceGraph(source)).new(identity=_identity())
-
-    runtime.astream(_graph_input())
-
-    with pytest.raises(RuntimeError, match="one object stream"):
-        runtime.astream(_graph_input())
+    runtime = definition_factory(_SourceGraph(source))
+    stream = runtime.open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_graph_input()
+    )
+    assert aiter(stream) is stream
+    with pytest.raises(RuntimeError, match="only be consumed once"):
+        aiter(stream)
+    await stream.aclose()
 
 
 @pytest.mark.asyncio
 async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     async def source() -> AsyncIterator[object]:
         yield {
@@ -112,11 +117,13 @@ async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
     async def on_event(event: BaseEvent) -> None:
         observed.append(event)
 
-    runtime = definition_factory(_SourceGraph(source)).new_agui(
-        identity=_identity(),
-        on_event=on_event,
+    runtime = definition_factory(_SourceGraph(source))
+    events = runtime.open_agui_run(
+        thread_id=_identity().thread_id,
+        run_id=_identity().run_id,
+        on_agui_event=on_event,
+        input=_graph_input(),
     )
-    events = runtime.astream(_graph_input())
     delivered = [event async for event in events]
 
     assert [event.type.value for event in delivered] == [
@@ -129,15 +136,13 @@ async def test_astream_agui_converts_the_bound_factory_without_a_parts_argument(
 
 @pytest.mark.asyncio
 async def test_native_facade_rejects_a_graph_result_without_async_iteration(
-    definition_factory: Callable[..., DeepAgentDefinition[None]],
+    definition_factory: Callable[..., AgentRuntime[None]],
 ) -> None:
     def source() -> AsyncIterator[object]:
         return cast(AsyncIterator[object], object())
 
-    stream = (
-        definition_factory(_SourceGraph(source))
-        .new(identity=_identity())
-        .astream(_graph_input())
+    stream = definition_factory(_SourceGraph(source)).open_run(
+        thread_id=_identity().thread_id, run_id=_identity().run_id, input=_graph_input()
     )
 
     with pytest.raises(

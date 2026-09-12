@@ -1,17 +1,23 @@
-"""Saver-neutral private state for canonical AG-UI checkpoint lineage."""
+"""Canonical checkpoint ownership issued by managed Graph invocation boundaries."""
 
 from __future__ import annotations
 
+import json
 from typing import Literal, TypeAlias, cast
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tinkerfin_contracts import RunIdentity
 
-LINEAGE_STATE_KEY = "_tinkerfin_lineage"
-RESUME_MARKER_STATE_KEY = "_tinkerfin_resume"
+LINEAGE_CONFIG_KEY = "__tinkerfin_checkpoint_lineage"
+LINEAGE_METADATA_KEY = "_tinkerfin_lineage"
+RESUME_METADATA_KEY = "_tinkerfin_resume"
+RESUME_CONFIG_KEY = "__tinkerfin_resume_intent"
+RESUME_WRITE_OWNER = "tinkerfin-resume-intent"
 PLANNING_CHECKPOINT_RUN_ID = "tinkerfin-plan"
 RUN_ID_METADATA_KEY = "_tinkerfin_run_id"
+NAMESPACE_METADATA_KEY = "_tinkerfin_namespace"
 CHECKPOINT_ROLE_METADATA_KEY = "_tinkerfin_checkpoint_role"
 PARENT_RUN_ID_METADATA_KEY = "_tinkerfin_parent_run_id"
 RUNTIME_PROFILE_METADATA_KEY = "_tinkerfin_runtime_profile"
@@ -21,115 +27,142 @@ PLANNING_CHECKPOINT_ROLE = "planning"
 LineageRole: TypeAlias = Literal["native", "planning"]
 
 
-def _to_camel(value: str) -> str:
-    words = value.split("_")
-    return "".join(
-        word if index == 0 else word.capitalize() for index, word in enumerate(words)
-    )
+class LineageMarker(RunIdentity):
+    """Persist the full managed run identity and role without exposing Graph state."""
 
-
-class LineageMarker(BaseModel):
-    """Persist one semantic run and graph role across checkpoint savers."""
-
-    model_config = ConfigDict(
-        alias_generator=_to_camel,
-        populate_by_name=True,
-        extra="forbid",
-        frozen=True,
-        strict=True,
-    )
-
-    thread_id: str = Field(min_length=1)
-    run_id: str = Field(min_length=1)
     parent_run_id: str | None = Field(default=None, min_length=1)
     runtime_profile: str = Field(min_length=1)
     role: LineageRole
 
-    @field_validator("thread_id", "run_id", "parent_run_id", "runtime_profile")
+    @field_validator("parent_run_id", "runtime_profile")
     @classmethod
-    def identifiers_are_canonical(cls, value: str | None) -> str | None:
+    def lineage_identifiers_are_canonical(cls, value: str | None) -> str | None:
         """Reject identifiers that cannot produce stable lineage evidence."""
 
         if value is not None and value != value.strip():
             raise ValueError("lineage marker identifiers must be canonical")
         return value
 
+    def canonical_json(self) -> str:
+        """Return stable JSON for exact checkpoint ownership comparisons."""
 
-def lineage_marker(
-    *,
-    identity: RunIdentity,
-    parent_run_id: str | None,
-    runtime_profile: str,
-    role: LineageRole,
-) -> LineageMarker:
-    """Build the private marker for one canonical Graph invocation."""
-
-    return LineageMarker(
-        thread_id=identity.thread_id,
-        run_id=identity.run_id,
-        parent_run_id=parent_run_id,
-        runtime_profile=runtime_profile,
-        role=role,
-    )
-
-
-def lineage_state_update(
-    *,
-    identity: RunIdentity,
-    parent_run_id: str | None,
-    runtime_profile: str,
-    role: LineageRole,
-) -> dict[str, dict[str, JsonValue]]:
-    """Return one JSON-safe private state update for a Graph input."""
-
-    marker = lineage_marker(
-        identity=identity,
-        parent_run_id=parent_run_id,
-        runtime_profile=runtime_profile,
-        role=role,
-    )
-    return {
-        LINEAGE_STATE_KEY: cast(
-            dict[str, JsonValue],
-            marker.model_dump(mode="json", by_alias=True, exclude_none=False),
+        return json.dumps(
+            self.model_dump(mode="json", by_alias=True),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
         )
-    }
 
 
-def parse_lineage_marker(value: object) -> LineageMarker:
-    """Validate one persisted private lineage marker without coercion."""
+class ResumeAnchor(BaseModel):
+    """Keep one approval's original task, payload, and Tool-call correlation.
 
-    return LineageMarker.model_validate(value)
+    Dynamic children can advance while their dispatch checkpoint stays paused.
+    Retrying a request must therefore read these immutable facts instead of the
+    child's latest interrupt or messages. Only matched Tool calls are retained.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    source: LineageMarker
+    graph_namespace: str
+    checkpoint_id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    interrupt_id: str = Field(min_length=1)
+    interrupt_json: str
+    tool_calls_json: str
+    cancellation_supported: bool
 
 
-def lineage_marker_with_role(
-    value: object,
-    *,
-    role: LineageRole,
-) -> dict[str, JsonValue]:
-    """Copy a validated marker while changing only its graph role."""
+class ResumeIntent(LineageMarker):
+    """Validated private checkpoint evidence for one saver-readable resume intent."""
 
-    marker = parse_lineage_marker(value).model_copy(update={"role": role})
-    return cast(
-        dict[str, JsonValue],
-        marker.model_dump(mode="json", by_alias=True, exclude_none=False),
+    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    role: LineageRole = Field(
+        description="Graph role of the interrupted source checkpoint"
     )
+    source_checkpoint_id: str = Field(min_length=1)
+    source_checkpoint_ns: str
+    native_interrupt_ids: tuple[str, ...] = Field(min_length=1)
+    anchors: tuple[ResumeAnchor, ...] = Field(min_length=1)
+    storage_checkpoint_id: str = Field(min_length=1)
+    storage_checkpoint_ns: str
+    decisions_json: str
+
+    @field_validator("native_interrupt_ids", "anchors", mode="before")
+    @classmethod
+    def sequences_are_json_arrays(cls, value: object) -> object:
+        """Normalize JSON arrays before strict tuple validation."""
+
+        if isinstance(value, list):
+            return tuple(cast(list[object], value))
+        return value
+
+    @model_validator(mode="after")
+    def interrupt_ids_are_canonical(self) -> ResumeIntent:
+        """Require a stable unique native interrupt set."""
+
+        values = self.native_interrupt_ids
+        if any(not value or value != value.strip() for value in values):
+            raise ValueError("native interrupt IDs must be canonical strings")
+        if len(set(values)) != len(values):
+            raise ValueError("native interrupt IDs must be unique")
+        if tuple(anchor.interrupt_id for anchor in self.anchors) != values:
+            raise ValueError("resume anchors must cover the complete ordered batch")
+        if any(
+            anchor.source.thread != self.thread
+            or anchor.source.runtime_profile != self.runtime_profile
+            for anchor in self.anchors
+        ):
+            raise ValueError("resume anchors have conflicting thread or Profile")
+        if not any(
+            anchor.checkpoint_id == self.storage_checkpoint_id
+            and anchor.graph_namespace == self.storage_checkpoint_ns
+            for anchor in self.anchors
+        ):
+            raise ValueError("resume storage must be an actual approval checkpoint")
+        return self
 
 
-__all__ = [
-    "CHECKPOINT_ROLE_METADATA_KEY",
-    "LINEAGE_STATE_KEY",
-    "NATIVE_CHECKPOINT_ROLE",
-    "PARENT_RUN_ID_METADATA_KEY",
-    "PLANNING_CHECKPOINT_ROLE",
-    "PLANNING_CHECKPOINT_RUN_ID",
-    "RESUME_MARKER_STATE_KEY",
-    "RUNTIME_PROFILE_METADATA_KEY",
-    "RUN_ID_METADATA_KEY",
-    "LineageMarker",
-    "LineageRole",
-    "lineage_marker",
-    "lineage_marker_with_role",
-    "lineage_state_update",
-    "parse_lineage_marker",
-]
+def bind_checkpoint_run(
+    config: RunnableConfig,
+    *,
+    identity: RunIdentity,
+    parent_run_id: str | None,
+    runtime_profile: str,
+) -> RunnableConfig:
+    """Issue typed run ownership at the managed execution boundary.
+
+    Ordinary metadata and model state never authorize checkpoint ownership. LangGraph
+    preserves this Python value in execution config, while get_checkpoint_metadata
+    excludes its private key. The scoped saver serializes the authoritative evidence.
+
+    Args:
+        config: Execution configuration whose containers remain unchanged.
+        identity: Complete logical identity of this managed invocation.
+        parent_run_id: Optional source Run in the same thread.
+        runtime_profile: Integration that owns the invocation's checkpoint semantics.
+
+    Returns:
+        Copied configuration containing this invocation's typed ownership.
+    """
+
+    options = dict(config.get("configurable", {}))
+    options.pop(RESUME_CONFIG_KEY, None)
+    return {
+        **config,
+        "configurable": {
+            **options,
+            NAMESPACE_METADATA_KEY: identity.namespace,
+            RUN_ID_METADATA_KEY: identity.run_id,
+            RUNTIME_PROFILE_METADATA_KEY: runtime_profile,
+            LINEAGE_CONFIG_KEY: LineageMarker(
+                namespace=identity.namespace,
+                thread_id=identity.thread_id,
+                run_id=identity.run_id,
+                parent_run_id=parent_run_id,
+                runtime_profile=runtime_profile,
+                role="native",
+            ),
+        },
+    }

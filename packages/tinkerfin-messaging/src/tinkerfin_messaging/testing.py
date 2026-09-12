@@ -85,8 +85,9 @@ async def verify_messaging_backend(
         async with Messaging(backend=backend) as messaging:
             channel = messaging.channel(name="verification-events", codec=codec)
             completed_identity = RunIdentity(
-                threadId=thread_id,
-                runId="completed-run",
+                namespace="messaging-verification",
+                thread_id=thread_id,
+                run_id="completed-run",
             )
             completed = await channel.wrap(
                 FiniteMessageSource[str].from_events(("first", "second")),
@@ -120,8 +121,9 @@ async def verify_messaging_backend(
             )
 
             cancellable_identity = RunIdentity(
-                threadId=thread_id,
-                runId="cancelled-run",
+                namespace="messaging-verification",
+                thread_id=thread_id,
+                run_id="cancelled-run",
             )
             source = _VerificationCancellableSource()
 
@@ -154,8 +156,9 @@ async def verify_messaging_backend(
 
             await channel.delete_stream(identity=cancellable_identity)
             replacement_identity = RunIdentity(
-                threadId=thread_id,
-                runId="replacement-run",
+                namespace="messaging-verification",
+                thread_id=thread_id,
+                run_id="replacement-run",
             )
             replacement = await channel.wrap(
                 FiniteMessageSource[str].from_events(("replacement",)),

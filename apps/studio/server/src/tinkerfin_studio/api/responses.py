@@ -36,10 +36,9 @@ def sse_response(body: AsyncIterator[str | bytes]) -> StreamingResponse:
 def trace_sse_response(
     events: AsyncGenerator[BaseModel, None],
 ) -> StreamingResponse:
-    """以原生事件流编码 Trace，并在结束或断连时关闭上游
+    """将 Trace 业务事件编码为 SSE 响应
 
-    长等待必须来自 Trace 查询返回的可关闭 follower。该 follower 已拥有取消和数据库清理；
-    此处只承担 Studio 的事件名称、JSON 编码与 HTTP 响应策略。
+    事件流来自 Trace 查询；响应使用 Studio 的事件名称、JSON 编码和 HTTP 配置。
 
     Args:
         events: 基于 Trace follower 生成的单次消费业务事件流

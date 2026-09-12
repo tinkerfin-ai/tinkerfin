@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import AsyncGenerator, Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from types import TracebackType
-from typing import Any, Generic, Self, TypeVar
+from typing import Any, Generic, Self
 
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.filesystem import FilesystemPermission
 from langchain.agents.middleware import AgentMiddleware
+from typing_extensions import TypeVar
+
+from tinkerfin_contracts import Workspace
 
 from ..backends.handle import OpenSandboxHandle
+from ..backends.rooted import RootedOpenSandboxBackend
 from ..backends.sdk import OpenSandboxBackend
 from ..errors import (
     OpenSandboxBackendUnavailableError,
@@ -30,13 +34,13 @@ from ..errors import (
 )
 from ..models import OpenSandboxDetails, OpenSandboxDiagnosticContent
 from . import _manager_bindings, _manager_resources
+from ._identity import SandboxResourceIdentity
 from ._manager_availability import _SandboxAvailability
 from ._manager_bindings import _BindingResolution
 from ._manager_resources import (
     _BackendAcquisition,
     _HealthBackend,
     _ManagedBackend,
-    _owner_key,
 )
 from ._notifications import _LifecycleNotifications
 from ._protocols import _SandboxClient, _SandboxClientBoundary
@@ -53,7 +57,7 @@ from .state import (
     _OpenSandboxStateBoundary,
 )
 
-KeyT = TypeVar("KeyT")
+KeyT = TypeVar("KeyT", default=str)
 
 
 class OpenSandboxManager(Generic[KeyT]):
@@ -78,7 +82,7 @@ class OpenSandboxManager(Generic[KeyT]):
         self,
         *,
         client: _SandboxClient,
-        key_resolver: Callable[[KeyT], str],
+        key_resolver: Callable[[KeyT], str] | None = None,
         state: OpenSandboxState | None = None,
         warm_pool_size: int | None = None,
         fail_on_startup_warmup_error: bool = False,
@@ -93,7 +97,7 @@ class OpenSandboxManager(Generic[KeyT]):
             client: Asynchronous creation and lifecycle client owned and closed by
                 this manager.
             key_resolver: Convert an opaque application key into a stable non-blank
-                owner key used by lifecycle State.
+                owner key used by lifecycle State. Omit it for string keys.
             state: Atomic allocation, warm-pool, and cleanup state owned and closed
                 by this manager. Omit it to use process-local memory.
             warm_pool_size: Target number of unbound ready Sandboxes. ``None`` uses
@@ -125,7 +129,7 @@ class OpenSandboxManager(Generic[KeyT]):
             raise TypeError("warm_pool_size must be an integer or None")
         if resolved_warm_size < 0:
             raise ValueError("warm_pool_size must not be negative")
-        if not callable(key_resolver):
+        if key_resolver is not None and not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         if recovery_policy is not None and not isinstance(
             recovery_policy, OpenSandboxRecoveryPolicy
@@ -197,10 +201,16 @@ class OpenSandboxManager(Generic[KeyT]):
         self._closed = False
         self._availability = _SandboxAvailability(self)
 
-    def _resolve_owner_key(self, key: KeyT) -> str:
-        """Resolve one opaque application key at the manager boundary."""
+    def _resolve_resource_key(self, key: KeyT, namespace: str | None) -> str:
+        """Bind namespace before every cache, State, claim, or availability lookup."""
         self._notifications.check_reentry()
-        return _owner_key(self._key_resolver(key))
+        if self._key_resolver is None:
+            if not isinstance(key, str):
+                raise TypeError("non-string Sandbox keys require key_resolver")
+            owner_key = key
+        else:
+            owner_key = self._key_resolver(key)
+        return SandboxResourceIdentity(namespace, owner_key).canonical_key()
 
     async def __aenter__(self) -> Self:
         """Open the State and warm pool, then return this owned resource."""
@@ -798,6 +808,32 @@ class OpenSandboxManager(Generic[KeyT]):
             handle,
         )
 
+    def workspace(
+        self, key: KeyT, *, routes: Mapping[str, BackendProtocol] | None = None
+    ) -> Workspace[RootedOpenSandboxBackend, BackendProtocol]:
+        """Declare a rooted workspace that uses each Runtime's logical namespace.
+
+        Pass this value as the Runtime's backend. Creation performs no resource
+        I/O. Each Run borrows the manager until its Graph has stopped; finishing a
+        Run neither closes the manager nor destroys the stable remote Sandbox.
+
+        Args:
+            key: Application key selecting a user, session, project, or other owner.
+            routes: Optional filesystem paths served by other borrowed backends.
+
+        Returns:
+            A lazy declaration exposing the rooted workspace to Tool preparation.
+
+        Raises:
+            ValueError: The client configuration disables rooted workspaces.
+        """
+
+        from ._workspace import SandboxWorkspace
+
+        if self._workspace_root() is None:
+            raise ValueError("workspace requires a configured workspace_root")
+        return SandboxWorkspace(self, key, routes or {})
+
     def build_agent_middleware(
         self,
         backend: BackendProtocol,
@@ -833,7 +869,7 @@ class OpenSandboxManager(Generic[KeyT]):
             permissions=permissions,
         )
 
-    async def get(self, key: KeyT) -> _ManagedBackend:
+    async def get(self, key: KeyT, *, namespace: str | None = None) -> _ManagedBackend:
         """Return the healthy stable backend for one caller-defined key.
 
         Resolution checks the local handle, committed State binding, warm pool, and
@@ -843,6 +879,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Returns:
             A manager-owned backend view whose remote Sandbox can be replaced.
@@ -856,6 +893,7 @@ class OpenSandboxManager(Generic[KeyT]):
         return await _manager_bindings.get(
             self,
             key,
+            namespace=namespace,
         )
 
     async def _get_locked(
@@ -884,7 +922,9 @@ class OpenSandboxManager(Generic[KeyT]):
             backend,
         )
 
-    async def recreate(self, key: KeyT) -> _ManagedBackend:
+    async def recreate(
+        self, key: KeyT, *, namespace: str | None = None
+    ) -> _ManagedBackend:
         """Create and commit a replacement Sandbox for one caller-defined key.
 
         An open handle is updated in place. The previous remote instance is retired
@@ -892,6 +932,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Returns:
             The stable backend view pointing at the replacement instance.
@@ -900,9 +941,12 @@ class OpenSandboxManager(Generic[KeyT]):
         return await _manager_bindings.recreate(
             self,
             key,
+            namespace=namespace,
         )
 
-    async def reconnect(self, key: KeyT) -> _ManagedBackend:
+    async def reconnect(
+        self, key: KeyT, *, namespace: str | None = None
+    ) -> _ManagedBackend:
         """Reconnect an existing binding while preserving its remote identity.
 
         Uses the recovery retry limits but never creates or recreates an instance,
@@ -910,6 +954,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Returns:
             A stable backend view connected to the same remote instance.
@@ -918,9 +963,9 @@ class OpenSandboxManager(Generic[KeyT]):
             OpenSandboxBackendUnavailableError: No binding exists or recovery fails.
             OpenSandboxStateError: Authoritative ownership cannot be established.
         """
-        return await _manager_bindings.reconnect(self, key)
+        return await _manager_bindings.reconnect(self, key, namespace=namespace)
 
-    async def reset(self, key: KeyT) -> None:
+    async def reset(self, key: KeyT, *, namespace: str | None = None) -> None:
         """Clear the configured workspace while retaining identity and binding.
 
         ``workspace_root`` is the only permitted deletion boundary. Reset is refused
@@ -929,6 +974,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Raises:
             OpenSandboxResetError: No safe workspace is configured or cleanup fails.
@@ -937,9 +983,12 @@ class OpenSandboxManager(Generic[KeyT]):
         return await _manager_bindings.reset(
             self,
             key,
+            namespace=namespace,
         )
 
-    async def pause(self, key: KeyT, *, timeout: float = 30.0) -> None:
+    async def pause(
+        self, key: KeyT, *, namespace: str | None = None, timeout: float = 30.0
+    ) -> None:
         """Pause the original instance after all registered processes finish work.
 
         Holders close local admission and confirm remote settlement before the
@@ -948,15 +997,20 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Caller-defined identity resolved to an existing binding.
+            namespace: Logical resource scope, or None for standalone use.
             timeout: Positive total work budget in seconds, including coordination.
 
         Raises:
             OpenSandboxBackendError: Pause or remote confirmation fails.
             OpenSandboxStateError: Shared ownership cannot be verified.
         """
-        await self._availability.pause(self._resolve_owner_key(key), timeout)
+        await self._availability.pause(
+            self._resolve_resource_key(key, namespace), timeout
+        )
 
-    async def resume(self, key: KeyT, *, timeout: float = 30.0) -> _ManagedBackend:
+    async def resume(
+        self, key: KeyT, *, namespace: str | None = None, timeout: float = 30.0
+    ) -> _ManagedBackend:
         """Resume the original paused instance and return its ready stable backend.
 
         A definitely undispatched drain is cancelled. Unconfirmed requests are not
@@ -965,6 +1019,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Caller-defined identity resolved to an existing binding.
+            namespace: Logical resource scope, or None for standalone use.
             timeout: Positive total work budget in seconds, including readiness.
 
         Returns:
@@ -974,17 +1029,18 @@ class OpenSandboxManager(Generic[KeyT]):
             OpenSandboxBackendError: The instance is stopped, missing, or not ready.
             OpenSandboxStateError: Shared ownership cannot be verified.
         """
-        owner_key = self._resolve_owner_key(key)
+        owner_key = self._resolve_resource_key(key, namespace)
         handle = await self._availability.resume(owner_key, timeout)
         return self._backend_view(owner_key, handle)
 
     async def get_diagnostic_logs(
-        self, key: KeyT, *, scope: str = "container"
+        self, key: KeyT, *, namespace: str | None = None, scope: str = "container"
     ) -> OpenSandboxDiagnosticContent:
         """Read scoped logs without creating, reconnecting, or renewing an instance.
 
         Args:
             key: Caller-defined identity resolved to an existing binding.
+            namespace: Logical resource scope, or None for standalone use.
             scope: Provider log scope; Docker supports ``container`` and ``all``.
 
         Returns:
@@ -994,7 +1050,7 @@ class OpenSandboxManager(Generic[KeyT]):
             OpenSandboxBackendError: The binding is absent or the query is rejected.
             OpenSandboxStateError: The authoritative binding cannot be read.
         """
-        owner_key = self._resolve_owner_key(key)
+        owner_key = self._resolve_resource_key(key, namespace)
         async with self._operation():
             binding = await self._state.read_binding(owner_key)
             if binding is None:
@@ -1006,12 +1062,13 @@ class OpenSandboxManager(Generic[KeyT]):
             )
 
     async def get_diagnostic_events(
-        self, key: KeyT, *, scope: str = "runtime"
+        self, key: KeyT, *, namespace: str | None = None, scope: str = "runtime"
     ) -> OpenSandboxDiagnosticContent:
         """Read scoped event diagnostics without waking or changing an instance.
 
         Args:
             key: Caller-defined identity resolved to an existing binding.
+            namespace: Logical resource scope, or None for standalone use.
             scope: Provider event scope; Docker supports ``runtime`` and ``all``.
 
         Returns:
@@ -1022,7 +1079,7 @@ class OpenSandboxManager(Generic[KeyT]):
             OpenSandboxBackendError: The binding is absent or the query is rejected.
             OpenSandboxStateError: The authoritative binding cannot be read.
         """
-        owner_key = self._resolve_owner_key(key)
+        owner_key = self._resolve_resource_key(key, namespace)
         async with self._operation():
             binding = await self._state.read_binding(owner_key)
             if binding is None:
@@ -1033,17 +1090,18 @@ class OpenSandboxManager(Generic[KeyT]):
                 binding.sandbox_id, scope=scope
             )
 
-    async def destroy(self, key: KeyT) -> None:
+    async def destroy(self, key: KeyT, *, namespace: str | None = None) -> None:
         """Destroy known remote instances and remove the committed binding."""
-        await self.delete(key)
+        await self.delete(key, namespace=namespace)
 
-    async def is_healthy(self, key: KeyT) -> bool:
+    async def is_healthy(self, key: KeyT, *, namespace: str | None = None) -> bool:
         """Check only the currently cached local handle for one key.
 
         This method does not read State, create, reconnect, or renew a Sandbox.
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Returns:
             Whether the open cached handle passes its health command.
@@ -1052,9 +1110,12 @@ class OpenSandboxManager(Generic[KeyT]):
         return await _manager_bindings.is_healthy(
             self,
             key,
+            namespace=namespace,
         )
 
-    async def get_details(self, key: KeyT) -> OpenSandboxDetails | None:
+    async def get_details(
+        self, key: KeyT, *, namespace: str | None = None
+    ) -> OpenSandboxDetails | None:
         """Read stable details for the Sandbox committed to one key.
 
         This method does not create, renew, reconnect a business handle, or mutate
@@ -1063,6 +1124,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Returns:
             Owner-aware details, or ``None`` when no binding exists.
@@ -1074,6 +1136,7 @@ class OpenSandboxManager(Generic[KeyT]):
         return await _manager_bindings.get_details(
             self,
             key,
+            namespace=namespace,
         )
 
     async def _delete_locked(
@@ -1094,7 +1157,7 @@ class OpenSandboxManager(Generic[KeyT]):
             claim,
         )
 
-    async def delete(self, key: KeyT) -> None:
+    async def delete(self, key: KeyT, *, namespace: str | None = None) -> None:
         """Destroy all known instances and remove one key binding.
 
         Once destruction starts, caller cancellation waits for the internal operation
@@ -1102,6 +1165,7 @@ class OpenSandboxManager(Generic[KeyT]):
 
         Args:
             key: Opaque application identity accepted by ``key_resolver``.
+            namespace: Logical resource scope, or None for standalone use.
 
         Raises:
             OpenSandboxDestroyError: Destruction is unconfirmed and can be retried.
@@ -1112,6 +1176,7 @@ class OpenSandboxManager(Generic[KeyT]):
         return await _manager_bindings.delete(
             self,
             key,
+            namespace=namespace,
         )
 
     async def _close_resources(self) -> None:

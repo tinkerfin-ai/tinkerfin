@@ -27,7 +27,7 @@ from tinkerfin_native_stream import NativeStreamContractError
 
 
 def _identity() -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId="run-1")
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id="run-1")
 
 
 def _message_part(message: AIMessageChunk) -> dict[str, object]:

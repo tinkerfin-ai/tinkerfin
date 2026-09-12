@@ -44,7 +44,7 @@ Its Tool events and message snapshots use the same parent message identity.
 
 ## Root agent and subagents
 
-Subagents run in non-root namespaces. The converter preserves full namespaces and provenance so messages, tools, and state from different scopes are not mixed.
+Subagents run in non-root graph namespaces. The converter preserves full graph namespaces and provenance so messages, tools, and state from different scopes are not mixed.
 
 `expose_subagent_events=True` delivers their public events. With `False`, the converter still validates their input but suppresses corresponding public events.
 
@@ -63,12 +63,19 @@ identity nor invalidate a task that Deep Agents accepts.
 ## Reasoning events
 
 ```python
-events = await tinkerfin.open_agui_run(
-    identity,
-    agent=agent,
+from contextlib import aclosing
+
+from tinkerfin import TinkerFin
+
+runtime = TinkerFin().with_namespace(namespace).build(model=model)
+async with aclosing(runtime.open_agui_run(
+    thread_id=thread_id,
+    run_id=run_id,
     input=graph_input,
     include_reasoning_events=True,
-)
+)) as events:
+    async for event in events:
+        await send_event(event)
 ```
 
 Supported providers may produce `REASONING_START`, `REASONING_MESSAGE_*`, and `REASONING_END`. Not every model emits public reasoning, and an empty text chunk is not automatically a heartbeat.
@@ -82,7 +89,7 @@ resume correlation. Unrelated business fields remain available for response vali
 | Native mode | Information used during conversion |
 | --- | --- |
 | `messages` | Text chunks, tool argument chunks, tool results, and message metadata |
-| `tasks` | Graph node and task starts, results, errors, and namespace relationships |
+| `tasks` | Graph node and task starts, results, errors, and graph namespace relationships |
 | `values` | State snapshots and top-level `interrupts` |
 
 The mode is plural: `tasks`. It is not the Deep Agents delegation tool named `task`. Root and subgraph `values` are separate state scopes; a later subgraph snapshot must not replace root state.
@@ -104,12 +111,19 @@ async def audit_event(event) -> None:
     await audit_log.write(event.model_dump(mode="json", by_alias=True))
 
 
-events = await tinkerfin.open_agui_run(
-    identity,
-    agent=agent,
+from contextlib import aclosing
+
+from tinkerfin import TinkerFin
+
+runtime = TinkerFin().with_namespace(namespace).build(model=model)
+async with aclosing(runtime.open_agui_run(
+    thread_id=thread_id,
+    run_id=run_id,
     input=graph_input,
     on_agui_event=audit_event,
-)
+)) as events:
+    async for event in events:
+        await send_event(event)
 ```
 
 `on_agui_event` is useful for audits and metrics. Keep it asynchronous and lightweight

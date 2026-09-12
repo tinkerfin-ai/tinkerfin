@@ -9,21 +9,21 @@ from redis.asyncio import Redis
 from redis.asyncio.cluster import RedisCluster
 from redis.exceptions import ConnectionError as RedisConnectionError
 
-from tinkerfin import (
+from tinkerfin import RunIdentity
+from tinkerfin.coordination import (
     RunCoordinationError,
     RunCoordinationUnavailableError,
-    RunIdentity,
 )
-from tinkerfin.errors import (
+from tinkerfin.redis import (
     RedisLeaseError,
     RedisLeaseLifecycleError,
     RedisLeaseUnavailableError,
+    RedisRunCoordinator,
 )
-from tinkerfin.redis import RedisRunCoordinator
 
 
 def _identity(*, thread_id: str = "user-1", run_id: str = "run-1") -> RunIdentity:
-    return RunIdentity(threadId=thread_id, runId=run_id)
+    return RunIdentity(namespace="test", thread_id=thread_id, run_id=run_id)
 
 
 def test_from_client_rejects_redis_cluster_outside_the_client_boundary() -> None:
@@ -87,6 +87,30 @@ class _BlockingAcquireRedis(_ScriptedRedis):
             self.acquire_started.set()
             await self.release_acquire.wait()
         return await super().eval(script, numkeys, *keys_and_args)
+
+
+@pytest.mark.parametrize("custom_key", [False, True])
+async def test_redis_coordination_defaults_to_namespaced_threads(
+    custom_key: bool,
+) -> None:
+    client = _ScriptedRedis([1, 1, 1, 1, 1, 1])
+    coordinator = RedisRunCoordinator.from_client(
+        cast(Redis, client),
+        key_resolver=(lambda _: "shared-key") if custom_key else None,
+    )
+    identities = (
+        RunIdentity(namespace="test", thread_id="thread", run_id="one"),
+        RunIdentity(namespace="test", thread_id="thread", run_id="two"),
+        RunIdentity(namespace="other", thread_id="thread", run_id="one"),
+    )
+    async with coordinator:
+        for identity in identities:
+            async with coordinator(identity):
+                pass
+    keys = [client.eval_calls[index][1][:2] for index in (0, 2, 4)]
+    assert keys[0] == keys[1]
+    assert keys[0] != keys[2]
+    assert client.close_calls == 0
 
 
 class _CommittedBlockingAcquireRedis(_ScriptedRedis):

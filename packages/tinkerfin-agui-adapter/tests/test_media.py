@@ -11,7 +11,9 @@ def test_tool_attachments_are_structured_and_replay_conflicts_are_rejected():
     attachment = Attachment(
         id="image-1", name="chart.png", mime_type="image/png", size_bytes=42
     )
-    adapter = DeepAgentAgUiAdapter(identity=RunIdentity(threadId="thread", runId="run"))
+    adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(namespace="test", thread_id="thread", run_id="run")
+    )
     message = ToolMessage(
         id="result",
         tool_call_id="call",
@@ -42,7 +44,9 @@ def test_user_attachment_snapshot_preserves_reference_and_text():
     attachment = Attachment(
         id="file-1", name="report.pdf", mime_type="application/pdf", size_bytes=100
     )
-    adapter = DeepAgentAgUiAdapter(identity=RunIdentity(threadId="thread", runId="run"))
+    adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(namespace="test", thread_id="thread", run_id="run")
+    )
     message = HumanMessage(
         id="user",
         content=[{"type": "text", "text": "read"}, attachment.content_block()],
@@ -72,7 +76,9 @@ def test_assistant_attachment_event_has_a_balanced_message_lifecycle():
     attachment = Attachment(
         id="image", name="image.png", mime_type="image/png", size_bytes=10
     )
-    adapter = DeepAgentAgUiAdapter(identity=RunIdentity(threadId="thread", runId="run"))
+    adapter = DeepAgentAgUiAdapter(
+        identity=RunIdentity(namespace="test", thread_id="thread", run_id="run")
+    )
     events = adapter.process(
         {
             "type": "messages",

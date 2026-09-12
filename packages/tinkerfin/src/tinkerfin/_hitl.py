@@ -8,27 +8,48 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import PurePosixPath
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeAlias, cast
 from uuid import NAMESPACE_URL, uuid5
 
 from deepagents.middleware.filesystem import FilesystemPermission
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
-from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig
-from langchain.agents.middleware.human_in_the_loop import Decision
+from langchain.agents.middleware import (
+    AgentState,
+    HumanInTheLoopMiddleware,
+    InterruptOnConfig,
+)
+from langchain.agents.middleware.human_in_the_loop import Decision, HITLRequest
 from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
-from langchain_core.messages import ToolCall, ToolMessage
+from langchain_core.messages import AIMessage, ToolCall, ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.config import get_config
+from langgraph.errors import GraphInterrupt
+from langgraph.runtime import Runtime
+from langgraph.types import Interrupt, interrupt
 from wcmatch import glob as wcglob
 
+from ._agui_lineage_state import RUN_ID_METADATA_KEY
+from ._hitl_state import (
+    TOOL_REVIEW_CHANNEL,
+    PendingToolReview,
+    pending_tool_review,
+    tool_review_digest,
+    tool_review_owner,
+)
+from ._tasks import run_async_owned
 from .errors import TinkerFinLifecycleError
 
 CANCEL_DECISION_TYPE = "tinkerfin_cancel"
 HITL_CONTRACT_ID = "tinkerfin.deepagents.hitl-cancel"
-TINKERFIN_HITL_CONTRACT = HITL_CONTRACT_ID
 
 _SUPPORTED_DEEPAGENTS_VERSION = "0.7.5"
 _SUPPORTED_LANGCHAIN_VERSION = "1.3.14"
 _GLOB_FLAGS = wcglob.BRACE | wcglob.GLOBSTAR
 _GLOB_WILDCARD_CHARS = frozenset("*?[") | frozenset("{")
+_CheckpointSaver: TypeAlias = (
+    BaseCheckpointSaver[int] | BaseCheckpointSaver[float] | BaseCheckpointSaver[str]
+)
 
 _FilesystemOperation = Literal["read", "write"]
 _ToolScope = Literal["exact", "bulk"]
@@ -229,11 +250,36 @@ def _settled_permissions(
     ]
 
 
+async def _save_tool_review(
+    saver: _CheckpointSaver, config: RunnableConfig, review: PendingToolReview
+) -> None:
+    """Finish the evidence write before publishing an interrupt or releasing resources.
+
+    LangGraph 1.2.10 reapplies writes only for real task IDs. A distinct owner keeps
+    this record out of both completed-task detection and null-task resume slots.
+    The record is saver evidence; it does not add a Graph state channel.
+    """
+
+    try:
+        await run_async_owned(
+            lambda: saver.aput_writes(
+                config,
+                ((TOOL_REVIEW_CHANNEL, review.model_dump(mode="json")),),
+                tool_review_owner(review.task_id),
+            ),
+            task_name="tinkerfin-tool-review-save",
+        )
+    except Exception as error:
+        raise TinkerFinLifecycleError(
+            "could not save pending tool review", cause=error
+        ) from error
+
+
 class _TinkerFinHitlPatchMiddleware(
     PatchToolCallsMiddleware,
     HumanInTheLoopMiddleware,
 ):
-    """Preserve Deep Agents patching and extend only its cancel decision."""
+    """Preserve patching and bind asynchronous approvals to their exact tool batch."""
 
     @property
     def name(self) -> str:
@@ -246,6 +292,149 @@ class _TinkerFinHitlPatchMiddleware(
         interrupt_on: dict[str, bool | InterruptOnConfig],
     ) -> None:
         HumanInTheLoopMiddleware.__init__(self, interrupt_on=interrupt_on)
+
+    def after_model(
+        self, state: AgentState, runtime: Runtime[Any]
+    ) -> dict[str, object] | None:
+        """Require async execution so pending approvals can be saved safely."""
+
+        del state, runtime
+        raise NotImplementedError("TinkerFin tool review requires async execution")
+
+    async def aafter_model(
+        self, state: AgentState, runtime: Runtime[Any]
+    ) -> dict[str, object] | None:
+        """Save each review and reject changed tool selection before consuming decisions.
+
+        Request construction and decision processing follow LangChain 1.3.14's
+        HumanInTheLoopMiddleware.after_model. The additional saver record preserves
+        exact tool IDs across Runtime rebuilds; tests cover policy changes, nested
+        interrupts, retries, and all native decision types.
+        """
+
+        configurable = get_config().get("configurable", {})
+        message = next(
+            (
+                item
+                for item in reversed(state["messages"])
+                if isinstance(item, AIMessage)
+            ),
+            None,
+        )
+        tool_calls = [] if message is None else message.tool_calls
+        request = HITLRequest(action_requests=[], review_configs=[])
+        selected: dict[int, InterruptOnConfig] = {}
+        for index, tool_call in enumerate(tool_calls):
+            policy = self.interrupt_on.get(tool_call["name"])
+            if policy is None or not self._should_interrupt(
+                tool_call, policy, state, runtime
+            ):
+                continue
+            action, review = self._create_action_and_config(
+                tool_call, policy, state, runtime
+            )
+            request["action_requests"].append(action)
+            request["review_configs"].append(review)
+            selected[index] = policy
+        reviewed_ids: list[str] = []
+        for index in selected:
+            tool_call_id = tool_calls[index].get("id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError("tool review requires stable tool call IDs")
+            reviewed_ids.append(tool_call_id)
+        digest = tool_review_digest(
+            request,
+            tool_calls=tool_calls,
+            reviewed_ids=reviewed_ids,
+        )
+        execution = runtime.execution_info
+        saver_value = configurable.get("__pregel_checkpointer")
+        saver: _CheckpointSaver | None = None
+        source_config: RunnableConfig = {}
+        graph_namespace = ""
+        if isinstance(saver_value, BaseCheckpointSaver) and execution is not None:
+            if configurable.get("__pregel_durability") != "sync":
+                raise ValueError("TinkerFin tool review requires durability='sync'")
+            saver = cast(_CheckpointSaver, saver_value)
+            # prepare_single_task adds a final node/task component. Retain every
+            # parent Graph component and invocation slot when locating its saver.
+            graph_namespace = execution.checkpoint_ns.rpartition("|")[0]
+            source_config = {
+                "configurable": {
+                    "thread_id": configurable["thread_id"],
+                    "checkpoint_ns": graph_namespace,
+                    "checkpoint_id": execution.checkpoint_id,
+                }
+            }
+            checkpoint = await saver.aget_tuple(source_config)
+            if checkpoint is None:
+                raise TinkerFinLifecycleError(
+                    "tool review source checkpoint is unavailable"
+                )
+            saved = pending_tool_review(checkpoint, task_id=execution.task_id)
+            # A changed policy may now select no tools. Check before the empty
+            # request return, otherwise previously cancelled actions could execute.
+            if saved is not None and (
+                saved.task_id != execution.task_id
+                or saved.graph_namespace != graph_namespace
+                or saved.batch_digest != digest
+            ):
+                raise TinkerFinLifecycleError(
+                    "tool review changed while awaiting a decision"
+                )
+        if not selected:
+            return None
+        try:
+            response: object = interrupt(request)
+        except GraphInterrupt as paused:
+            if saver is None or execution is None:
+                raise TinkerFinLifecycleError(
+                    "tool review requires an asynchronous checkpointer"
+                ) from paused
+            pending = cast(Sequence[Interrupt], paused.args[0])
+            if len(pending) != 1:
+                raise TinkerFinLifecycleError(
+                    "tool review requires one native interrupt group"
+                ) from paused
+            run_id = configurable.get(RUN_ID_METADATA_KEY)
+            record = PendingToolReview(
+                graph_namespace=graph_namespace,
+                run_id=run_id if isinstance(run_id, str) else None,
+                task_id=execution.task_id,
+                interrupt_id=pending[0].id,
+                batch_digest=digest,
+            )
+            await _save_tool_review(saver, source_config, record)
+            raise
+        if not isinstance(response, Mapping):
+            raise TypeError("tool review decisions must be a mapping")
+        decisions_value = cast(Mapping[object, object], response).get("decisions")
+        if not isinstance(decisions_value, list):
+            raise TypeError("tool review decisions must be a list")
+        decisions = cast(list[Decision], decisions_value)
+        if len(decisions) != len(selected):
+            raise ValueError(
+                "tool review decisions must cover the complete action batch"
+            )
+        revised: list[ToolCall] = []
+        tool_messages: list[ToolMessage] = []
+        decision_index = 0
+        for index, tool_call in enumerate(tool_calls):
+            policy = selected.get(index)
+            if policy is None:
+                revised.append(tool_call)
+                continue
+            updated, result = self._process_decision(
+                decisions[decision_index], tool_call, policy
+            )
+            decision_index += 1
+            if updated is not None:
+                revised.append(updated)
+            if result is not None:
+                tool_messages.append(result)
+        assert message is not None
+        message.tool_calls = revised
+        return {"messages": [message, *tool_messages]}
 
     @staticmethod
     def _process_decision(
@@ -349,13 +538,12 @@ def _prepare_declarative_subagents(
     *,
     inherited_permissions: tuple[FilesystemPermission, ...],
     inherited_interrupt_on: dict[str, bool | InterruptOnConfig],
-) -> tuple[object, frozenset[str], bool]:
+) -> tuple[object, bool]:
     if value is None:
-        return None, frozenset(), False
+        return None, False
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise TypeError("subagents must be a sequence or None")
     prepared: list[object] = []
-    uncontracted_external: set[str] = set()
     has_adapter = False
     for raw_spec in cast(Sequence[object], value):
         if not isinstance(raw_spec, Mapping):
@@ -365,12 +553,10 @@ def _prepare_declarative_subagents(
             name = spec.get("name")
             if not isinstance(name, str) or not name:
                 raise ValueError("external subagent requires a stable name")
-            contract = spec.pop("tinkerfin_hitl_contract", None)
-            if contract is None:
-                uncontracted_external.add(name)
-            elif contract != HITL_CONTRACT_ID:
+            if "tinkerfin_hitl_contract" in spec:
                 raise ValueError(
-                    f"external subagent {name!r} declares an unsupported HITL contract"
+                    "tool cancellation requires an installed TinkerFin tool review "
+                    "implementation; a subagent declaration cannot grant support"
                 )
             prepared.append(spec)
             continue
@@ -390,7 +576,7 @@ def _prepare_declarative_subagents(
         spec["interrupt_on"] = {}
         spec["middleware"] = list(_inject_adapter(spec.get("middleware", ()), adapter))
         prepared.append(spec)
-    return prepared, frozenset(uncontracted_external), has_adapter
+    return prepared, has_adapter
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,7 +587,6 @@ class HitlFactoryOverrides:
     middleware: tuple[AgentMiddleware[Any, Any, Any], ...]
     permissions: list[FilesystemPermission]
     subagents: object
-    uncontracted_external_subagents: frozenset[str]
 
 
 def prepare_hitl_factory_overrides(
@@ -417,7 +602,7 @@ def prepare_hitl_factory_overrides(
         arguments: Build arguments already bound to the Profile factory signature.
 
     Returns:
-        Immutable effective HITL inputs and unsupported external subagent names.
+        Immutable effective tool review and permission inputs.
 
     Raises:
         TypeError: A permission, middleware, or subagent value has the wrong shape.
@@ -427,12 +612,10 @@ def prepare_hitl_factory_overrides(
     permissions = _as_permissions(arguments.get("permissions"))
     interrupt_on = _as_interrupt_on(arguments.get("interrupt_on"))
     adapter = _adapter_for(permissions, interrupt_on)
-    prepared_subagents, uncontracted_external, has_subagent_adapter = (
-        _prepare_declarative_subagents(
-            arguments.get("subagents"),
-            inherited_permissions=permissions,
-            inherited_interrupt_on=interrupt_on,
-        )
+    prepared_subagents, has_subagent_adapter = _prepare_declarative_subagents(
+        arguments.get("subagents"),
+        inherited_permissions=permissions,
+        inherited_interrupt_on=interrupt_on,
     )
     if adapter is not None or has_subagent_adapter:
         _validate_locked_hitl_versions()
@@ -441,14 +624,12 @@ def prepare_hitl_factory_overrides(
         middleware=_inject_adapter(arguments.get("middleware", ()), adapter),
         permissions=_settled_permissions(permissions),
         subagents=prepared_subagents,
-        uncontracted_external_subagents=uncontracted_external,
     )
 
 
 __all__ = [
     "CANCEL_DECISION_TYPE",
     "HITL_CONTRACT_ID",
-    "TINKERFIN_HITL_CONTRACT",
     "HitlFactoryOverrides",
     "prepare_hitl_factory_overrides",
 ]

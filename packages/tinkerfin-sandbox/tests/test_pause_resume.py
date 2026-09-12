@@ -14,6 +14,9 @@ import pytest
 from opensandbox import Sandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.transport import RetryPolicy
+from sqlalchemy.ext.asyncio import AsyncEngine
+from test_manager import _resource_key
+from tests.support.sql_engines import SqlEngineFactory
 
 from tinkerfin_sandbox import (
     OpenSandboxAvailability,
@@ -288,8 +291,8 @@ class _Client:
 class _ControlledState(SQLAlchemyOpenSandboxState):
     """Delay public coordination responses while retaining real SQL transitions."""
 
-    def __init__(self, url: str) -> None:
-        super().__init__(url=url, namespace="pause-resume", poll_interval=0.01)
+    def __init__(self, engine: AsyncEngine) -> None:
+        super().__init__(engine=engine, namespace="pause-resume", poll_interval=0.01)
         self.outage = False
         self.delay_ack = False
         self.ack_started = asyncio.Event()
@@ -376,6 +379,7 @@ class _World:
 
     def __init__(self, tmp_path: Path, workspace_root: str | None) -> None:
         self.url = f"sqlite+aiosqlite:///{tmp_path / 'pause-state.db'}"
+        self.engines = SqlEngineFactory()
         self.workspace_root = workspace_root
         self.remote = _Remote()
         self.managers: list[OpenSandboxManager[str]] = []
@@ -385,7 +389,7 @@ class _World:
 
     async def add(self, observer: _Observer | None = None) -> OpenSandboxManager[str]:
         client = _Client(self.remote, workspace_root=self.workspace_root)
-        state = _ControlledState(self.url)
+        state = _ControlledState(self.engines(self.url))
         manager = OpenSandboxManager[str](
             client=client,
             key_resolver=str,
@@ -421,9 +425,13 @@ class _World:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
-        await asyncio.wait_for(
-            asyncio.gather(*(manager.aclose() for manager in self.managers)), timeout=10
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(manager.aclose() for manager in self.managers)),
+                timeout=10,
+            )
+        finally:
+            await self.engines.aclose()
 
 
 @asynccontextmanager
@@ -440,7 +448,7 @@ async def _world(
 async def _phase(state: _ControlledState, phase: str) -> OpenSandboxAvailability:
     async with asyncio.timeout(3):
         while True:
-            snapshot = await state.read_availability("owner")
+            snapshot = await state.read_availability(_resource_key("owner"))
             if snapshot is not None and snapshot.phase == phase:
                 return snapshot
             await asyncio.sleep(0.01)
@@ -661,14 +669,14 @@ async def test_resume_refreshes_both_stable_handles_for_the_original_instance(
             await first.get("owner"),
             await second.get("owner"),
         )
-        binding = await world.states[0].read_binding("owner")
+        binding = await world.states[0].read_binding(_resource_key("owner"))
         await first.pause("owner", timeout=2)
         resumed = await first.resume("owner", timeout=2)
         assert resumed is first_handle
         await _usable(second_handle)
         assert await second.get("owner") is second_handle
         assert first_handle.id == second_handle.id == "sandbox-1"
-        assert await world.states[1].read_binding("owner") == binding
+        assert await world.states[1].read_binding(_resource_key("owner")) == binding
         assert world.clients[0].connections[-1] == ("sandbox-1", 1)
         assert world.clients[1].connections[-1] == ("sandbox-1", 1)
         assert world.remote.resume_calls == ["sandbox-1"]
@@ -725,13 +733,13 @@ async def test_missing_and_stopped_instances_never_create_during_pause_or_resume
                 await operation("missing", timeout=1)
         assert world.remote.created == 0
         handle = await manager.get("owner")
-        original = await world.states[0].read_binding("owner")
+        original = await world.states[0].read_binding(_resource_key("owner"))
         world.remote.states[handle.id] = "Terminated"
         for operation in (manager.pause, manager.resume):
             with pytest.raises(OpenSandboxBackendError):
                 await operation("owner", timeout=1)
         assert world.remote.created == 1
-        assert await world.states[0].read_binding("owner") == original
+        assert await world.states[0].read_binding(_resource_key("owner")) == original
 
 
 @pytest.mark.asyncio
@@ -833,7 +841,7 @@ async def test_explicit_resource_management_serializes_with_dispatched_pause(
             await _usable(replacement)
             assert world.remote.created == 2
         else:
-            assert await world.states[1].read_binding("owner") is None
+            assert await world.states[1].read_binding(_resource_key("owner")) is None
             assert world.remote.created == 1
         assert world.remote.pause_calls == [("sandbox-1", 0, 0)]
         assert handle.id in {"sandbox-1", "sandbox-2"}

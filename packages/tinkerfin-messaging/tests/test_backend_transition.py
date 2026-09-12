@@ -12,10 +12,7 @@ import pytest
 
 from tinkerfin_contracts import RunIdentity
 from tinkerfin_messaging._messaging_ledger import _MessagingLedger
-from tinkerfin_messaging._messaging_transition import (
-    messaging_message_signature,
-    resolve_messaging_transition,
-)
+from tinkerfin_messaging._messaging_transition import messaging_message_signature
 from tinkerfin_messaging.backend import MemoryBackend, RunStatus
 from tinkerfin_messaging.backend_contract import (
     CommittedMessagePage,
@@ -34,6 +31,7 @@ from tinkerfin_messaging.backend_contract import (
     StoredMessagingChannel,
     StoredMessagingRun,
     StoredMessagingStream,
+    resolve_messaging_transition,
 )
 from tinkerfin_messaging.errors import (
     MessageIdConflict,
@@ -51,7 +49,7 @@ from tinkerfin_messaging.testing import verify_messaging_backend
 
 
 def _identity(run_id: str = "run-1") -> RunIdentity:
-    return RunIdentity(threadId="thread-1", runId=run_id)
+    return RunIdentity(namespace="test", thread_id="thread-1", run_id=run_id)
 
 
 def _settings(*, max_messages: int = 100) -> MessagingBackendSettings:
@@ -263,7 +261,9 @@ def test_backend_settings_require_complete_ordered_lease_durations() -> None:
 def test_message_signature_preserves_current_redis_evidence() -> None:
     assert (
         messaging_message_signature(
-            identity=RunIdentity(threadId="conversation-1", runId="run-1"),
+            identity=RunIdentity(
+                namespace="test", thread_id="conversation-1", run_id="run-1"
+            ),
             codec_id="text",
             payload=b"payload",
             checkpoint=None,
@@ -610,6 +610,43 @@ def test_generation_cleanup_requires_an_inactive_stream() -> None:
     assert completed.stream is not None
     assert completed.stream.disposition == "deleted"
     assert completed.tombstone_reason == "deleted"
+
+
+@pytest.mark.parametrize("same_run", [True, False])
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_generation_cleanup_fences_an_expired_producer(
+    same_run: bool, recoverable: bool
+) -> None:
+    owner = _run(
+        identity=_identity("run-1" if same_run else "other-run"),
+        producer_lease_active=False,
+        recoverable=recoverable,
+    )
+    effect = resolve_messaging_transition(
+        MessagingTransition(
+            kind="begin_generation_cleanup",
+            transition_id="delete-expired-owner",
+            channel="events",
+            identity=_identity(),
+            settings=_settings(),
+            cleanup_reason="deleted",
+        ),
+        _state(
+            stream=_stream(active_run_id=owner.identity.run_id),
+            target_run=owner if same_run else None,
+            active_run=None if same_run else owner,
+        ),
+    )
+    assert effect.result.cleanup_required is True
+    assert effect.stream is not None
+    assert effect.stream.disposition == "deleting"
+    assert effect.stream.active_run_id is None
+    assert len(effect.runs) == 1
+    assert effect.runs[0].identity == owner.identity
+    assert effect.runs[0].status == "owner_lost"
+    assert effect.runs[0].producer_token is None
+    assert effect.lease_action == "release"
+    assert effect.lease_run_id == owner.identity.run_id
 
 
 def test_generation_cleanup_keeps_the_first_sealed_reason() -> None:

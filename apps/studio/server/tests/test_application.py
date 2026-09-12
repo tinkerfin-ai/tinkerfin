@@ -186,8 +186,7 @@ async def test_readiness_reports_dependency_status_without_error_details() -> No
         async def check(self) -> dict[str, bool]:
             return {
                 "mysql": True,
-                "redis_control": True,
-                "redis_runtime": True,
+                "redis": True,
                 "opensandbox": False,
             }
 
@@ -205,8 +204,7 @@ async def test_readiness_reports_dependency_status_without_error_details() -> No
         "status": "not_ready",
         "components": {
             "mysql": True,
-            "redis_control": True,
-            "redis_runtime": True,
+            "redis": True,
             "opensandbox": False,
         },
     }

@@ -11,6 +11,7 @@ from redis.asyncio import Redis
 
 from tinkerfin_contracts import RunIdentity
 
+from ..coordination import _coordination_key
 from ..errors import (
     RedisLeaseError,
     RedisLeaseTimeoutError,
@@ -78,13 +79,13 @@ class RedisRunCoordinator:
         self,
         *,
         lease_lock: RedisLeaseLock,
-        key_resolver: Callable[[RunIdentity], str],
+        key_resolver: Callable[[RunIdentity], str] | None = None,
     ) -> None:
         """Bind a borrowed lease manager and canonical Run-to-resource resolver."""
 
         if not isinstance(lease_lock, RedisLeaseLock):
             raise TypeError("lease_lock must be a RedisLeaseLock")
-        if not callable(key_resolver):
+        if key_resolver is not None and not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         self._lease_lock = lease_lock
         self._key_resolver = key_resolver
@@ -94,7 +95,7 @@ class RedisRunCoordinator:
         cls,
         client: Redis,
         *,
-        key_resolver: Callable[[RunIdentity], str],
+        key_resolver: Callable[[RunIdentity], str] | None = None,
         key_prefix: str = _DEFAULT_KEY_PREFIX,
         lease_ttl_seconds: float = _DEFAULT_LEASE_TTL_SECONDS,
         renew_interval_seconds: float | None = None,
@@ -102,7 +103,7 @@ class RedisRunCoordinator:
     ) -> RedisRunCoordinator:
         """Create a coordinator that borrows one asynchronous Redis client."""
 
-        if not callable(key_resolver):
+        if key_resolver is not None and not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         return cls(
             lease_lock=RedisLeaseLock.from_client(
@@ -120,7 +121,7 @@ class RedisRunCoordinator:
         cls,
         url: str,
         *,
-        key_resolver: Callable[[RunIdentity], str],
+        key_resolver: Callable[[RunIdentity], str] | None = None,
         key_prefix: str = _DEFAULT_KEY_PREFIX,
         lease_ttl_seconds: float = _DEFAULT_LEASE_TTL_SECONDS,
         renew_interval_seconds: float | None = None,
@@ -128,7 +129,7 @@ class RedisRunCoordinator:
     ) -> RedisRunCoordinator:
         """Create a coordinator that owns the Redis client built from `url`."""
 
-        if not callable(key_resolver):
+        if key_resolver is not None and not callable(key_resolver):
             raise TypeError("key_resolver must be callable")
         return cls(
             lease_lock=RedisLeaseLock.from_url(
@@ -176,16 +177,7 @@ class RedisRunCoordinator:
 
     @asynccontextmanager  # pyright: ignore[reportDeprecated]
     async def _coordinate(self, identity: RunIdentity) -> AsyncIterator[None]:
-        if not isinstance(identity, RunIdentity):
-            raise TypeError("identity must be a RunIdentity")
-        resolved_key = self._key_resolver(identity)
-        if not isinstance(resolved_key, str):
-            raise TypeError("key_resolver must return a string")
-        if not resolved_key or resolved_key != resolved_key.strip():
-            raise ValueError(
-                "key_resolver must return a non-blank string without surrounding "
-                "whitespace"
-            )
+        resolved_key = _coordination_key(identity, self._key_resolver)
         context = self._lease_lock.hold(resolved_key)
         try:
             await context.__aenter__()

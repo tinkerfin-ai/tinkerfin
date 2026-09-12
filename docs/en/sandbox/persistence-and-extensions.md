@@ -2,87 +2,75 @@
 
 [Rooted files and commands](rooted-filesystem.md) · [中文](../../cn/sandbox/persistence-and-extensions.md)
 
-Default state exists only in the current process. Use SQLAlchemy state when multiple workers share bindings or when a restart must recover them.
+Use persistent State to share Sandbox bindings between workers and recover them after
+restart. It stores bindings, leases, availability, and cleanup work. Container files
+need their own volumes and backups. With `OpenSandboxConfig(ttl=None)`, new persistent
+Sandboxes remain until explicitly destroyed; closing a manager retains their bindings.
 
-State stores bindings and leases, not container files. For a workspace kept until
-explicit cleanup, combine persistent State with `OpenSandboxConfig(ttl=None)`.
-Normal manager close then preserves its binding and remote instance. Volumes and a
-backup policy are still needed when files must survive instance or storage loss.
-
-## SQLite for multiple local processes
+## SQL databases
 
 ```bash
-pip install "tinkerfin-sandbox[sqlite]"
+pip install "tinkerfin-sandbox[sqlalchemy]" aiosqlite
 ```
+
+Use `asyncpg` for PostgreSQL or `asyncmy` for MySQL. Supply the Engine you already manage:
 
 ```python
-from tinkerfin_sandbox import (
-    OpenSandboxManager,
-    SQLAlchemyOpenSandboxState,
-)
+from sqlalchemy.ext.asyncio import create_async_engine
+from tinkerfin_sandbox import OpenSandboxManager, SQLAlchemyOpenSandboxState
 
+engine = create_async_engine("sqlite+aiosqlite:////var/lib/app/sandboxes.db")
+state = SQLAlchemyOpenSandboxState(engine=engine, namespace="production")
+manager = OpenSandboxManager(client=client, state=state)
 
-state = SQLAlchemyOpenSandboxState(
-    url="sqlite+aiosqlite:////var/lib/app/opensandbox.db",
-    namespace="production",
-    lease_ttl=15.0,
-    poll_interval=0.05,
-    sqlite_retry_timeout=5.0,
-)
-manager = OpenSandboxManager(
-    client=client,
-    key_resolver=key_resolver,
-    state=state,
-)
+try:
+    async with manager:
+        backend = await manager.get("projects/project-1")
+finally:
+    await engine.dispose()
 ```
 
-## MySQL for workers on several hosts
-
-```bash
-pip install "tinkerfin-sandbox[mysql]"
-```
-
-```python
-state = SQLAlchemyOpenSandboxState(
-    url="mysql+asyncmy://user:password@db/sandbox_state",
-    namespace="production",
-)
-```
-
-MySQL 5.7 and MySQL 8.x are supported. MariaDB is not currently in the verified boundary.
-
-### State parameters
+PostgreSQL URLs use `postgresql+asyncpg://...`; MySQL URLs use `mysql+asyncmy://...`.
+The same State API covers all three databases. MySQL 5.7 uses bounded claim waits;
+MySQL 8 and PostgreSQL can skip locked warm and cleanup rows. MariaDB is not supported.
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `url` | required | SQLAlchemy asynchronous connection URL |
-| `namespace` | `""` | Isolates deployments in one database |
-| `lease_ttl` | `15.0` | Owner, warm-slot, and cleanup lease seconds |
-| `poll_interval` | `0.05` | Base wait and retry interval |
-| `sqlite_retry_timeout` | `5.0` | Total SQLite lock retry budget |
+| `engine` | required | Borrowed asynchronous SQLAlchemy Engine |
+| `namespace` | `""` | Deployment domain shared by cooperating managers |
+| `lease_ttl` | `15.0` | Worker and claim lease duration, in seconds |
+| `poll_interval` | `0.05` | Claim polling and initial lock retry delay, in seconds |
+| `sqlite_retry_timeout` | `5.0` | SQLite lock retry budget, in seconds |
 
-All workers in one namespace must use the same warm-pool size. The database account needs schema and data permissions during first startup.
+All workers in one deployment namespace must agree on warm capacity. This deployment
+domain is separate from the Runtime namespace and application key used to select each
+Sandbox. See [keys and workspace use](index.md).
 
-Cancellation waits for database results to be consumed and the connection to return
-to its pool. A cancellation observed before COMMIT begins rolls back the write;
-once COMMIT has been issued, State waits for its confirmed or uncertain outcome.
-This necessary settlement can extend the caller's work deadline. It does not
-serialize independent transactions or change the SQLite lock retry budget.
+The State never disposes the borrowed Engine. Startup and close wait for accepted
+work to settle before delivering cancellation. A write cancelled before COMMIT rolls
+back; an issued COMMIT retains its confirmed or uncertain result. Driver connection
+and statement timeouts belong to the Engine owner, and cleanup can extend elapsed time.
+An uncertain COMMIT or a failed cleanup never replays the write.
 
-## Generate schema before deployment
+SQLite uses exclusive checkouts. For an in-memory database, configure
+`AsyncAdaptedQueuePool` with `pool_size=1, max_overflow=0`; `StaticPool` is rejected.
+SQLite lock retries are bounded by `sqlite_retry_timeout`. A busy COMMIT retries within
+the same transaction, without repeating its writes.
+
+## Generate the database schema
 
 ```python
 from pathlib import Path
 from tinkerfin_sandbox import get_sqlalchemy_opensandbox_state_schema
 
-
-schema = get_sqlalchemy_opensandbox_state_schema(dialect="mysql")
+schema = get_sqlalchemy_opensandbox_state_schema(dialect="postgresql")
 Path("opensandbox-schema.sql").write_text(schema.ddl, encoding="utf-8")
 ```
 
-`dialect` is `mysql` or `sqlite`. The returned value also provides `table_names`.
-Runtime startup still validates the complete deployed table, column, primary-key, and
-index structure, including the exact index set and uniqueness flags.
+`dialect` accepts `postgresql`, `mysql`, or `sqlite`. The descriptor also exposes
+`table_names`. Startup creates an empty schema or validates its tables, columns, keys,
+indexes, and database comments. Creating the schema requires DDL permissions; a
+precreated complete schema can use a DML account.
 
 ## Warm capacity
 

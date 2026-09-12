@@ -49,6 +49,7 @@ def resolve_ledger_change(
         TraceStoreError: The requested transition violates current Ledger state.
     """
 
+    _validate_change_scope(change, state)
     if change.kind == "open_writer":
         return _resolve_open_writer(change, state)
     if change.kind == "append_events":
@@ -62,6 +63,71 @@ def resolve_ledger_change(
     if change.kind == "delete_generation":
         return _resolve_delete_generation(change, state)
     raise TraceStoreProtocolError("Trace Ledger change kind is unsupported")
+
+
+def _validate_change_scope(
+    change: TraceLedgerChange,
+    state: TraceLedgerState,
+) -> None:
+    """Reject contradictory identities before any quota or persistence effect.
+
+    A shared backend serves many namespaces. Every supplied identity must name the
+    same thread, including idempotency evidence that bypasses a fresh append.
+    Generation mismatches remain the individual transition's stale-key decision.
+    """
+
+    keys = tuple(
+        key
+        for key in (
+            change.identity,
+            change.key,
+            None if change.checkpoint is None else change.checkpoint.key,
+            None if state.thread is None else state.thread.key,
+        )
+        if key is not None
+    )
+    if (
+        any(key.namespace != change.namespace for key in keys)
+        or len({key.thread_id for key in keys}) > 1
+    ):
+        raise TraceStoreProtocolError("Trace Ledger thread identities conflict")
+    if (
+        change.checkpoint is not None
+        and change.key is not None
+        and change.checkpoint.key != change.key
+    ):
+        raise TraceStoreProtocolError("Trace checkpoint generation identities conflict")
+    run_ids = {
+        run_id
+        for run_id in (
+            change.run_id,
+            None if change.identity is None else change.identity.run_id,
+            None if change.checkpoint is None else change.checkpoint.run_id,
+            None if state.target_writer is None else state.target_writer.run_id,
+        )
+        if run_id is not None
+    }
+    if len(run_ids) > 1:
+        raise TraceStoreProtocolError("Trace Ledger Run identities conflict")
+    facts = tuple(draft.fact for draft in change.facts) + tuple(
+        event.fact for event in change.proven_events
+    )
+    if any(
+        not keys
+        or fact.identity.namespace != change.namespace
+        or fact.identity.thread_id != keys[0].thread_id
+        or fact.identity.run_id not in run_ids
+        for fact in facts
+    ):
+        raise TraceStoreProtocolError(
+            "Trace writer can append facts only for its bound Run"
+        )
+    if change.key is not None and any(
+        event.generation != change.key.generation for event in change.proven_events
+    ):
+        raise TraceStoreProtocolError(
+            "Proven Trace events belong to another generation"
+        )
 
 
 def _resolve_open_writer(
@@ -279,7 +345,7 @@ def _resolve_append_events(
     # writer flags, quotas, and Graph rows cannot commit a contradictory Run terminal.
     if any(
         isinstance(fact, RunFact)
-        and (fact.namespace != () or fact.in_subagent_scope is not False)
+        and (fact.graph_namespace != () or fact.in_subagent_scope is not False)
         for fact in facts
     ):
         raise TraceStoreProtocolError("Run lifecycle facts require the root scope")
@@ -319,7 +385,8 @@ def _resolve_append_events(
     for draft in change.facts:
         fact = draft.fact
         if (
-            fact.identity.thread_id != thread.key.thread_id
+            fact.identity.namespace != thread.key.namespace
+            or fact.identity.thread_id != thread.key.thread_id
             or fact.identity.run_id != writer.run_id
         ):
             raise TraceStoreProtocolError(
